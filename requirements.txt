@@ -1,4 +1,6 @@
 torch
+torchvision
+torchaudio
 adam-atan2
 einops
 tqdm
@@ -15,6 +17,4 @@ wheel
 setuptools 
 setuptools-scm
 pydantic-core
-huggingface_hub 
 numba
-triton

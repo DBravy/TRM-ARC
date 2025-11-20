@@ -1,0 +1,98 @@
+# Example configuration for Slot Attention on ARC
+# Copy and modify this for your training runs
+
+# Model architecture
+model:
+  # Enable slot attention
+  use_slot_attention: true
+
+  # Slot attention parameters
+  num_slots: 10              # Number of object slots
+  slot_dim: 64               # Dimension of each slot representation
+  slot_iterations: 3         # Iterative refinement steps
+  slot_mlp_hidden: 128       # MLP hidden dimension in slot attention
+
+  # Grid dimensions (MUST match your data!)
+  grid_height: 30
+  grid_width: 30
+  grid_channels: 1           # 1 for color indices, or 10+ for one-hot
+
+  # Encoder/decoder architecture
+  cnn_hidden_dim: 64         # CNN encoder hidden channels
+  decoder_hidden_dim: 64     # Spatial broadcast decoder hidden channels
+
+  # Core transformer parameters
+  hidden_size: 256           # Main hidden dimension
+  num_heads: 8               # Attention heads
+  expansion: 4.0             # MLP expansion factor
+
+  # Recursive reasoning
+  H_cycles: 3                # High-level reasoning cycles
+  L_cycles: 5                # Low-level reasoning cycles
+  L_layers: 4                # Number of transformer layers
+
+  # Position encodings
+  pos_encodings: "rope"      # "rope" or "learned"
+  rope_theta: 10000.0
+
+  # ACT (Adaptive Computation Time)
+  halt_max_steps: 5
+  halt_exploration_prob: 0.1
+  no_ACT_continue: true
+
+  # Puzzle embeddings (optional, can set to 0 to disable)
+  puzzle_emb_ndim: 0         # 0 = disabled, or 256+ for task-level context
+  num_puzzle_identifiers: 1000
+  puzzle_emb_len: 0          # Auto-calculated if puzzle_emb_ndim > 0
+
+  # Other
+  forward_dtype: "bfloat16"  # "float32", "bfloat16", or "float16"
+  vocab_size: 11             # Not used with slot attention, but required by config
+  seq_len: 900               # Not used with slot attention, but required by config
+
+# Training parameters
+training:
+  batch_size: 32
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+
+  # Loss type for slot attention
+  loss_type: "mse"           # "mse" for continuous, "ce" for discrete
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # Optimization
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+
+# Data
+data:
+  train_dir: "data/arc2concept-aug-1000/train"
+  val_dir: "data/arc2concept-aug-1000/val"
+
+  # Data format
+  input_format: "grid"       # "grid" for slot attention, "tokens" for original
+
+  # Preprocessing
+  max_grid_size: 30
+  pad_to_square: true
+  normalize: false
+
+# Logging
+logging:
+  log_every: 100
+  eval_every: 1000
+  save_every: 5000
+  wandb: true
+  project_name: "arc-slot-attention"
+
+# Hardware
+hardware:
+  device: "cuda"
+  num_workers: 4
+  pin_memory: true
