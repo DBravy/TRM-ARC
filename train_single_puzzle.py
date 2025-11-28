@@ -113,6 +113,80 @@ class SimpleTRM(nn.Module):
         return logits
 
 
+def find_grid_bounds(grid):
+    """Find actual grid boundaries (non-padding area)."""
+    # Tokens: PAD=0, EOS=1, digits=2-11
+    mask = (grid >= 2) & (grid <= 11)
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    if not rows.any():
+        return 0, 5, 0, 5
+    r_min, r_max = np.where(rows)[0][[0, -1]]
+    c_min, c_max = np.where(cols)[0][[0, -1]]
+    return r_min, r_max + 1, c_min, c_max + 1
+
+
+def grid_to_str(grid, r1, r2, c1, c2):
+    """Convert grid to string for display."""
+    lines = []
+    for r in range(r1, min(r2, r1 + 12)):  # Limit display
+        row = []
+        for c in range(c1, min(c2, c1 + 12)):
+            val = grid[r, c]
+            if val == 0:
+                row.append(".")
+            elif val == 1:
+                row.append("|")  # EOS
+            else:
+                row.append(str(val - 2))  # Convert back to 0-9
+        lines.append(" ".join(row))
+    return "\n".join(lines)
+
+
+def visualize_prediction(model, test_loader, epoch, test_acc):
+    """Show side-by-side comparison of prediction vs ground truth."""
+    model.eval()
+    with torch.no_grad():
+        test_batch = next(iter(test_loader))
+        inputs = test_batch["inputs"][:1].to(DEVICE)
+        labels = test_batch["labels"][:1].to(DEVICE)
+        puzzle_ids = test_batch["puzzle_identifiers"][:1].to(DEVICE)
+
+        logits = model(inputs, puzzle_ids)
+        preds = logits.argmax(dim=-1)
+
+        # Convert to grids (30x30)
+        label_grid = labels[0].cpu().numpy().reshape(30, 30)
+        pred_grid = preds[0].cpu().numpy().reshape(30, 30)
+
+        r1, r2, c1, c2 = find_grid_bounds(label_grid)
+
+        # Token-level comparison
+        match = (pred_grid == label_grid)
+        valid = (label_grid != 0)
+        correct = (match & valid).sum()
+        total = valid.sum()
+
+        # Build side-by-side display
+        gt_lines = grid_to_str(label_grid, r1, r2, c1, c2).split("\n")
+        pred_lines = grid_to_str(pred_grid, r1, r2, c1, c2).split("\n")
+
+        tqdm.write(f"\n{'─'*50}")
+        tqdm.write(f"EPOCH {epoch} | Test Acc: {test_acc:.2%} | Token: {correct}/{total}")
+        tqdm.write(f"{'─'*50}")
+        tqdm.write(f"{'GROUND TRUTH':<25} {'MODEL PREDICTION':<25}")
+        tqdm.write(f"{'─'*50}")
+
+        max_lines = max(len(gt_lines), len(pred_lines))
+        for i in range(max_lines):
+            gt = gt_lines[i] if i < len(gt_lines) else ""
+            pr = pred_lines[i] if i < len(pred_lines) else ""
+            # Mark differences
+            tqdm.write(f"{gt:<25} {pr:<25}")
+
+        tqdm.write(f"{'─'*50}\n")
+
+
 def train(args):
     # Load metadata
     with open(os.path.join(args.data_dir, "train", "dataset.json")) as f:
@@ -228,8 +302,8 @@ def train(args):
                 best_test_acc = test_acc
                 best_test_epoch = epoch + 1
 
-            # Print detailed update
-            tqdm.write(f"\n>>> Epoch {epoch+1}: Loss={avg_loss:.4f} | Train={train_acc:.2%} | TEST={test_acc:.2%} | Best={best_test_acc:.2%} (ep {best_test_epoch})")
+            # Show visual comparison
+            visualize_prediction(model, test_loader, epoch + 1, test_acc)
 
     print(f"\n" + "="*60)
     print("FINAL RESULTS")
@@ -244,69 +318,7 @@ def train(args):
     else:
         print("\n✗ FAILURE: Model did not learn the puzzle.")
 
-    # Show actual prediction vs ground truth for test example
-    print("\n" + "="*60)
-    print("PREDICTION VISUALIZATION (first test example)")
     print("="*60)
-
-    model.eval()
-    with torch.no_grad():
-        test_batch = next(iter(test_loader))
-        inputs = test_batch["inputs"][:1].to(DEVICE)
-        labels = test_batch["labels"][:1].to(DEVICE)
-        puzzle_ids = test_batch["puzzle_identifiers"][:1].to(DEVICE)
-
-        logits = model(inputs, puzzle_ids)
-        preds = logits.argmax(dim=-1)
-
-        # Convert to grids (30x30)
-        input_grid = inputs[0].cpu().numpy().reshape(30, 30)
-        label_grid = labels[0].cpu().numpy().reshape(30, 30)
-        pred_grid = preds[0].cpu().numpy().reshape(30, 30)
-
-        # Find actual grid boundaries (non-padding area)
-        def find_grid_bounds(grid):
-            # Find rows and cols with non-zero/non-padding content
-            # Tokens: PAD=0, EOS=1, digits=2-11
-            mask = (grid >= 2) & (grid <= 11)
-            rows = np.any(mask, axis=1)
-            cols = np.any(mask, axis=0)
-            if not rows.any():
-                return 0, 5, 0, 5
-            r_min, r_max = np.where(rows)[0][[0, -1]]
-            c_min, c_max = np.where(cols)[0][[0, -1]]
-            return r_min, r_max + 1, c_min, c_max + 1
-
-        r1, r2, c1, c2 = find_grid_bounds(label_grid)
-
-        # Display function
-        def grid_to_str(grid, r1, r2, c1, c2):
-            lines = []
-            for r in range(r1, min(r2, r1 + 10)):  # Limit display
-                row = []
-                for c in range(c1, min(c2, c1 + 15)):
-                    val = grid[r, c]
-                    if val == 0:
-                        row.append(".")
-                    elif val == 1:
-                        row.append("|")  # EOS
-                    else:
-                        row.append(str(val - 2))  # Convert back to 0-9
-                lines.append(" ".join(row))
-            return "\n".join(lines)
-
-        print(f"\nGrid region: rows [{r1}:{r2}], cols [{c1}:{c2}]")
-        print("\nGROUND TRUTH OUTPUT:")
-        print(grid_to_str(label_grid, r1, r2, c1, c2))
-        print("\nMODEL PREDICTION:")
-        print(grid_to_str(pred_grid, r1, r2, c1, c2))
-
-        # Token-level comparison
-        match = (pred_grid == label_grid)
-        valid = (label_grid != 0)
-        correct = (match & valid).sum()
-        total = valid.sum()
-        print(f"\nToken accuracy: {correct}/{total} = {correct/total:.2%}")
 
 
 if __name__ == "__main__":
