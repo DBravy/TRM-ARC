@@ -143,7 +143,7 @@ def grid_to_str(grid, r1, r2, c1, c2):
     return "\n".join(lines)
 
 
-def visualize_prediction(model, test_loader, epoch, test_acc):
+def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
     """Show side-by-side comparison of prediction vs ground truth."""
     model.eval()
     with torch.no_grad():
@@ -154,6 +154,25 @@ def visualize_prediction(model, test_loader, epoch, test_acc):
 
         logits = model(inputs, puzzle_ids)
         preds = logits.argmax(dim=-1)
+
+        # Debug info
+        if debug or epoch <= 5:
+            tqdm.write(f"\n[DEBUG] Logits shape: {logits.shape}")
+            tqdm.write(f"[DEBUG] Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
+            tqdm.write(f"[DEBUG] Logits mean/std: {logits.mean().item():.3f} / {logits.std().item():.3f}")
+
+            # Show distribution of predictions
+            pred_flat = preds[0].cpu().numpy().flatten()
+            unique, counts = np.unique(pred_flat, return_counts=True)
+            tqdm.write(f"[DEBUG] Prediction distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
+
+            # Show softmax probabilities for a non-padding position
+            label_flat = labels[0].cpu().numpy().flatten()
+            non_pad_idx = np.where(label_flat != 0)[0]
+            if len(non_pad_idx) > 0:
+                idx = non_pad_idx[0]
+                probs = torch.softmax(logits[0, idx], dim=-1).cpu().numpy()
+                tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
 
         # Convert to grids (30x30)
         label_grid = labels[0].cpu().numpy().reshape(30, 30)
@@ -230,6 +249,26 @@ def train(args):
     print(f"Training on {len(train_dataset)} examples (demos + augments)")
     print(f"Testing on {len(test_dataset)} examples (held-out test inputs)")
     print(f"Both use puzzle_identifier = 1 (shared embedding)")
+    print("="*60)
+
+    # Debug: Check data
+    print("\n[DEBUG] Checking training data...")
+    sample = train_dataset[0]
+    print(f"  Input shape: {sample['inputs'].shape}")
+    print(f"  Label shape: {sample['labels'].shape}")
+    print(f"  Puzzle ID: {sample['puzzle_identifiers']}")
+    print(f"  Input unique values: {torch.unique(sample['inputs']).tolist()}")
+    print(f"  Label unique values: {torch.unique(sample['labels']).tolist()}")
+    print(f"  Non-zero labels: {(sample['labels'] != 0).sum().item()} / {sample['labels'].numel()}")
+
+    print("\n[DEBUG] Checking test data...")
+    test_sample = test_dataset[0]
+    print(f"  Input shape: {test_sample['inputs'].shape}")
+    print(f"  Label shape: {test_sample['labels'].shape}")
+    print(f"  Puzzle ID: {test_sample['puzzle_identifiers']}")
+    print(f"  Input unique values: {torch.unique(test_sample['inputs']).tolist()}")
+    print(f"  Label unique values: {torch.unique(test_sample['labels']).tolist()}")
+    print(f"  Non-zero labels: {(test_sample['labels'] != 0).sum().item()} / {test_sample['labels'].numel()}")
     print("="*60 + "\n")
 
     pbar = tqdm(range(args.epochs), desc="Training", unit="epoch")
