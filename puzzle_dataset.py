@@ -130,6 +130,16 @@ class PuzzleDataset(IterableDataset):
             "group_indices": None
         }
 
+        # Check if grid data exists (for slot attention support)
+        first_dataset_path = self.config.dataset_paths[0]
+        first_set_name = self.metadata.sets[0]
+        grid_input_path = os.path.join(first_dataset_path, self.split, f"{first_set_name}__input_grids.npy")
+        has_grid_data = os.path.exists(grid_input_path)
+
+        if has_grid_data:
+            field_mmap_modes["input_grids"] = "r"
+            field_mmap_modes["label_grids"] = "r"
+
         # Load data
         self._data = {}
         for set_name in self.metadata.sets: # Load subset
@@ -138,18 +148,30 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
-                self._data[set_name_] = {
-                    field_name: np.load(os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
-                    for field_name, mmap_mode in field_mmap_modes.items()
-                }
+                self._data[set_name_] = {}
+                for field_name, mmap_mode in field_mmap_modes.items():
+                    file_path = os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy")
+                    if os.path.exists(file_path):
+                        self._data[set_name_][field_name] = np.load(file_path, mmap_mode=mmap_mode)
+                    elif field_name in ["input_grids", "label_grids"]:
+                        # Grid data is optional (for backward compatibility)
+                        pass
+                    else:
+                        # Required field missing
+                        raise FileNotFoundError(f"Required field {field_name} not found at {file_path}")
 
 
     def _collate_batch(self, batch):
         # Convert dtype
-        batch = {k: v.astype(np.int32) for k, v in batch.items()}
+        for k, v in batch.items():
+            if k in ["input_grids", "label_grids"]:
+                # Keep grids as float32 for slot attention
+                batch[k] = v.astype(np.float32)
+            else:
+                batch[k] = v.astype(np.int32)
 
         # Convert ignore label IDs
-        if self.metadata.ignore_label_id is not None:
+        if self.metadata.ignore_label_id is not None and "labels" in batch:
             batch["labels"][batch["labels"] == self.metadata.ignore_label_id] = IGNORE_LABEL_ID
 
         # Pad
@@ -158,9 +180,13 @@ class PuzzleDataset(IterableDataset):
             pad_values = {
                 "inputs": self.metadata.pad_id,
                 "labels": IGNORE_LABEL_ID,
+                "input_grids": 0,
+                "label_grids": 0,
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
-            batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+            for k, v in batch.items():
+                if k in pad_values:
+                    batch[k] = np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k])
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}

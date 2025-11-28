@@ -74,6 +74,33 @@ def np_grid_to_seq_translational_augment(inp: np.ndarray, out: np.ndarray, do_tr
     return result
 
 
+def np_grid_to_raw_grid_augment(inp: np.ndarray, out: np.ndarray, do_translation: bool):
+    """
+    Convert grids to padded raw grids for slot attention.
+    Returns grids as [height, width] with pixel values 0-9.
+    """
+    # Compute random top-left pad
+    if do_translation:
+        pad_r = np.random.randint(0, ARCMaxGridSize - max(inp.shape[0], out.shape[0]) + 1)
+        pad_c = np.random.randint(0, ARCMaxGridSize - max(inp.shape[1], out.shape[1]) + 1)
+    else:
+        pad_r = pad_c = 0
+
+    # Pad grids to ARCMaxGridSize x ARCMaxGridSize
+    # Keep original values (0-9), pad with 0
+    result = []
+    for grid in [inp, out]:
+        nrow, ncol = grid.shape
+        padded_grid = np.pad(
+            grid,
+            ((pad_r, ARCMaxGridSize - pad_r - nrow), (pad_c, ARCMaxGridSize - pad_c - ncol)),
+            constant_values=0
+        )
+        result.append(padded_grid)
+
+    return result
+
+
 def grid_hash(grid: np.ndarray):
     assert grid.ndim == 2
     assert grid.dtype == np.uint8
@@ -254,42 +281,49 @@ def convert_dataset(config: DataProcessConfig):
         
         for subset_name, subset in split.items(): # "all" is the only subset
             # Construct subset
-            results = {k: [] for k in ["inputs", "labels", "puzzle_identifiers", "puzzle_indices", "group_indices"]}
+            results = {k: [] for k in ["inputs", "labels", "input_grids", "label_grids", "puzzle_identifiers", "puzzle_indices", "group_indices"]}
             results["puzzle_indices"].append(0)
             results["group_indices"].append(0)
-            
+
             example_id = 0
             puzzle_id = 0
-            
+
             for group in subset:
                 for puzzle in group:
                     # Push puzzle
                     no_aug_id = np.random.randint(0, len(puzzle.examples))
                     for _idx_ex, (inp, out) in enumerate(puzzle.examples):
-                        inp, out = np_grid_to_seq_translational_augment(inp, out, do_translation=enable_translational_augment and _idx_ex != no_aug_id)
-                            
-                        results["inputs"].append(inp)
-                        results["labels"].append(out)
+                        # Save tokenized sequences (for backward compatibility)
+                        inp_seq, out_seq = np_grid_to_seq_translational_augment(inp, out, do_translation=enable_translational_augment and _idx_ex != no_aug_id)
+                        results["inputs"].append(inp_seq)
+                        results["labels"].append(out_seq)
+
+                        # Save raw grids (for slot attention)
+                        inp_grid, out_grid = np_grid_to_raw_grid_augment(inp, out, do_translation=enable_translational_augment and _idx_ex != no_aug_id)
+                        results["input_grids"].append(inp_grid)
+                        results["label_grids"].append(out_grid)
+
                         example_id += 1
-                        
                         total_examples += 1
 
                     results["puzzle_indices"].append(example_id)
                     results["puzzle_identifiers"].append(identifier_map[puzzle.id])
-                    
+
                     puzzle_id += 1
                     total_puzzles += 1
-                    
+
                 # Push group
                 results["group_indices"].append(puzzle_id)
                 total_groups += 1
-            
+
             for k, v in results.items():
                 if k in {"inputs", "labels"}:
                     v = np.stack(v, 0)
+                elif k in {"input_grids", "label_grids"}:
+                    v = np.stack(v, 0).astype(np.uint8)  # Save grids as uint8
                 else:
                     v = np.array(v, dtype=np.int32)
-                
+
                 np.save(os.path.join(config.output_dir, split_name, f"{subset_name}__{k}.npy"), v)
         
         # Metadata
@@ -303,7 +337,9 @@ def convert_dataset(config: DataProcessConfig):
             total_groups=total_groups,
             mean_puzzle_examples=total_examples / total_puzzles,
             total_puzzles=total_puzzles,
-            sets=list(split.keys())
+            sets=list(split.keys()),
+            grid_height=ARCMaxGridSize,
+            grid_width=ARCMaxGridSize
         )
 
         # Save metadata as JSON.

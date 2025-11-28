@@ -17,7 +17,8 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+# from adam_atan2 import AdamATan2  # Requires CUDA compilation
+AdamATan2 = torch.optim.AdamW  # Use standard AdamW as drop-in replacement
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -293,6 +294,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
+
+    # Use grids if slot attention is enabled and grids are available
+    if hasattr(config.arch, "use_slot_attention") and config.arch.__pydantic_extra__.get("use_slot_attention", False):
+        if "input_grids" in batch and "label_grids" in batch:
+            batch["inputs"] = batch["input_grids"]
+            batch["labels"] = batch["label_grids"]
 
     # Init carry if it is None
     if train_state.carry is None:

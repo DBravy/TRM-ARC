@@ -1,0 +1,245 @@
+"""
+Minimal training script for single-puzzle experiment.
+Works on CPU/MPS (Mac) without CUDA.
+
+Usage:
+    python train_single_puzzle.py --data-dir data/single_puzzle_007bbfb7 --epochs 1000
+"""
+
+import argparse
+import json
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# Determine device
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
+print(f"Using device: {DEVICE}")
+
+
+class SinglePuzzleDataset(Dataset):
+    def __init__(self, data_dir: str, split: str):
+        self.inputs = np.load(os.path.join(data_dir, split, "all__inputs.npy"))
+        self.labels = np.load(os.path.join(data_dir, split, "all__labels.npy"))
+        self.puzzle_ids = np.load(os.path.join(data_dir, split, "all__puzzle_identifiers.npy"))
+
+        # Expand puzzle_ids to match examples
+        puzzle_indices = np.load(os.path.join(data_dir, split, "all__puzzle_indices.npy"))
+        self.example_puzzle_ids = np.zeros(len(self.inputs), dtype=np.int32)
+        for i in range(len(puzzle_indices) - 1):
+            start, end = puzzle_indices[i], puzzle_indices[i + 1]
+            self.example_puzzle_ids[start:end] = self.puzzle_ids[i]
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return {
+            "inputs": torch.tensor(self.inputs[idx], dtype=torch.long),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "puzzle_identifiers": torch.tensor(self.example_puzzle_ids[idx], dtype=torch.long),
+        }
+
+
+class SimpleTRM(nn.Module):
+    """Simplified TRM for single-puzzle experiment."""
+
+    def __init__(self, vocab_size=12, hidden_size=128, num_puzzle_ids=2, seq_len=900,
+                 num_layers=2, num_heads=4, H_cycles=2, L_cycles=3):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.seq_len = seq_len
+        self.H_cycles = H_cycles
+        self.L_cycles = L_cycles
+
+        # Embeddings
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_puzzle = nn.Embedding(num_puzzle_ids, hidden_size)
+        self.embed_pos = nn.Embedding(seq_len, hidden_size)
+
+        # Transformer layers (shared for both H and L updates)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output head
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
+
+        # Initial states
+        self.H_init = nn.Parameter(torch.randn(hidden_size) * 0.02)
+        self.L_init = nn.Parameter(torch.randn(hidden_size) * 0.02)
+
+    def forward(self, inputs, puzzle_identifiers):
+        B, L = inputs.shape
+
+        # Embeddings
+        tok_emb = self.embed_tokens(inputs)  # (B, L, H)
+        pos_emb = self.embed_pos(torch.arange(L, device=inputs.device))  # (L, H)
+        puzzle_emb = self.embed_puzzle(puzzle_identifiers)  # (B, H)
+
+        # Input embedding = tokens + position + puzzle (broadcast)
+        input_emb = tok_emb + pos_emb.unsqueeze(0) + puzzle_emb.unsqueeze(1)
+
+        # Initialize latent states
+        z_H = self.H_init.unsqueeze(0).unsqueeze(0).expand(B, L, -1)
+        z_L = self.L_init.unsqueeze(0).unsqueeze(0).expand(B, L, -1)
+
+        # Recursive reasoning
+        for _h in range(self.H_cycles):
+            for _l in range(self.L_cycles):
+                # L update: z_L = f(z_L + z_H + input)
+                z_L = self.transformer(z_L + z_H + input_emb)
+            # H update: z_H = f(z_H + z_L)
+            z_H = self.transformer(z_H + z_L)
+
+        # Output
+        logits = self.lm_head(z_H)
+        return logits
+
+
+def train(args):
+    # Load metadata
+    with open(os.path.join(args.data_dir, "train", "dataset.json")) as f:
+        metadata = json.load(f)
+
+    print(f"Metadata: {metadata}")
+
+    # Datasets
+    train_dataset = SinglePuzzleDataset(args.data_dir, "train")
+    test_dataset = SinglePuzzleDataset(args.data_dir, "test")
+
+    print(f"Training examples: {len(train_dataset)}")
+    print(f"Test examples: {len(test_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # Model
+    model = SimpleTRM(
+        vocab_size=metadata["vocab_size"],
+        hidden_size=args.hidden_size,
+        num_puzzle_ids=metadata["num_puzzle_identifiers"],
+        seq_len=metadata["seq_len"],
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        H_cycles=args.H_cycles,
+        L_cycles=args.L_cycles,
+    ).to(DEVICE)
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # Training loop
+    best_test_acc = 0.0
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_tokens = 0
+
+        for batch in train_loader:
+            inputs = batch["inputs"].to(DEVICE)
+            labels = batch["labels"].to(DEVICE)
+            puzzle_ids = batch["puzzle_identifiers"].to(DEVICE)
+
+            optimizer.zero_grad()
+
+            logits = model(inputs, puzzle_ids)
+
+            # Loss (ignore padding = 0)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=0
+            )
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            # Accuracy (non-padding tokens)
+            preds = logits.argmax(dim=-1)
+            mask = labels != 0
+            total_correct += ((preds == labels) & mask).sum().item()
+            total_tokens += mask.sum().item()
+
+        train_acc = total_correct / total_tokens if total_tokens > 0 else 0
+        avg_loss = total_loss / len(train_loader)
+
+        # Evaluate on test set
+        if (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1:
+            model.eval()
+            test_correct = 0
+            test_tokens = 0
+
+            with torch.no_grad():
+                for batch in test_loader:
+                    inputs = batch["inputs"].to(DEVICE)
+                    labels = batch["labels"].to(DEVICE)
+                    puzzle_ids = batch["puzzle_identifiers"].to(DEVICE)
+
+                    logits = model(inputs, puzzle_ids)
+                    preds = logits.argmax(dim=-1)
+
+                    mask = labels != 0
+                    test_correct += ((preds == labels) & mask).sum().item()
+                    test_tokens += mask.sum().item()
+
+            test_acc = test_correct / test_tokens if test_tokens > 0 else 0
+
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+
+            print(f"Epoch {epoch+1}/{args.epochs} | "
+                  f"Loss: {avg_loss:.4f} | "
+                  f"Train Acc: {train_acc:.4f} | "
+                  f"Test Acc: {test_acc:.4f} | "
+                  f"Best Test: {best_test_acc:.4f}")
+        elif (epoch + 1) % 100 == 0:
+            print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f}")
+
+    print(f"\n=== Final Results ===")
+    print(f"Best Test Accuracy: {best_test_acc:.4f}")
+
+    if best_test_acc > 0.9:
+        print("SUCCESS: Model learned the puzzle from demonstrations!")
+    elif best_test_acc > 0.5:
+        print("PARTIAL: Model learned something but not perfectly.")
+    else:
+        print("FAILURE: Model did not learn the puzzle.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--H-cycles", type=int, default=2)
+    parser.add_argument("--L-cycles", type=int, default=3)
+    parser.add_argument("--eval-interval", type=int, default=100)
+
+    args = parser.parse_args()
+    train(args)

@@ -20,6 +20,9 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
     mean_puzzle_examples: float
     total_puzzles: int
     sets: List[str]
+    # Grid dimensions (for slot attention)
+    grid_height: int = 30
+    grid_width: int = 30
 
 
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
