@@ -320,7 +320,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--H-cycles", type=int, default=2)
     parser.add_argument("--L-cycles", type=int, default=3)
-    parser.add_argument("--eval-interval", type=int, default=100)
+    parser.add_argument("--eval-interval", type=int, default=1)
 
     args = parser.parse_args()
     train(args)
