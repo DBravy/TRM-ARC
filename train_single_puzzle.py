@@ -156,7 +156,7 @@ def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
         preds = logits.argmax(dim=-1)
 
         # Debug info
-        if debug or epoch <= 5:
+        if debug or epoch <= 5000:
             tqdm.write(f"\n[DEBUG] Logits shape: {logits.shape}")
             tqdm.write(f"[DEBUG] Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
             tqdm.write(f"[DEBUG] Logits mean/std: {logits.mean().item():.3f} / {logits.std().item():.3f}")
@@ -171,6 +171,10 @@ def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
             non_pad_idx = np.where(label_flat != 0)[0]
             if len(non_pad_idx) > 0:
                 idx = non_pad_idx[0]
+                probs = torch.softmax(logits[0, idx], dim=-1).cpu().numpy()
+                tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
+            if len(non_pad_idx) > 20:
+                idx = non_pad_idx[20]
                 probs = torch.softmax(logits[0, idx], dim=-1).cpu().numpy()
                 tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
 
