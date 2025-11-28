@@ -148,8 +148,19 @@ def train(args):
 
     # Training loop
     best_test_acc = 0.0
+    best_test_epoch = 0
 
-    for epoch in range(args.epochs):
+    print("\n" + "="*60)
+    print("TRAINING START")
+    print("="*60)
+    print(f"Training on {len(train_dataset)} examples (demos + augments)")
+    print(f"Testing on {len(test_dataset)} examples (held-out test inputs)")
+    print(f"Both use puzzle_identifier = 1 (shared embedding)")
+    print("="*60 + "\n")
+
+    pbar = tqdm(range(args.epochs), desc="Training", unit="epoch")
+
+    for epoch in pbar:
         model.train()
         total_loss = 0.0
         total_correct = 0
@@ -185,6 +196,13 @@ def train(args):
         train_acc = total_correct / total_tokens if total_tokens > 0 else 0
         avg_loss = total_loss / len(train_loader)
 
+        # Update progress bar
+        pbar.set_postfix({
+            "loss": f"{avg_loss:.4f}",
+            "train_acc": f"{train_acc:.2%}",
+            "best_test": f"{best_test_acc:.2%}"
+        })
+
         # Evaluate on test set
         if (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1:
             model.eval()
@@ -208,24 +226,87 @@ def train(args):
 
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
+                best_test_epoch = epoch + 1
 
-            print(f"Epoch {epoch+1}/{args.epochs} | "
-                  f"Loss: {avg_loss:.4f} | "
-                  f"Train Acc: {train_acc:.4f} | "
-                  f"Test Acc: {test_acc:.4f} | "
-                  f"Best Test: {best_test_acc:.4f}")
-        elif (epoch + 1) % 100 == 0:
-            print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | Train Acc: {train_acc:.4f}")
+            # Print detailed update
+            tqdm.write(f"\n>>> Epoch {epoch+1}: Loss={avg_loss:.4f} | Train={train_acc:.2%} | TEST={test_acc:.2%} | Best={best_test_acc:.2%} (ep {best_test_epoch})")
 
-    print(f"\n=== Final Results ===")
-    print(f"Best Test Accuracy: {best_test_acc:.4f}")
+    print(f"\n" + "="*60)
+    print("FINAL RESULTS")
+    print("="*60)
+    print(f"Best Test Accuracy: {best_test_acc:.2%} (at epoch {best_test_epoch})")
 
-    if best_test_acc > 0.9:
-        print("SUCCESS: Model learned the puzzle from demonstrations!")
-    elif best_test_acc > 0.5:
-        print("PARTIAL: Model learned something but not perfectly.")
+    if best_test_acc > 0.95:
+        print("\n✓ SUCCESS: Model learned the puzzle from demonstrations!")
+        print("  This confirms the transductive learning hypothesis.")
+    elif best_test_acc > 0.7:
+        print("\n~ PARTIAL: Model learned something but not perfectly.")
     else:
-        print("FAILURE: Model did not learn the puzzle.")
+        print("\n✗ FAILURE: Model did not learn the puzzle.")
+
+    # Show actual prediction vs ground truth for test example
+    print("\n" + "="*60)
+    print("PREDICTION VISUALIZATION (first test example)")
+    print("="*60)
+
+    model.eval()
+    with torch.no_grad():
+        test_batch = next(iter(test_loader))
+        inputs = test_batch["inputs"][:1].to(DEVICE)
+        labels = test_batch["labels"][:1].to(DEVICE)
+        puzzle_ids = test_batch["puzzle_identifiers"][:1].to(DEVICE)
+
+        logits = model(inputs, puzzle_ids)
+        preds = logits.argmax(dim=-1)
+
+        # Convert to grids (30x30)
+        input_grid = inputs[0].cpu().numpy().reshape(30, 30)
+        label_grid = labels[0].cpu().numpy().reshape(30, 30)
+        pred_grid = preds[0].cpu().numpy().reshape(30, 30)
+
+        # Find actual grid boundaries (non-padding area)
+        def find_grid_bounds(grid):
+            # Find rows and cols with non-zero/non-padding content
+            # Tokens: PAD=0, EOS=1, digits=2-11
+            mask = (grid >= 2) & (grid <= 11)
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            if not rows.any():
+                return 0, 5, 0, 5
+            r_min, r_max = np.where(rows)[0][[0, -1]]
+            c_min, c_max = np.where(cols)[0][[0, -1]]
+            return r_min, r_max + 1, c_min, c_max + 1
+
+        r1, r2, c1, c2 = find_grid_bounds(label_grid)
+
+        # Display function
+        def grid_to_str(grid, r1, r2, c1, c2):
+            lines = []
+            for r in range(r1, min(r2, r1 + 10)):  # Limit display
+                row = []
+                for c in range(c1, min(c2, c1 + 15)):
+                    val = grid[r, c]
+                    if val == 0:
+                        row.append(".")
+                    elif val == 1:
+                        row.append("|")  # EOS
+                    else:
+                        row.append(str(val - 2))  # Convert back to 0-9
+                lines.append(" ".join(row))
+            return "\n".join(lines)
+
+        print(f"\nGrid region: rows [{r1}:{r2}], cols [{c1}:{c2}]")
+        print("\nGROUND TRUTH OUTPUT:")
+        print(grid_to_str(label_grid, r1, r2, c1, c2))
+        print("\nMODEL PREDICTION:")
+        print(grid_to_str(pred_grid, r1, r2, c1, c2))
+
+        # Token-level comparison
+        match = (pred_grid == label_grid)
+        valid = (label_grid != 0)
+        correct = (match & valid).sum()
+        total = valid.sum()
+        print(f"\nToken accuracy: {correct}/{total} = {correct/total:.2%}")
 
 
 if __name__ == "__main__":
