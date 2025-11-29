@@ -455,8 +455,8 @@ def train(args):
 
             # Loss (ignore padding = 0)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
                 ignore_index=0
             )
 
