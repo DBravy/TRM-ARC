@@ -241,6 +241,15 @@ class ActualTRMWrapper(nn.Module):
 
     def forward(self, inputs, puzzle_identifiers):
         """Simple forward interface matching other models."""
+        actual_batch_size = inputs.shape[0]
+        expected_batch_size = self.trm.config.batch_size
+
+        # Pad batch if smaller than expected (sparse embedding requires fixed size)
+        if actual_batch_size < expected_batch_size:
+            pad_size = expected_batch_size - actual_batch_size
+            inputs = torch.cat([inputs, inputs[:1].expand(pad_size, -1)], dim=0)
+            puzzle_identifiers = torch.cat([puzzle_identifiers, puzzle_identifiers[:1].expand(pad_size)], dim=0)
+
         batch = {
             "inputs": inputs,
             "puzzle_identifiers": puzzle_identifiers,
@@ -259,7 +268,8 @@ class ActualTRMWrapper(nn.Module):
         # Forward pass
         _, outputs = self.trm(carry, batch)
 
-        return outputs["logits"]
+        # Return only the actual batch (remove padding)
+        return outputs["logits"][:actual_batch_size]
 
 
 def find_grid_bounds(grid):
