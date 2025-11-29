@@ -330,11 +330,11 @@ def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
             non_pad_idx = np.where(label_flat != 0)[0]
             if len(non_pad_idx) > 0:
                 idx = non_pad_idx[0]
-                probs = torch.softmax(logits[0, idx], dim=-1).cpu().numpy()
+                probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
                 tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
             if len(non_pad_idx) > 20:
                 idx = non_pad_idx[20]
-                probs = torch.softmax(logits[0, idx], dim=-1).cpu().numpy()
+                probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
                 tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
 
         # Convert to grids (30x30)
