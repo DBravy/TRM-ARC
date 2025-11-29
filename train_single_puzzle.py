@@ -4,11 +4,13 @@ Works on CPU/MPS (Mac) without CUDA.
 
 Usage:
     python train_single_puzzle.py --data-dir data/single_puzzle_007bbfb7 --epochs 1000
+    python train_single_puzzle.py --data-dir data/single_puzzle_007bbfb7 --model actual_trm --epochs 1000
 """
 
 import argparse
 import json
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,15 +18,21 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# Determine device
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Determine device and dtype
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
+    DTYPE = torch.bfloat16  # CUDA supports bfloat16
 else:
-    DEVICE = torch.device("cpu")
+    if torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+    else:
+        DEVICE = torch.device("cpu")
+    DTYPE = torch.float32  # MPS/CPU need float32
 
-print(f"Using device: {DEVICE}")
+print(f"Using device: {DEVICE}, dtype: {DTYPE}")
 
 
 class SinglePuzzleDataset(Dataset):
@@ -190,6 +198,70 @@ class SimpleCNN(nn.Module):
         return logits
 
 
+class ActualTRMWrapper(nn.Module):
+    """Wrapper around the actual TRM from trm.py for simple interface."""
+
+    def __init__(self, vocab_size=12, hidden_size=128, num_puzzle_ids=2, seq_len=900,
+                 num_layers=2, num_heads=4, H_cycles=3, L_cycles=4, batch_size=16, **kwargs):
+        super().__init__()
+
+        # Import the actual TRM
+        from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1
+
+        # Determine dtype string based on global DTYPE
+        dtype_str = "float32" if DTYPE == torch.float32 else "bfloat16"
+
+        # Build config for actual TRM
+        config_dict = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "puzzle_emb_ndim": hidden_size,  # Use puzzle embeddings
+            "num_puzzle_identifiers": num_puzzle_ids,
+            "vocab_size": vocab_size,
+            "H_cycles": H_cycles,
+            "L_cycles": L_cycles,
+            "H_layers": 1,  # Ignored per docs
+            "L_layers": num_layers,
+            "hidden_size": hidden_size,
+            "expansion": 4.0,
+            "num_heads": num_heads,
+            "pos_encodings": "rope",  # Use RoPE embeddings
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "halt_max_steps": 1,  # No halting for simplicity
+            "halt_exploration_prob": 0.0,
+            "forward_dtype": dtype_str,
+            "mlp_t": False,  # Use attention, not MLP transpose
+            "puzzle_emb_len": 16,
+            "no_ACT_continue": True,
+        }
+
+        self.trm = TinyRecursiveReasoningModel_ACTV1(config_dict)
+        self.trm = self.trm.to(DTYPE)
+
+    def forward(self, inputs, puzzle_identifiers):
+        """Simple forward interface matching other models."""
+        batch = {
+            "inputs": inputs,
+            "puzzle_identifiers": puzzle_identifiers,
+        }
+
+        # Get initial carry
+        carry = self.trm.initial_carry(batch)
+
+        # Move carry to device
+        carry.inner_carry.z_H = carry.inner_carry.z_H.to(DEVICE)
+        carry.inner_carry.z_L = carry.inner_carry.z_L.to(DEVICE)
+        carry.steps = carry.steps.to(DEVICE)
+        carry.halted = carry.halted.to(DEVICE)
+        carry.current_data = {k: v.to(DEVICE) for k, v in carry.current_data.items()}
+
+        # Forward pass
+        _, outputs = self.trm(carry, batch)
+
+        return outputs["logits"]
+
+
 def find_grid_bounds(grid):
     """Find actual grid boundaries (non-padding area)."""
     # Tokens: PAD=0, EOS=1, digits=2-11
@@ -309,6 +381,7 @@ def train(args):
         "trm": SimpleTRM,
         "mlp": SimpleMLP,
         "cnn": SimpleCNN,
+        "actual_trm": ActualTRMWrapper,
     }
 
     if args.model not in model_classes:
@@ -323,6 +396,7 @@ def train(args):
         num_heads=args.num_heads,
         H_cycles=args.H_cycles,
         L_cycles=args.L_cycles,
+        batch_size=args.batch_size,  # Needed for actual TRM
     ).to(DEVICE)
 
     print(f"Model: {args.model.upper()}")
@@ -454,8 +528,8 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--model", type=str, default="trm", choices=["trm", "mlp", "cnn"],
-                        help="Model architecture: trm (recursive), mlp (simple), cnn (spatial)")
+    parser.add_argument("--model", type=str, default="trm", choices=["trm", "mlp", "cnn", "actual_trm"],
+                        help="Model architecture: trm (simplified), mlp (simple), cnn (spatial), actual_trm (real TRM)")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
