@@ -113,6 +113,83 @@ class SimpleTRM(nn.Module):
         return logits
 
 
+class SimpleMLP(nn.Module):
+    """Simple MLP baseline - can it memorize a single puzzle?"""
+
+    def __init__(self, vocab_size=12, hidden_size=128, num_puzzle_ids=2, seq_len=900, **kwargs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+
+        # Simple embedding + MLP approach
+        self.embed_tokens = nn.Embedding(vocab_size, 32)
+
+        # MLP: takes flattened embedded input, outputs logits for each position
+        self.mlp = nn.Sequential(
+            nn.Linear(seq_len * 32, hidden_size * 4),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 4, hidden_size * 4),
+            nn.ReLU(),
+            nn.Linear(hidden_size * 4, seq_len * vocab_size),
+        )
+
+    def forward(self, inputs, puzzle_identifiers):
+        B, L = inputs.shape
+
+        # Embed and flatten
+        x = self.embed_tokens(inputs)  # (B, L, 32)
+        x = x.view(B, -1)  # (B, L*32)
+
+        # MLP
+        x = self.mlp(x)  # (B, L*vocab_size)
+
+        # Reshape to (B, L, vocab_size)
+        logits = x.view(B, L, self.vocab_size)
+        return logits
+
+
+class SimpleCNN(nn.Module):
+    """Simple CNN baseline - uses 2D spatial structure."""
+
+    def __init__(self, vocab_size=12, hidden_size=128, num_puzzle_ids=2, seq_len=900, **kwargs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.grid_size = 30  # 30x30 grid
+
+        # Embedding for input tokens
+        self.embed_tokens = nn.Embedding(vocab_size, 32)
+
+        # CNN layers
+        self.conv = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, vocab_size, kernel_size=1),  # 1x1 conv to get per-pixel logits
+        )
+
+    def forward(self, inputs, puzzle_identifiers):
+        B, L = inputs.shape
+
+        # Embed tokens
+        x = self.embed_tokens(inputs)  # (B, 900, 32)
+
+        # Reshape to 2D grid: (B, 32, 30, 30)
+        x = x.view(B, self.grid_size, self.grid_size, -1)
+        x = x.permute(0, 3, 1, 2)  # (B, 32, 30, 30)
+
+        # Apply CNN
+        x = self.conv(x)  # (B, vocab_size, 30, 30)
+
+        # Reshape back to sequence
+        x = x.permute(0, 2, 3, 1)  # (B, 30, 30, vocab_size)
+        logits = x.reshape(B, L, self.vocab_size)
+
+        return logits
+
+
 def find_grid_bounds(grid):
     """Find actual grid boundaries (non-padding area)."""
     # Tokens: PAD=0, EOS=1, digits=2-11
@@ -227,8 +304,17 @@ def train(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Model
-    model = SimpleTRM(
+    # Model selection
+    model_classes = {
+        "trm": SimpleTRM,
+        "mlp": SimpleMLP,
+        "cnn": SimpleCNN,
+    }
+
+    if args.model not in model_classes:
+        raise ValueError(f"Unknown model: {args.model}. Choose from {list(model_classes.keys())}")
+
+    model = model_classes[args.model](
         vocab_size=metadata["vocab_size"],
         hidden_size=args.hidden_size,
         num_puzzle_ids=metadata["num_puzzle_identifiers"],
@@ -239,6 +325,7 @@ def train(args):
         L_cycles=args.L_cycles,
     ).to(DEVICE)
 
+    print(f"Model: {args.model.upper()}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -367,6 +454,8 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--model", type=str, default="trm", choices=["trm", "mlp", "cnn"],
+                        help="Model architecture: trm (recursive), mlp (simple), cnn (spatial)")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
