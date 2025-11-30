@@ -1,15 +1,25 @@
 """
-Minimal training script for single-puzzle experiment.
+Training script for single or multi-puzzle experiments (1-3 puzzles).
 Works on CPU/MPS (Mac) without CUDA.
 
 Usage:
-    python train_single_puzzle.py --data-dir data/single_puzzle_007bbfb7 --epochs 1000
-    python train_single_puzzle.py --data-dir data/single_puzzle_007bbfb7 --model actual_trm --epochs 1000
+    # Random single puzzle (auto-discovers from data root):
+    python train_single_puzzle.py --epochs 1000
+
+    # Random 2 puzzles:
+    python train_single_puzzle.py --num-puzzles 2 --epochs 1000
+
+    # Specific puzzles:
+    python train_single_puzzle.py --data-dirs data/single_puzzle_007bbfb7 --epochs 1000
+
+    # With actual TRM:
+    python train_single_puzzle.py --num-puzzles 2 --model actual_trm --epochs 1000
 """
 
 import argparse
 import json
 import os
+import random
 import sys
 import numpy as np
 import torch
@@ -35,18 +45,73 @@ else:
 print(f"Using device: {DEVICE}, dtype: {DTYPE}")
 
 
-class SinglePuzzleDataset(Dataset):
-    def __init__(self, data_dir: str, split: str):
-        self.inputs = np.load(os.path.join(data_dir, split, "all__inputs.npy"))
-        self.labels = np.load(os.path.join(data_dir, split, "all__labels.npy"))
-        self.puzzle_ids = np.load(os.path.join(data_dir, split, "all__puzzle_identifiers.npy"))
+def discover_puzzle_dirs(data_root: str) -> list:
+    """Find all valid puzzle directories under data_root.
 
-        # Expand puzzle_ids to match examples
-        puzzle_indices = np.load(os.path.join(data_dir, split, "all__puzzle_indices.npy"))
-        self.example_puzzle_ids = np.zeros(len(self.inputs), dtype=np.int32)
-        for i in range(len(puzzle_indices) - 1):
-            start, end = puzzle_indices[i], puzzle_indices[i + 1]
-            self.example_puzzle_ids[start:end] = self.puzzle_ids[i]
+    A valid puzzle directory has train/ and test/ subdirs with all__inputs.npy files.
+    """
+    valid_dirs = []
+
+    if not os.path.isdir(data_root):
+        return valid_dirs
+
+    for name in os.listdir(data_root):
+        candidate = os.path.join(data_root, name)
+        if not os.path.isdir(candidate):
+            continue
+
+        # Check for required structure
+        train_inputs = os.path.join(candidate, "train", "all__inputs.npy")
+        test_inputs = os.path.join(candidate, "test", "all__inputs.npy")
+
+        if os.path.exists(train_inputs) and os.path.exists(test_inputs):
+            valid_dirs.append(candidate)
+
+    return sorted(valid_dirs)
+
+
+class MultiPuzzleDataset(Dataset):
+    """Dataset that can load from 1-3 puzzle directories."""
+
+    def __init__(self, data_dirs: list, split: str, puzzle_id_offset: int = 0):
+        """
+        Args:
+            data_dirs: List of data directories (1-3 puzzles)
+            split: 'train' or 'test'
+            puzzle_id_offset: Starting puzzle ID (usually 1, since 0 is reserved)
+        """
+        all_inputs = []
+        all_labels = []
+        all_puzzle_ids = []
+
+        for puzzle_idx, data_dir in enumerate(data_dirs):
+            inputs = np.load(os.path.join(data_dir, split, "all__inputs.npy"))
+            labels = np.load(os.path.join(data_dir, split, "all__labels.npy"))
+            puzzle_indices = np.load(os.path.join(data_dir, split, "all__puzzle_indices.npy"))
+
+            # Expand puzzle_ids to match examples
+            example_puzzle_ids = np.zeros(len(inputs), dtype=np.int32)
+            for i in range(len(puzzle_indices) - 1):
+                start, end = puzzle_indices[i], puzzle_indices[i + 1]
+                # Assign unique puzzle ID: offset + puzzle_idx + 1
+                # Each puzzle directory gets a unique ID
+                example_puzzle_ids[start:end] = puzzle_id_offset + puzzle_idx + 1
+
+            all_inputs.append(inputs)
+            all_labels.append(labels)
+            all_puzzle_ids.append(example_puzzle_ids)
+
+        # Concatenate all puzzles
+        self.inputs = np.concatenate(all_inputs, axis=0)
+        self.labels = np.concatenate(all_labels, axis=0)
+        self.example_puzzle_ids = np.concatenate(all_puzzle_ids, axis=0)
+
+        # Track which examples belong to which puzzle (for per-puzzle metrics)
+        self.puzzle_boundaries = []
+        offset = 0
+        for inputs in all_inputs:
+            self.puzzle_boundaries.append((offset, offset + len(inputs)))
+            offset += len(inputs)
 
     def __len__(self):
         return len(self.inputs)
@@ -57,6 +122,13 @@ class SinglePuzzleDataset(Dataset):
             "labels": torch.tensor(self.labels[idx], dtype=torch.long),
             "puzzle_identifiers": torch.tensor(self.example_puzzle_ids[idx], dtype=torch.long),
         }
+
+    def get_puzzle_indices(self, puzzle_num: int):
+        """Get indices for examples from a specific puzzle (0-indexed)."""
+        if puzzle_num >= len(self.puzzle_boundaries):
+            return []
+        start, end = self.puzzle_boundaries[puzzle_num]
+        return list(range(start, end))
 
 
 class SimpleTRM(nn.Module):
@@ -370,18 +442,40 @@ def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
 
 
 def train(args):
-    # Load metadata
-    with open(os.path.join(args.data_dir, "train", "dataset.json")) as f:
-        metadata = json.load(f)
+    num_puzzles = len(args.data_dirs)
+    print(f"\nLoading {num_puzzles} puzzle(s)...")
 
-    print(f"Metadata: {metadata}")
+    # Load metadata from each puzzle directory
+    all_metadata = []
+    puzzle_names = []
+    for data_dir in args.data_dirs:
+        with open(os.path.join(data_dir, "train", "dataset.json")) as f:
+            metadata = json.load(f)
+            all_metadata.append(metadata)
+        # Extract puzzle name from directory
+        puzzle_names.append(os.path.basename(data_dir.rstrip("/")))
+
+    # Combine metadata (use max values for compatibility)
+    combined_metadata = {
+        "vocab_size": max(m["vocab_size"] for m in all_metadata),
+        "seq_len": max(m["seq_len"] for m in all_metadata),
+        # Number of puzzle IDs = 1 (reserved) + num_puzzles
+        "num_puzzle_identifiers": num_puzzles + 1,
+    }
+
+    print(f"Puzzles: {puzzle_names}")
+    print(f"Combined metadata: {combined_metadata}")
 
     # Datasets
-    train_dataset = SinglePuzzleDataset(args.data_dir, "train")
-    test_dataset = SinglePuzzleDataset(args.data_dir, "test")
+    train_dataset = MultiPuzzleDataset(args.data_dirs, "train")
+    test_dataset = MultiPuzzleDataset(args.data_dirs, "test")
 
-    print(f"Training examples: {len(train_dataset)}")
+    print(f"Training examples: {len(train_dataset)} (across {num_puzzles} puzzle(s))")
     print(f"Test examples: {len(test_dataset)}")
+    for i, name in enumerate(puzzle_names):
+        train_count = len(train_dataset.get_puzzle_indices(i))
+        test_count = len(test_dataset.get_puzzle_indices(i))
+        print(f"  Puzzle {i+1} ({name}): {train_count} train, {test_count} test")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
@@ -398,10 +492,10 @@ def train(args):
         raise ValueError(f"Unknown model: {args.model}. Choose from {list(model_classes.keys())}")
 
     model = model_classes[args.model](
-        vocab_size=metadata["vocab_size"],
+        vocab_size=combined_metadata["vocab_size"],
         hidden_size=args.hidden_size,
-        num_puzzle_ids=metadata["num_puzzle_identifiers"],
-        seq_len=metadata["seq_len"],
+        num_puzzle_ids=combined_metadata["num_puzzle_identifiers"],
+        seq_len=combined_metadata["seq_len"],
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         H_cycles=args.H_cycles,
@@ -421,9 +515,9 @@ def train(args):
     print("\n" + "="*60)
     print("TRAINING START")
     print("="*60)
-    print(f"Training on {len(train_dataset)} examples (demos + augments)")
+    print(f"Training on {len(train_dataset)} examples from {num_puzzles} puzzle(s)")
     print(f"Testing on {len(test_dataset)} examples (held-out test inputs)")
-    print(f"Both use puzzle_identifier = 1 (shared embedding)")
+    print(f"Puzzle IDs: 1-{num_puzzles} (0 reserved)")
     print("="*60)
 
     # Debug: Check data
@@ -537,7 +631,12 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--data-dirs", type=str, nargs="+", default=None,
+                        help="Data directories for puzzles (optional - will auto-discover if not provided)")
+    parser.add_argument("--data-root", type=str, default="data",
+                        help="Root directory to search for puzzles (default: data/)")
+    parser.add_argument("--num-puzzles", type=int, default=1,
+                        help="Number of random puzzles to select (1-3, default: 1)")
     parser.add_argument("--model", type=str, default="trm", choices=["trm", "mlp", "cnn", "actual_trm"],
                         help="Model architecture: trm (simplified), mlp (simple), cnn (spatial), actual_trm (real TRM)")
     parser.add_argument("--epochs", type=int, default=1000)
@@ -549,6 +648,37 @@ if __name__ == "__main__":
     parser.add_argument("--H-cycles", type=int, default=2)
     parser.add_argument("--L-cycles", type=int, default=3)
     parser.add_argument("--eval-interval", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for puzzle selection (for reproducibility)")
 
     args = parser.parse_args()
+
+    # Validate num-puzzles
+    if args.num_puzzles < 1 or args.num_puzzles > 3:
+        parser.error("--num-puzzles must be between 1 and 3")
+
+    # If data-dirs not provided, auto-discover and randomly select
+    if args.data_dirs is None:
+        available = discover_puzzle_dirs(args.data_root)
+        if not available:
+            parser.error(f"No valid puzzle directories found in '{args.data_root}'. "
+                        "Use --data-dirs to specify manually or --data-root to change search path.")
+
+        if len(available) < args.num_puzzles:
+            parser.error(f"Requested {args.num_puzzles} puzzles but only {len(available)} available in '{args.data_root}'")
+
+        # Set seed if provided
+        if args.seed is not None:
+            random.seed(args.seed)
+
+        # Randomly select puzzles
+        args.data_dirs = random.sample(available, args.num_puzzles)
+        print(f"Auto-selected {args.num_puzzles} puzzle(s) from {len(available)} available:")
+        for d in args.data_dirs:
+            print(f"  - {os.path.basename(d)}")
+    else:
+        # Validate manually specified dirs
+        if len(args.data_dirs) > 3:
+            parser.error("Maximum 3 puzzle directories supported")
+
     train(args)
