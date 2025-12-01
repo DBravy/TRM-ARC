@@ -374,71 +374,84 @@ def grid_to_str(grid, r1, r2, c1, c2):
     return "\n".join(lines)
 
 
-def visualize_prediction(model, test_loader, epoch, test_acc, debug=False):
-    """Show side-by-side comparison of prediction vs ground truth."""
+def visualize_prediction(model, test_dataset, puzzle_names, epoch, test_acc, debug=False):
+    """Show side-by-side comparison of prediction vs ground truth for all puzzles."""
     model.eval()
+
+    tqdm.write(f"\n{'═'*50}")
+    tqdm.write(f"EPOCH {epoch} | Overall Test Acc: {test_acc:.2%}")
+    tqdm.write(f"{'═'*50}")
+
     with torch.no_grad():
-        test_batch = next(iter(test_loader))
-        inputs = test_batch["inputs"][:1].to(DEVICE)
-        labels = test_batch["labels"][:1].to(DEVICE)
-        puzzle_ids = test_batch["puzzle_identifiers"][:1].to(DEVICE)
+        # Show one example from each puzzle
+        for puzzle_idx in range(len(puzzle_names)):
+            puzzle_indices = test_dataset.get_puzzle_indices(puzzle_idx)
+            if not puzzle_indices:
+                continue
 
-        logits = model(inputs, puzzle_ids)
-        preds = logits.argmax(dim=-1)
+            # Get first example from this puzzle
+            sample = test_dataset[puzzle_indices[0]]
+            inputs = sample["inputs"].unsqueeze(0).to(DEVICE)
+            labels = sample["labels"].unsqueeze(0).to(DEVICE)
+            puzzle_ids = sample["puzzle_identifiers"].unsqueeze(0).to(DEVICE)
 
-        # Debug info
-        if debug or epoch <= 5000:
-            tqdm.write(f"\n[DEBUG] Logits shape: {logits.shape}")
-            tqdm.write(f"[DEBUG] Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
-            tqdm.write(f"[DEBUG] Logits mean/std: {logits.mean().item():.3f} / {logits.std().item():.3f}")
+            logits = model(inputs, puzzle_ids)
+            preds = logits.argmax(dim=-1)
 
-            # Show distribution of predictions
-            pred_flat = preds[0].cpu().numpy().flatten()
-            unique, counts = np.unique(pred_flat, return_counts=True)
-            tqdm.write(f"[DEBUG] Prediction distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
+            # Debug info (only for first puzzle)
+            if puzzle_idx == 0 and (debug or epoch <= 5000):
+                tqdm.write(f"\n[DEBUG] Logits shape: {logits.shape}")
+                tqdm.write(f"[DEBUG] Logits min/max: {logits.min().item():.3f} / {logits.max().item():.3f}")
+                tqdm.write(f"[DEBUG] Logits mean/std: {logits.mean().item():.3f} / {logits.std().item():.3f}")
 
-            # Show softmax probabilities for a non-padding position
-            label_flat = labels[0].cpu().numpy().flatten()
-            non_pad_idx = np.where(label_flat != 0)[0]
-            if len(non_pad_idx) > 0:
-                idx = non_pad_idx[0]
-                probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
-                tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
-            if len(non_pad_idx) > 20:
-                idx = non_pad_idx[20]
-                probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
-                tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
+                # Show distribution of predictions
+                pred_flat = preds[0].cpu().numpy().flatten()
+                unique, counts = np.unique(pred_flat, return_counts=True)
+                tqdm.write(f"[DEBUG] Prediction distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
 
-        # Convert to grids (30x30)
-        label_grid = labels[0].cpu().numpy().reshape(30, 30)
-        pred_grid = preds[0].cpu().numpy().reshape(30, 30)
+                # Show softmax probabilities for a non-padding position
+                label_flat = labels[0].cpu().numpy().flatten()
+                non_pad_idx = np.where(label_flat != 0)[0]
+                if len(non_pad_idx) > 0:
+                    idx = non_pad_idx[0]
+                    probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
+                    tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
+                if len(non_pad_idx) > 20:
+                    idx = non_pad_idx[20]
+                    probs = torch.softmax(logits[0, idx].float(), dim=-1).cpu().numpy()
+                    tqdm.write(f"[DEBUG] Softmax at pos {idx}: {probs.round(3)}")
 
-        r1, r2, c1, c2 = find_grid_bounds(label_grid)
+            # Convert to grids (30x30)
+            label_grid = labels[0].cpu().numpy().reshape(30, 30)
+            pred_grid = preds[0].cpu().numpy().reshape(30, 30)
 
-        # Token-level comparison
-        match = (pred_grid == label_grid)
-        valid = (label_grid != 0)
-        correct = (match & valid).sum()
-        total = valid.sum()
+            r1, r2, c1, c2 = find_grid_bounds(label_grid)
 
-        # Build side-by-side display
-        gt_lines = grid_to_str(label_grid, r1, r2, c1, c2).split("\n")
-        pred_lines = grid_to_str(pred_grid, r1, r2, c1, c2).split("\n")
+            # Token-level comparison
+            match = (pred_grid == label_grid)
+            valid = (label_grid != 0)
+            correct = (match & valid).sum()
+            total = valid.sum()
+            puzzle_acc = correct / total if total > 0 else 0
 
-        tqdm.write(f"\n{'─'*50}")
-        tqdm.write(f"EPOCH {epoch} | Test Acc: {test_acc:.2%} | Token: {correct}/{total}")
-        tqdm.write(f"{'─'*50}")
-        tqdm.write(f"{'GROUND TRUTH':<25} {'MODEL PREDICTION':<25}")
-        tqdm.write(f"{'─'*50}")
+            # Build side-by-side display
+            gt_lines = grid_to_str(label_grid, r1, r2, c1, c2).split("\n")
+            pred_lines = grid_to_str(pred_grid, r1, r2, c1, c2).split("\n")
 
-        max_lines = max(len(gt_lines), len(pred_lines))
-        for i in range(max_lines):
-            gt = gt_lines[i] if i < len(gt_lines) else ""
-            pr = pred_lines[i] if i < len(pred_lines) else ""
-            # Mark differences
-            tqdm.write(f"{gt:<25} {pr:<25}")
+            tqdm.write(f"\n{'─'*50}")
+            tqdm.write(f"Puzzle {puzzle_idx + 1}: {puzzle_names[puzzle_idx]}")
+            tqdm.write(f"Accuracy: {puzzle_acc:.2%} | Token: {correct}/{total}")
+            tqdm.write(f"{'─'*50}")
+            tqdm.write(f"{'GROUND TRUTH':<25} {'MODEL PREDICTION':<25}")
+            tqdm.write(f"{'─'*50}")
 
-        tqdm.write(f"{'─'*50}\n")
+            max_lines = max(len(gt_lines), len(pred_lines))
+            for i in range(max_lines):
+                gt = gt_lines[i] if i < len(gt_lines) else ""
+                pr = pred_lines[i] if i < len(pred_lines) else ""
+                tqdm.write(f"{gt:<25} {pr:<25}")
+
+        tqdm.write(f"{'═'*50}\n")
 
 
 def train(args):
@@ -610,8 +623,8 @@ def train(args):
                 best_test_acc = test_acc
                 best_test_epoch = epoch + 1
 
-            # Show visual comparison
-            visualize_prediction(model, test_loader, epoch + 1, test_acc)
+            # Show visual comparison for all puzzles
+            visualize_prediction(model, test_dataset, puzzle_names, epoch + 1, test_acc)
 
     print(f"\n" + "="*60)
     print("FINAL RESULTS")
