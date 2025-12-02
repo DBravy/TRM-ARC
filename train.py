@@ -707,6 +707,7 @@ def train(args):
 
     step = start_step
     best_val_acc = 0.0
+    training_start_time = time.time()
 
     for eval_iter in range(start_eval, num_evals):
         epoch_start = eval_iter * args.eval_interval
@@ -716,7 +717,14 @@ def train(args):
         model.train()
         carry = None
         train_loss = 0.0
+        train_acc = 0.0
+        train_exact_acc = 0.0
         train_count = 0
+        interval_loss = 0.0
+        interval_acc = 0.0
+        interval_exact_acc = 0.0
+        interval_count = 0
+        interval_start_time = time.time()
 
         pbar = tqdm(train_loader, desc=f"Training", leave=False)
         for set_name, batch, global_batch_size in pbar:
@@ -732,7 +740,14 @@ def train(args):
             )
 
             train_loss += metrics["train/loss"]
+            train_acc += metrics["train/accuracy"]
+            train_exact_acc += metrics["train/exact_accuracy"]
             train_count += 1
+
+            interval_loss += metrics["train/loss"]
+            interval_acc += metrics["train/accuracy"]
+            interval_exact_acc += metrics["train/exact_accuracy"]
+            interval_count += 1
 
             pbar.set_postfix({
                 "loss": f"{metrics['train/loss']:.4f}",
@@ -745,7 +760,44 @@ def train(args):
             if not args.no_wandb:
                 wandb.log(metrics, step=step)
 
+            # Print detailed stats every log_interval steps
+            if step % args.log_interval == 0:
+                elapsed = time.time() - training_start_time
+                interval_elapsed = time.time() - interval_start_time
+                steps_per_sec = interval_count / max(interval_elapsed, 1e-6)
+                avg_interval_loss = interval_loss / max(interval_count, 1)
+                avg_interval_acc = interval_acc / max(interval_count, 1)
+                avg_interval_exact = interval_exact_acc / max(interval_count, 1)
+
+                hours, remainder = divmod(int(elapsed), 3600)
+                minutes, seconds = divmod(remainder, 60)
+
+                print(f"\n  Step {step:,}/{total_steps:,} ({100*step/total_steps:.1f}%) | "
+                      f"Time: {hours:02d}:{minutes:02d}:{seconds:02d} | "
+                      f"{steps_per_sec:.1f} steps/s")
+                print(f"    Loss: {avg_interval_loss:.4f} | "
+                      f"Acc: {avg_interval_acc:.2%} | "
+                      f"Exact: {avg_interval_exact:.2%} | "
+                      f"LR: {metrics['train/lr']:.2e}")
+
+                # Reset interval tracking
+                interval_loss = 0.0
+                interval_acc = 0.0
+                interval_exact_acc = 0.0
+                interval_count = 0
+                interval_start_time = time.time()
+
         avg_train_loss = train_loss / max(train_count, 1)
+        avg_train_acc = train_acc / max(train_count, 1)
+        avg_train_exact = train_exact_acc / max(train_count, 1)
+
+        # Print epoch summary
+        print(f"\n{'─'*60}")
+        print(f"[Epoch {epoch_start + args.eval_interval}] Training Summary:")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Train Accuracy: {avg_train_acc:.2%}")
+        print(f"  Train Exact Accuracy: {avg_train_exact:.2%}")
+        print(f"{'─'*60}")
 
         # Evaluation
         print(f"[Epoch {epoch_start + args.eval_interval}] Evaluating...")
@@ -753,6 +805,7 @@ def train(args):
 
         if val_metrics["val/exact_accuracy"] > best_val_acc:
             best_val_acc = val_metrics["val/exact_accuracy"]
+            print(f"  *** New best validation accuracy! ***")
 
         print(f"  Val Accuracy: {val_metrics['val/accuracy']:.2%}")
         print(f"  Val Exact Accuracy: {val_metrics['val/exact_accuracy']:.2%}")
@@ -868,6 +921,8 @@ def parse_args():
 
     # Misc
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log-interval", type=int, default=100,
+                        help="Print training stats every N steps")
 
     return parser.parse_args()
 
