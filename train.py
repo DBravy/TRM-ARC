@@ -36,6 +36,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+def get_memory_usage_mb():
+    """Get current process memory usage in MB."""
+    if HAS_PSUTIL:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    return None
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -587,6 +601,12 @@ def train(args):
     # Build dataset if needed
     dataset_path = build_dataset_if_needed(args)
 
+    # Force garbage collection after dataset building to free memory
+    gc.collect()
+    mem = get_memory_usage_mb()
+    if mem:
+        print(f"Memory after dataset building: {mem:.0f} MB")
+
     # Import dataset utilities
     from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
 
@@ -604,10 +624,10 @@ def train(args):
     train_loader = DataLoader(
         train_dataset,
         batch_size=None,
-        num_workers=1,
-        prefetch_factor=8,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     eval_config = PuzzleDatasetConfig(
@@ -650,6 +670,9 @@ def train(args):
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
+    mem = get_memory_usage_mb()
+    if mem:
+        print(f"Memory after model creation: {mem:.0f} MB")
 
     # Create optimizers
     optimizers, optimizer_lrs = create_optimizers(args, model)
@@ -918,6 +941,10 @@ def parse_args():
     # Memory
     parser.add_argument("--empty-cache-interval", type=int, default=100,
                         help="Clear CUDA cache every N steps")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers (0 = main process, reduces RAM)")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="DataLoader prefetch factor (only if num-workers > 0)")
 
     # Misc
     parser.add_argument("--seed", type=int, default=42)
