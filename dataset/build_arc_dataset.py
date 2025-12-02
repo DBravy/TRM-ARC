@@ -235,23 +235,28 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             if config.single_puzzle is not None and name != config.single_puzzle:
                 continue
 
-            fraction = idx / len(puzzles)
-            test_examples_dest = None
-            for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
-                if fraction < f:
-                    test_examples_dest = dest
-                    break
-
-            assert test_examples_dest is not None
-
-            if test_examples_dest[0] == "test":
+            # In single puzzle mode, put puzzle in both train and test for evaluation
+            if config.single_puzzle is not None:
+                test_examples_dest = ("test", "all")
                 test_puzzles[name] = puzzle
+                print(f"Single puzzle mode: {name}")
+            else:
+                fraction = idx / len(puzzles)
+                test_examples_dest = None
+                for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
+                    if fraction < f:
+                        test_examples_dest = dest
+                        break
+
+                assert test_examples_dest is not None
+
+                if test_examples_dest[0] == "test":
+                    test_puzzles[name] = puzzle
 
             convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest})
             total_puzzles += 1
 
             if config.single_puzzle is not None:
-                print(f"Single puzzle mode: {name}")
                 break  # Only need this one puzzle
 
     print (f"Total puzzles: {total_puzzles}")
