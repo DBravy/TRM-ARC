@@ -396,6 +396,7 @@ def build_dataset_if_needed(args) -> str:
         test_set_name=config["test_set_name"],
         seed=args.seed,
         num_aug=args.num_augmentations,
+        test_num_aug=args.test_num_aug,
         puzzle_identifiers_start=1,
         single_puzzle=args.single_puzzle,
     )
@@ -585,6 +586,60 @@ def evaluate(
         "val/accuracy": total_metrics["accuracy"] / count,
         "val/exact_accuracy": total_metrics["exact_accuracy"] / count,
     }
+
+
+def evaluate_arc(
+    model: nn.Module,
+    eval_loader: DataLoader,
+    data_path: str,
+    metadata,
+    pass_Ks: tuple = (1, 2),
+) -> Dict[str, float]:
+    """Run ARC evaluation with voting mechanism.
+
+    This uses the ARC evaluator which:
+    1. Collects predictions from all augmented versions of each puzzle
+    2. Uses inverse_aug to map predictions back to original space
+    3. Votes on the best prediction based on frequency and confidence
+    4. Returns pass@K metrics
+    """
+    from evaluators.arc import ARC
+
+    evaluator = ARC(
+        data_path=data_path,
+        eval_metadata=metadata,
+        submission_K=2,
+        pass_Ks=pass_Ks,
+        aggregated_voting=True
+    )
+
+    evaluator.begin_eval()
+    model.eval()
+
+    with torch.inference_mode():
+        for set_name, batch, global_batch_size in eval_loader:
+            batch = {k: v.to(DEVICE) for k, v in batch.items()}
+
+            carry = model.initial_carry(batch)
+            while True:
+                carry, loss, metrics, outputs, all_finish = model(
+                    carry=carry, batch=batch,
+                    return_keys=["preds", "q_halt_logits"]
+                )
+                if all_finish:
+                    break
+
+            # Prepare predictions for evaluator
+            preds_dict = {
+                "preds": outputs["preds"],
+                "q_halt_logits": outputs["q_halt_logits"]
+            }
+
+            evaluator.update_batch(batch, preds_dict)
+
+    # Single-process mode: rank=0, world_size=1
+    result = evaluator.result(save_path=None, rank=0, world_size=1)
+    return result if result is not None else {}
 
 
 # =============================================================================
@@ -842,6 +897,22 @@ def train(args):
         print(f"  Val Exact Accuracy: {val_metrics['val/exact_accuracy']:.2%}")
         print(f"  Best Val Exact: {best_val_acc:.2%}")
 
+        # ARC voting evaluation (optional)
+        if args.use_arc_eval:
+            # Need to recreate eval_loader since it's an iterator
+            arc_eval_loader = DataLoader(
+                PuzzleDataset(eval_config, split="test"),
+                batch_size=None,
+                num_workers=0,
+            )
+            arc_metrics = evaluate_arc(
+                model, arc_eval_loader, dataset_path, metadata,
+                pass_Ks=(1, 2)
+            )
+            for k, v in arc_metrics.items():
+                print(f"  {k}: {v:.2%}")
+            val_metrics.update(arc_metrics)
+
         if not args.no_wandb:
             wandb.log(val_metrics, step=step)
 
@@ -897,6 +968,8 @@ def parse_args():
                         help="Root directory for datasets")
     parser.add_argument("--num-augmentations", type=int, default=1000,
                         help="Number of augmentations per puzzle when building dataset")
+    parser.add_argument("--test-num-aug", type=int, default=100,
+                        help="Number of augmentations for test split (0 = one prediction per puzzle)")
     parser.add_argument("--single-puzzle", type=str, default=None,
                         help="Train on only this puzzle ID (e.g., '00d62c1b')")
 
@@ -935,6 +1008,8 @@ def parse_args():
     # Evaluation & Visualization
     parser.add_argument("--eval-interval", type=int, default=10000,
                         help="Evaluate every N epochs")
+    parser.add_argument("--use-arc-eval", action="store_true",
+                        help="Use ARC voting evaluator for pass@K metrics (requires --test-num-aug > 0)")
     parser.add_argument("--visualize", action="store_true", default=True,
                         help="Show ASCII visualization at each eval")
     parser.add_argument("--no-visualize", action="store_false", dest="visualize",

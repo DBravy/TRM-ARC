@@ -22,6 +22,7 @@ class DataProcessConfig(BaseModel):
     test_set_name2: str = "your_test_set"
     seed: int = 42
     num_aug: int = 1000
+    test_num_aug: int = 0  # Number of augmentations for test split (0 = no augmentation)
     puzzle_identifiers_start: int = 1 # start > 1 to handle multiple datasets
     single_puzzle: str = None  # If set, only include this puzzle ID
     
@@ -151,7 +152,7 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
-def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]]):
+def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], test_aug_count: int = 0):
     # Convert
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
@@ -189,7 +190,13 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
         results.setdefault(dest_split, {})
         results[dest_split].setdefault(dest_set, [])
-        results[dest_split][dest_set].append([converted[dest] for converted in group])
+
+        # Limit augmentations for test split
+        if dest_split == "test":
+            max_versions = test_aug_count + 1  # +1 for original
+            results[dest_split][dest_set].append([converted[dest] for converted in group[:max_versions]])
+        else:
+            results[dest_split][dest_set].append([converted[dest] for converted in group])
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
@@ -253,7 +260,7 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 if test_examples_dest[0] == "test":
                     test_puzzles[name] = puzzle
 
-            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest})
+            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest}, test_aug_count=config.test_num_aug)
             total_puzzles += 1
 
             if config.single_puzzle is not None:
