@@ -365,7 +365,12 @@ def visualize_predictions(
 def build_dataset_if_needed(args) -> str:
     """Build dataset from raw JSON if it doesn't exist. Returns dataset path."""
     config = DATASET_CONFIGS[args.dataset]
-    output_dir = os.path.join(args.data_root, config["output_dir_suffix"])
+
+    # Use separate directory for single puzzle mode
+    if args.single_puzzle:
+        output_dir = os.path.join(args.data_root, f"single-puzzle-{args.single_puzzle}")
+    else:
+        output_dir = os.path.join(args.data_root, config["output_dir_suffix"])
 
     # Check if dataset already exists
     train_dataset_json = os.path.join(output_dir, "train", "dataset.json")
@@ -374,6 +379,8 @@ def build_dataset_if_needed(args) -> str:
         return output_dir
 
     print(f"Building dataset for {args.dataset}...")
+    if args.single_puzzle:
+        print(f"Single puzzle mode: {args.single_puzzle}")
     print(f"This may take a few minutes...")
 
     # Import dataset builder
@@ -390,6 +397,7 @@ def build_dataset_if_needed(args) -> str:
         seed=args.seed,
         num_aug=args.num_augmentations,
         puzzle_identifiers_start=1,
+        single_puzzle=args.single_puzzle,
     )
 
     convert_dataset(build_config)
@@ -889,6 +897,8 @@ def parse_args():
                         help="Root directory for datasets")
     parser.add_argument("--num-augmentations", type=int, default=1000,
                         help="Number of augmentations per puzzle when building dataset")
+    parser.add_argument("--single-puzzle", type=str, default=None,
+                        help="Train on only this puzzle ID (e.g., '00d62c1b')")
 
     # Model
     parser.add_argument("--hidden-size", type=int, default=512)

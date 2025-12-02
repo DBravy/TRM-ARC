@@ -23,6 +23,7 @@ class DataProcessConfig(BaseModel):
     seed: int = 42
     num_aug: int = 1000
     puzzle_identifiers_start: int = 1 # start > 1 to handle multiple datasets
+    single_puzzle: str = None  # If set, only include this puzzle ID
     
 ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
@@ -230,20 +231,28 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         
         # Assign by fraction
         for idx, (name, puzzle) in enumerate(puzzles):
+            # Filter to single puzzle if specified
+            if config.single_puzzle is not None and name != config.single_puzzle:
+                continue
+
             fraction = idx / len(puzzles)
             test_examples_dest = None
             for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
                 if fraction < f:
                     test_examples_dest = dest
                     break
-                    
+
             assert test_examples_dest is not None
-            
+
             if test_examples_dest[0] == "test":
                 test_puzzles[name] = puzzle
-                
+
             convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest})
             total_puzzles += 1
+
+            if config.single_puzzle is not None:
+                print(f"Single puzzle mode: {name}")
+                break  # Only need this one puzzle
 
     print (f"Total puzzles: {total_puzzles}")
     return results, test_puzzles
@@ -256,14 +265,17 @@ def convert_dataset(config: DataProcessConfig):
     data, test_puzzles = load_puzzles_arcagi(config)
     
     # Map global puzzle identifiers
+    # Use base puzzle name (without augmentation suffix) so all augmentations share the same ID
     num_identifiers = config.puzzle_identifiers_start  # 0 is blank, start at 1
     identifier_map = {}
     for split_name, split in data.items():
         for subset_name, subset in split.items():
             for group in subset:
                 for puzzle in group:
-                    if puzzle.id not in identifier_map:
-                        identifier_map[puzzle.id] = num_identifiers
+                    # Strip augmentation suffix to get base puzzle name
+                    base_name = puzzle.id.split(PuzzleIdSeparator)[0]
+                    if base_name not in identifier_map:
+                        identifier_map[base_name] = num_identifiers
                         num_identifiers += 1
     print (f"Total puzzle IDs (including <blank>): {num_identifiers}")
 
@@ -307,7 +319,8 @@ def convert_dataset(config: DataProcessConfig):
                         total_examples += 1
 
                     results["puzzle_indices"].append(example_id)
-                    results["puzzle_identifiers"].append(identifier_map[puzzle.id])
+                    base_name = puzzle.id.split(PuzzleIdSeparator)[0]
+                    results["puzzle_identifiers"].append(identifier_map[base_name])
 
                     puzzle_id += 1
                     total_puzzles += 1
