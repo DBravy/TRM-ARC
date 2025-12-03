@@ -496,9 +496,11 @@ def create_model(args, metadata, device):
         "mlp_t": False,
         "no_ACT_continue": True,
         "causal": False,
-        # CNN-guided freezing
-        "cnn_checkpoint_path": "checkpoints/pixel_error_cnn.pt",
+        # CNN joint training (enabled by default)
+        "cnn_checkpoint_path": "init",  # "init" = fresh CNN, or path to pretrained
         "cnn_freeze_threshold": 0.5,
+        "cnn_loss_weight": 0.1,
+        "cnn_freeze_warmup_steps": 1000,  # Train CNN before using for freezing
     }
 
     model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
@@ -506,7 +508,7 @@ def create_model(args, metadata, device):
 
     with torch.device(device):
         model = model_cls(config_dict)
-        model = loss_cls(model, loss_type="stablemax_cross_entropy")
+        model = loss_cls(model, loss_type="stablemax_cross_entropy", cnn_loss_weight=config_dict["cnn_loss_weight"])
 
     if args.compile and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model)
@@ -606,12 +608,18 @@ def train_step(
 
     # Extract metrics
     count = max(metrics["count"].item(), 1)
-    return carry, {
+    result_metrics = {
         "train/loss": loss.item() / global_batch_size,
         "train/accuracy": metrics["accuracy"].item() / count,
         "train/exact_accuracy": metrics["exact_accuracy"].item() / count,
         "train/lr": lr,
     }
+
+    # Add CNN loss if present
+    if "cnn_loss" in metrics:
+        result_metrics["train/cnn_loss"] = metrics["cnn_loss"].item()
+
+    return carry, result_metrics
 
 
 def evaluate(
@@ -906,11 +914,14 @@ def train(args):
             interval_exact_acc += metrics["train/exact_accuracy"]
             interval_count += 1
 
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{metrics['train/loss']:.4f}",
                 "acc": f"{metrics['train/accuracy']:.2%}",
                 "lr": f"{metrics['train/lr']:.2e}",
-            })
+            }
+            if "train/cnn_loss" in metrics:
+                postfix["cnn"] = f"{metrics['train/cnn_loss']:.4f}"
+            pbar.set_postfix(postfix)
 
             memory_manager.step_update(step)
 

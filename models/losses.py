@@ -39,10 +39,11 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str, cnn_loss_weight: float = 0.1):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.cnn_loss_weight = cnn_loss_weight
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -96,8 +97,15 @@ class ACTLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
-        # Filter outputs for return
-        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        # CNN joint training loss
+        cnn_loss = 0
+        if outputs.get("cnn_loss") is not None:
+            cnn_loss = self.cnn_loss_weight * outputs["cnn_loss"]
+            metrics["cnn_loss"] = outputs["cnn_loss"].detach()
+
+        # Filter outputs for return
+        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs and outputs[k] is not None}
+
+        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + cnn_loss, metrics, detached_outputs, new_carry.halted.all()
 

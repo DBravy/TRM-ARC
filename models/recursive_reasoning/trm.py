@@ -62,9 +62,11 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
-    # CNN-guided freezing
+    # CNN-guided freezing and joint training
     cnn_checkpoint_path: Optional[str] = None
     cnn_freeze_threshold: float = 0.5
+    cnn_loss_weight: float = 0.1  # Weight for CNN loss in joint training
+    cnn_freeze_warmup_steps: int = 0  # Steps before using CNN for freezing
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -163,14 +165,20 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
-        # Load frozen CNN for correctness detection
+        # Load CNN for correctness detection (jointly trained)
         self.correctness_cnn = None
         if self.config.cnn_checkpoint_path:
             from train_pixel_error_cnn import PixelErrorCNN
-            self.correctness_cnn = PixelErrorCNN.from_checkpoint(self.config.cnn_checkpoint_path)
-            self.correctness_cnn.eval()
-            for param in self.correctness_cnn.parameters():
-                param.requires_grad = False
+            if self.config.cnn_checkpoint_path == "init":
+                # Initialize fresh CNN without loading weights
+                self.correctness_cnn = PixelErrorCNN(hidden_dim=64)
+            else:
+                # Load from checkpoint as initialization
+                self.correctness_cnn = PixelErrorCNN.from_checkpoint(self.config.cnn_checkpoint_path)
+            # CNN is now trainable - no freezing
+
+        # Step counter for CNN warmup
+        self.register_buffer('cnn_step_counter', torch.tensor(0, dtype=torch.long))
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -246,7 +254,55 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             
             return frozen_full.unsqueeze(-1)  # [B, L, 1]
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def _compute_cnn_loss(self, z_H: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Compute CNN loss for joint training.
+
+        The CNN learns to predict which pixels in the current TRM output are incorrect
+        by comparing against ground truth labels.
+
+        Returns:
+            CNN loss tensor, or None if CNN is not enabled.
+        """
+        if self.correctness_cnn is None:
+            return None
+
+        # Get current TRM predictions (detached - CNN learns independently)
+        with torch.no_grad():
+            logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
+            current_output = logits.argmax(dim=-1)  # [B, seq_len]
+
+            # Convert to color space (0-9)
+            current_output_colors = (current_output - 2).clamp(0, 9)
+            current_output_2d = current_output_colors.view(-1, 30, 30).long()
+
+            # Input grid in color space
+            input_colors = (batch["inputs"] - 2).clamp(0, 9)
+            input_2d = input_colors.view(-1, 30, 30).long()
+
+            # Ground truth labels
+            labels = batch["labels"]
+            # Handle IGNORE_LABEL_ID (-100) - these positions should be ignored
+            valid_mask = (labels != IGNORE_LABEL_ID)
+            label_colors = (labels.clamp(min=0) - 2).clamp(0, 9)
+            label_2d = label_colors.view(-1, 30, 30)
+            valid_2d = valid_mask.view(-1, 30, 30)
+
+            # Actual correctness: 1.0 = correct, 0.0 = wrong
+            actual_correct = (current_output_2d == label_2d).float()
+
+        # CNN predicts correctness (this has gradients)
+        predicted_logits = self.correctness_cnn(input_2d, current_output_2d)
+
+        # BCE loss only on valid positions
+        if valid_2d.any():
+            loss = F.binary_cross_entropy_with_logits(
+                predicted_logits[valid_2d],
+                actual_correct[valid_2d]
+            )
+            return loss
+        return None
+
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -256,44 +312,55 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
-        
+
+        # Check if we're past warmup period for CNN freezing
+        use_cnn_freezing = (self.correctness_cnn is not None and
+                           self.cnn_step_counter.item() >= self.config.cnn_freeze_warmup_steps)
+
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
-                # Get frozen mask at start of this H step
-                frozen_mask = self._get_frozen_mask(z_H, batch)
+                # Get frozen mask at start of this H step (only after warmup)
+                frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
                 if frozen_mask is not None:
                     z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
-                
+
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
-                
+
                 # Restore frozen positions
                 if frozen_mask is not None:
                     z_H = torch.where(frozen_mask, z_H_cached, z_H)
                     z_L = torch.where(frozen_mask, z_L_cached, z_L)
-        
+
         # 1 with grad
-        # Get frozen mask for final step
-        frozen_mask = self._get_frozen_mask(z_H, batch)
+        # Get frozen mask for final step (only after warmup)
+        frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
         if frozen_mask is not None:
             z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
-        
+
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
-        
+
         # Restore frozen positions (with grad - uses torch.where which is differentiable)
         if frozen_mask is not None:
             z_H = torch.where(frozen_mask, z_H_cached, z_H)
             z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
+        # Compute CNN loss for joint training (always, if CNN exists)
+        cnn_loss = self._compute_cnn_loss(z_H, batch) if self.training else None
+
+        # Increment step counter during training
+        if self.training:
+            self.cnn_step_counter.add_(1)
+
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), cnn_loss
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -331,12 +398,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), cnn_loss = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "cnn_loss": cnn_loss,  # May be None if CNN not enabled
         }
 
         with torch.no_grad():
