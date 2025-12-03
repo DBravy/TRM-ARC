@@ -1088,7 +1088,7 @@ def parse_args():
                         help="Disable visualization")
     parser.add_argument("--vis-samples", type=int, default=3,
                         help="Number of samples to visualize per eval")
-    parser.add_argument("--cnn-checkpoint", type=str, default=None,
+    parser.add_argument("--cnn-checkpoint", type=str, default="checkpoints/pixel_error_cnn.pt",
                         help="Path to CNN error detector checkpoint for visualization")
 
     # Logging (WandB enabled by default)
