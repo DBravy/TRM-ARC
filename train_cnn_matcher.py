@@ -521,11 +521,6 @@ def main():
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction of data for validation")
 
-    # Checkpointing
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_matcher")
-    parser.add_argument("--save-every", type=int, default=10,
-                        help="Save checkpoint every N epochs")
-
     # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -611,9 +606,6 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
-    # Checkpoint dir
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
     # Training loop
     print("\n" + "="*60)
     print("Starting Training")
@@ -637,40 +629,16 @@ def main():
         print(f"  Val Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.2%}")
         print(f"  Val Precision: {val_metrics['precision']:.2%}, Recall: {val_metrics['recall']:.2%}, F1: {val_metrics['f1']:.2%}")
 
-        # Save best model
+        # Track best
         if val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-            }, os.path.join(args.checkpoint_dir, 'best_model.pt'))
-            print(f"  [New best model saved! F1: {best_val_f1:.2%}]")
+            print(f"  [New best F1: {best_val_f1:.2%}]")
 
-        # Periodic checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt'))
-
-    # Final evaluation
+    # Final summary
     print("\n" + "="*60)
-    print("Final Evaluation")
+    print("Training Complete")
     print("="*60)
-
-    # Load best model
-    checkpoint = torch.load(os.path.join(args.checkpoint_dir, 'best_model.pt'))
-    model.load_state_dict(checkpoint['model_state_dict'])
-
-    final_metrics = evaluate(model, val_loader, DEVICE)
-    print(f"Best Model Metrics:")
-    print(f"  Accuracy: {final_metrics['accuracy']:.2%}")
-    print(f"  Precision: {final_metrics['precision']:.2%}")
-    print(f"  Recall: {final_metrics['recall']:.2%}")
-    print(f"  F1: {final_metrics['f1']:.2%}")
+    print(f"Best F1: {best_val_f1:.2%}")
 
     # Demo predictions
     demo_predictions(model, val_dataset, DEVICE)
