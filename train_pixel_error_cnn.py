@@ -460,70 +460,103 @@ def visualize_predictions(
     device: torch.device,
     num_samples: int = 3,
 ):
-    """Visualize pixel-level predictions"""
+    """
+    Visualize pixel-level predictions showing the full task:
+    - Input grid
+    - Correct output
+    - Distractor (wrong) output
+    - Where errors are
+    - What the model predicts
+    """
     model.eval()
 
-    print("\n" + "="*70)
-    print("Sample Predictions (showing error locations)")
-    print("="*70)
+    print("\n" + "="*80)
+    print("VISUALIZATION: What the model is learning")
+    print("="*80)
+    print("\nThe model sees: INPUT + DISTRACTOR")
+    print("The model predicts: which pixels in DISTRACTOR are WRONG")
+    print("="*80)
 
-    # Get some negative samples (more interesting to visualize)
-    indices = []
-    for i in range(len(dataset)):
-        if i % (1 + dataset.num_negatives) != 0:  # Skip positives
-            indices.append(i)
-        if len(indices) >= num_samples * 2:
-            break
+    # Get raw examples from dataset (before augmentation)
+    examples = dataset.examples[:num_samples]
 
-    random.shuffle(indices)
+    for i, (input_grid_raw, correct_output_raw, puzzle_id) in enumerate(examples):
+        print(f"\n{'━'*80}")
+        print(f"Example {i+1}: Puzzle {puzzle_id}")
+        print(f"{'━'*80}")
 
-    for idx in indices[:num_samples]:
-        input_grid, output_grid, pixel_mask, is_positive = dataset[idx]
-        input_grid = input_grid.unsqueeze(0).to(device)
-        output_grid = output_grid.unsqueeze(0).to(device)
+        # Generate a distractor (wrong output)
+        wrong_output, _ = dataset._generate_negative(correct_output_raw, puzzle_id)
+
+        # Pad all grids
+        input_padded = dataset._pad_grid(input_grid_raw)
+        correct_padded = dataset._pad_grid(correct_output_raw)
+        wrong_padded = dataset._pad_grid(wrong_output)
+
+        # Compute error mask
+        error_mask = (wrong_padded != correct_padded).astype(np.float32)
+
+        # Get model prediction
+        inp_t = torch.from_numpy(input_padded.copy()).long().unsqueeze(0).to(device)
+        wrong_t = torch.from_numpy(wrong_padded.copy()).long().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred_proba = model.predict_proba(input_grid, output_grid)[0].cpu().numpy()
+            pred_proba = model.predict_proba(inp_t, wrong_t)[0].cpu().numpy()
 
-        pixel_mask = pixel_mask.numpy()
-        output_grid = output_grid[0].cpu().numpy()
+        # Find bounds based on correct output (the actual content)
+        h, w = correct_output_raw.shape
+        r_min, c_min = 0, 0
+        r_max = min(h, 12)
+        c_max = min(w, 12)
 
-        # Find actual grid bounds (non-zero region)
-        non_zero = output_grid > 0
-        if non_zero.any():
-            rows = np.any(non_zero, axis=1)
-            cols = np.any(non_zero, axis=0)
-            r_min, r_max = np.where(rows)[0][[0, -1]]
-            c_min, c_max = np.where(cols)[0][[0, -1]]
-        else:
-            r_min, r_max, c_min, c_max = 0, 5, 0, 5
+        # Print grids side by side
+        print(f"\n{'INPUT':<15} {'CORRECT OUTPUT':<15} {'DISTRACTOR':<15} {'ERRORS (X=wrong)':<18} {'MODEL PRED':<15}")
+        print(f"{'─'*15} {'─'*15} {'─'*15} {'─'*18} {'─'*15}")
 
-        r_max = min(r_max + 1, r_min + 10)
-        c_max = min(c_max + 1, c_min + 10)
-
-        print(f"\n{'─'*70}")
-        print(f"Sample (is_positive={is_positive:.0f})")
-        print(f"{'─'*70}")
-
-        # Show output grid, true errors, and predicted errors side by side
-        print(f"{'OUTPUT GRID':<20} {'TRUE ERRORS':<20} {'PREDICTED ERRORS':<20}")
-
-        for r in range(r_min, r_max):
-            out_row = ""
-            true_row = ""
+        for r in range(r_max):
+            inp_row = ""
+            correct_row = ""
+            wrong_row = ""
+            error_row = ""
             pred_row = ""
-            for c in range(c_min, c_max):
-                out_row += f"{output_grid[r, c]} "
-                true_row += "X " if pixel_mask[r, c] == 0 else ". "
+
+            for c in range(c_max):
+                # Input
+                if r < input_grid_raw.shape[0] and c < input_grid_raw.shape[1]:
+                    inp_row += f"{input_grid_raw[r, c]} "
+                else:
+                    inp_row += ". "
+
+                # Correct output
+                if r < correct_output_raw.shape[0] and c < correct_output_raw.shape[1]:
+                    correct_row += f"{correct_output_raw[r, c]} "
+                else:
+                    correct_row += ". "
+
+                # Wrong output (distractor)
+                if r < wrong_output.shape[0] and c < wrong_output.shape[1]:
+                    wrong_row += f"{wrong_output[r, c]} "
+                else:
+                    wrong_row += ". "
+
+                # Error mask (X where distractor differs from correct)
+                error_row += "X " if error_mask[r, c] == 1 else ". "
+
+                # Model prediction (X where model thinks it's wrong)
                 pred_row += "X " if pred_proba[r, c] < 0.5 else ". "
-            print(f"{out_row:<20} {true_row:<20} {pred_row:<20}")
 
-        # Count errors
-        true_errors = (pixel_mask == 0).sum()
-        pred_errors = (pred_proba < 0.5).sum()
-        correct_errors = ((pixel_mask == 0) & (pred_proba < 0.5)).sum()
+            print(f"{inp_row:<15} {correct_row:<15} {wrong_row:<15} {error_row:<18} {pred_row:<15}")
 
-        print(f"\nTrue errors: {true_errors}, Predicted errors: {pred_errors}, Correctly identified: {correct_errors}")
+        # Statistics
+        total_errors = int(error_mask.sum())
+        pred_errors = int((pred_proba < 0.5).sum())
+        true_positives = int(((error_mask == 1) & (pred_proba < 0.5)).sum())
+
+        precision = true_positives / pred_errors if pred_errors > 0 else 0
+        recall = true_positives / total_errors if total_errors > 0 else 0
+
+        print(f"\nStats: {total_errors} actual errors, {pred_errors} predicted errors, {true_positives} correctly found")
+        print(f"       Precision: {precision:.0%}, Recall: {recall:.0%}")
 
 
 # =============================================================================
