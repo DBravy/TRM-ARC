@@ -440,6 +440,9 @@ def create_model(args, metadata, device):
         "mlp_t": False,
         "no_ACT_continue": True,
         "causal": False,
+        # CNN-guided freezing
+        "cnn_checkpoint_path": "checkpoints/pixel_error_cnn.pt",
+        "cnn_freeze_threshold": 0.5,
     }
 
     model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")

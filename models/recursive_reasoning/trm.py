@@ -62,6 +62,10 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
+    # CNN-guided freezing
+    cnn_checkpoint_path: Optional[str] = None
+    cnn_freeze_threshold: float = 0.5
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -159,6 +163,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
+        # Load frozen CNN for correctness detection
+        self.correctness_cnn = None
+        if self.config.cnn_checkpoint_path:
+            from train_pixel_error_cnn import PixelErrorCNN
+            self.correctness_cnn = PixelErrorCNN.from_checkpoint(self.config.cnn_checkpoint_path)
+            self.correctness_cnn.eval()
+            for param in self.correctness_cnn.parameters():
+                param.requires_grad = False
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -196,6 +209,37 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), L_init, carry.z_L),
         )
 
+    def _get_frozen_mask(self, z_H: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Get mask of positions that should be frozen.
+        
+        Returns:
+            Tensor of shape [B, L, 1] where True = frozen (high confidence correct).
+            Returns None if CNN is not enabled.
+        """
+        if self.correctness_cnn is None:
+            return None
+        
+        with torch.no_grad():
+            # Get current predictions from z_H
+            logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
+            current_output = logits.argmax(dim=-1)  # [B, seq_len]
+            current_output_2d = current_output.view(-1, 30, 30).long()  # [B, 30, 30]
+            
+            # Get input grid
+            input_2d = batch["inputs"].view(-1, 30, 30).long()  # [B, 30, 30]
+            
+            # Run CNN to get correctness confidence
+            confidence = self.correctness_cnn.predict_proba(input_2d, current_output_2d)  # [B, 30, 30]
+            
+            # Create mask - True where frozen (high confidence = probably correct)
+            frozen_2d = confidence > self.config.cnn_freeze_threshold  # [B, 30, 30]
+            frozen_seq = frozen_2d.view(-1, self.config.seq_len)  # [B, seq_len]
+            
+            # Prepend False for puzzle_emb positions (never frozen)
+            frozen_full = F.pad(frozen_seq, (self.puzzle_emb_len, 0), value=False)  # [B, seq_len + puzzle_emb_len]
+            
+            return frozen_full.unsqueeze(-1)  # [B, L, 1]
+
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -205,18 +249,39 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
+        
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
+                # Get frozen mask at start of this H step
+                frozen_mask = self._get_frozen_mask(z_H, batch)
+                if frozen_mask is not None:
+                    z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+                
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
+                
+                # Restore frozen positions
+                if frozen_mask is not None:
+                    z_H = torch.where(frozen_mask, z_H_cached, z_H)
+                    z_L = torch.where(frozen_mask, z_L_cached, z_L)
+        
         # 1 with grad
+        # Get frozen mask for final step
+        frozen_mask = self._get_frozen_mask(z_H, batch)
+        if frozen_mask is not None:
+            z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+        
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
+        
+        # Restore frozen positions (with grad - uses torch.where which is differentiable)
+        if frozen_mask is not None:
+            z_H = torch.where(frozen_mask, z_H_cached, z_H)
+            z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
