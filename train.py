@@ -496,11 +496,12 @@ def create_model(args, metadata, device):
         "mlp_t": False,
         "no_ACT_continue": True,
         "causal": False,
-        # CNN joint training (enabled by default)
-        "cnn_checkpoint_path": "init",  # "init" = fresh CNN, or path to pretrained
+        # CNN-guided pixel freezing (uses pretrained CNN)
+        # Use pretrained checkpoint if it exists, otherwise disable CNN
+        "cnn_checkpoint_path": "checkpoints/pixel_error_cnn.pt" if os.path.exists("checkpoints/pixel_error_cnn.pt") else None,
         "cnn_freeze_threshold": 0.5,
-        "cnn_loss_weight": 0.1,
-        "cnn_freeze_warmup_steps": 1000,  # Train CNN before using for freezing
+        "cnn_loss_weight": 0.0,  # Don't train the CNN, use pretrained weights
+        "cnn_freeze_warmup_steps": 0,  # Use CNN freezing from the start
     }
 
     model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
