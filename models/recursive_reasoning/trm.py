@@ -222,11 +222,17 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             # Get current predictions from z_H
             logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
-            current_output = logits.argmax(dim=-1)  # [B, seq_len]
-            current_output_2d = current_output.view(-1, 30, 30).long()  # [B, 30, 30]
+            current_output = logits.argmax(dim=-1)  # [B, seq_len], values 0-11 (vocab space)
             
-            # Get input grid
-            input_2d = batch["inputs"].view(-1, 30, 30).long()  # [B, 30, 30]
+            # Convert from vocab space to color space
+            # Vocab: PAD=0, EOS=1, colors 2-11 -> Color space: 0-9
+            # Subtract 2 and clamp: PAD/EOS become 0, colors 2-11 become 0-9
+            current_output_colors = (current_output - 2).clamp(0, 9)
+            current_output_2d = current_output_colors.view(-1, 30, 30).long()  # [B, 30, 30]
+            
+            # Get input grid and convert from vocab space to color space
+            input_colors = (batch["inputs"] - 2).clamp(0, 9)
+            input_2d = input_colors.view(-1, 30, 30).long()  # [B, 30, 30]
             
             # Run CNN to get correctness confidence
             confidence = self.correctness_cnn.predict_proba(input_2d, current_output_2d)  # [B, 30, 30]
