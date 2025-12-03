@@ -285,8 +285,9 @@ def visualize_predictions(
     metrics: Dict[str, float],
     num_samples: int = 3,
     identifier_map: Optional[List[str]] = None,
+    cnn_model: Optional[nn.Module] = None,
 ):
-    """Visualize predictions at eval interval."""
+    """Visualize predictions at eval interval, optionally with CNN error detection."""
     model.eval()
 
     print(f"\n{'='*60}")
@@ -334,20 +335,75 @@ def visualize_predictions(
                 total = mask.sum()
                 acc = correct / total if total > 0 else 0
 
-                print(f"\n{'-'*60}")
+                # Get CNN error predictions if available
+                cnn_error_mask = None
+                if cnn_model is not None:
+                    # Convert grids to CNN format (values 0-9, not tokens 2-11)
+                    inp_grid = np.clip(inputs - 2, 0, 9).astype(np.int64)
+                    pred_grid = np.clip(pred - 2, 0, 9).astype(np.int64)
+
+                    inp_t = torch.from_numpy(inp_grid).long().unsqueeze(0).to(DEVICE)
+                    pred_t = torch.from_numpy(pred_grid).long().unsqueeze(0).to(DEVICE)
+
+                    cnn_proba = cnn_model.predict_proba(inp_t, pred_t)[0].cpu().numpy()
+                    cnn_error_mask = (cnn_proba < 0.5)  # True where CNN thinks pixel is wrong
+
+                print(f"\n{'-'*80}")
                 print(f"Sample: {puzzle_name}")
                 print(f"Token Accuracy: {acc:.2%} ({correct}/{total})")
-                print(f"{'-'*60}")
+                print(f"{'-'*80}")
 
+                # Build display strings
                 gt_lines = grid_to_str(labels, r1, r2, c1, c2).split("\n")
                 pred_lines = grid_to_str(pred, r1, r2, c1, c2).split("\n")
 
-                print(f"{'GROUND TRUTH':<25} {'PREDICTION':<25}")
-                max_lines = max(len(gt_lines), len(pred_lines))
-                for i in range(max_lines):
-                    gt = gt_lines[i] if i < len(gt_lines) else ""
-                    pr = pred_lines[i] if i < len(pred_lines) else ""
-                    print(f"{gt:<25} {pr:<25}")
+                # Build CNN error indicator lines
+                if cnn_error_mask is not None:
+                    cnn_lines = []
+                    for r in range(r1, min(r2, r1 + 12)):
+                        row = []
+                        for c in range(c1, min(c2, c1 + 12)):
+                            if cnn_error_mask[r, c]:
+                                row.append("X")  # CNN thinks this is wrong
+                            else:
+                                row.append(".")
+                        cnn_lines.append(" ".join(row))
+
+                    # Also compute actual errors for comparison
+                    actual_errors = (pred != labels) & mask.astype(bool)
+                    actual_lines = []
+                    for r in range(r1, min(r2, r1 + 12)):
+                        row = []
+                        for c in range(c1, min(c2, c1 + 12)):
+                            if actual_errors[r, c]:
+                                row.append("X")
+                            else:
+                                row.append(".")
+                        actual_lines.append(" ".join(row))
+
+                    print(f"{'GROUND TRUTH':<25} {'PREDICTION':<25} {'ACTUAL ERRORS':<25} {'CNN PRED ERRORS':<25}")
+                    max_lines = max(len(gt_lines), len(pred_lines), len(cnn_lines))
+                    for i in range(max_lines):
+                        gt = gt_lines[i] if i < len(gt_lines) else ""
+                        pr = pred_lines[i] if i < len(pred_lines) else ""
+                        ae = actual_lines[i] if i < len(actual_lines) else ""
+                        cn = cnn_lines[i] if i < len(cnn_lines) else ""
+                        print(f"{gt:<25} {pr:<25} {ae:<25} {cn:<25}")
+
+                    # CNN accuracy stats
+                    cnn_pred_errors = cnn_error_mask[r1:r2, c1:c2].sum()
+                    actual_error_count = actual_errors[r1:r2, c1:c2].sum()
+                    cnn_correct = ((cnn_error_mask == actual_errors) & mask.astype(bool))[r1:r2, c1:c2].sum()
+                    cnn_total = mask[r1:r2, c1:c2].sum()
+                    print(f"\nCNN: {cnn_pred_errors} predicted errors, {actual_error_count} actual errors, "
+                          f"{cnn_correct}/{cnn_total} pixels correct")
+                else:
+                    print(f"{'GROUND TRUTH':<25} {'PREDICTION':<25}")
+                    max_lines = max(len(gt_lines), len(pred_lines))
+                    for i in range(max_lines):
+                        gt = gt_lines[i] if i < len(gt_lines) else ""
+                        pr = pred_lines[i] if i < len(pred_lines) else ""
+                        print(f"{gt:<25} {pr:<25}")
 
                 samples_shown += 1
                 if samples_shown >= num_samples:
@@ -355,7 +411,7 @@ def visualize_predictions(
 
             break  # Only need one batch
 
-    print(f"{'='*60}\n")
+    print(f"{'='*80}\n")
 
 
 # =============================================================================
@@ -774,6 +830,18 @@ def train(args):
         start_eval = start_step // (args.eval_interval * args.batch_size // (metadata.total_groups * metadata.mean_puzzle_examples))
         print(f"Resumed from step {start_step}")
 
+    # Load CNN error detector for visualization (optional)
+    cnn_model = None
+    if args.cnn_checkpoint and os.path.exists(args.cnn_checkpoint):
+        print(f"\nLoading CNN error detector from {args.cnn_checkpoint}...")
+        try:
+            from train_pixel_error_cnn import PixelErrorCNN
+            cnn_model = PixelErrorCNN.from_checkpoint(args.cnn_checkpoint, DEVICE)
+            print("CNN error detector loaded successfully")
+        except Exception as e:
+            print(f"Warning: Could not load CNN model: {e}")
+            cnn_model = None
+
     # Initialize WandB
     if not args.no_wandb:
         import wandb
@@ -931,6 +999,7 @@ def train(args):
                 model, viz_loader, step, val_metrics,
                 num_samples=args.vis_samples,
                 identifier_map=identifier_map,
+                cnn_model=cnn_model,
             )
 
         # Save checkpoint
@@ -1019,6 +1088,8 @@ def parse_args():
                         help="Disable visualization")
     parser.add_argument("--vis-samples", type=int, default=3,
                         help="Number of samples to visualize per eval")
+    parser.add_argument("--cnn-checkpoint", type=str, default=None,
+                        help="Path to CNN error detector checkpoint for visualization")
 
     # Logging (WandB enabled by default)
     parser.add_argument("--no-wandb", action="store_true",
