@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Pixel-Level Error Detection CNN for ARC Puzzles
+Pixel-Level Error Detection CNN for ARC Puzzles - HARD NEGATIVES VERSION
 
-This trains a CNN to predict which specific pixels in a candidate output
-are incorrect. The model outputs a 30x30 heatmap where each pixel indicates
-the probability that pixel is correct.
+This version focuses on hard negatives that are "almost correct" to force
+the CNN to learn fine-grained pixel-level correctness detection.
+
+Hard negative strategies:
+1. Single pixel corruption (1 pixel wrong)
+2. Few pixel corruption (2-5 pixels wrong)  
+3. Local region corruption (small contiguous area)
+4. Color swap (swap two colors throughout)
+5. Single row/column shift
+6. Boundary errors (errors only at edges of shapes)
+7. Pattern extension errors (extend a repeating pattern incorrectly)
 
 Usage:
-    python train_pixel_error_cnn.py --dataset arc-agi-1
-    python train_pixel_error_cnn.py --single-puzzle 00d62c1b
+    python train_pixel_error_cnn_hard.py --dataset arc-agi-1
+    python train_pixel_error_cnn_hard.py --single-puzzle 00d62c1b
 """
 
 import argparse
 import json
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -23,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from scipy import ndimage
 
 # Determine device
 if torch.cuda.is_available():
@@ -73,6 +82,298 @@ def random_color_permutation() -> np.ndarray:
 def apply_augmentation(grid: np.ndarray, trans_id: int, color_map: np.ndarray) -> np.ndarray:
     """Apply dihedral transform and color permutation"""
     return dihedral_transform(color_map[grid], trans_id)
+
+
+# =============================================================================
+# Hard Negative Generation
+# =============================================================================
+
+def get_nonzero_positions(grid: np.ndarray) -> List[Tuple[int, int]]:
+    """Get list of positions with non-zero values"""
+    positions = list(zip(*np.where(grid > 0)))
+    return positions
+
+
+def get_boundary_positions(grid: np.ndarray) -> List[Tuple[int, int]]:
+    """Get positions at boundaries between different colors"""
+    h, w = grid.shape
+    boundary = []
+    
+    for r in range(h):
+        for c in range(w):
+            if grid[r, c] == 0:
+                continue
+            # Check if any neighbor is different
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w:
+                    if grid[nr, nc] != grid[r, c]:
+                        boundary.append((r, c))
+                        break
+    return boundary
+
+
+def get_colors_used(grid: np.ndarray) -> List[int]:
+    """Get list of colors used in grid (excluding 0)"""
+    return [c for c in np.unique(grid) if c > 0]
+
+
+def corrupt_single_pixel(grid: np.ndarray) -> np.ndarray:
+    """Corrupt exactly 1 pixel"""
+    result = grid.copy()
+    positions = get_nonzero_positions(grid)
+    
+    if not positions:
+        # Fallback: corrupt any position
+        r, c = random.randint(0, grid.shape[0]-1), random.randint(0, grid.shape[1]-1)
+    else:
+        r, c = random.choice(positions)
+    
+    # Change to a different color
+    current = result[r, c]
+    new_color = random.choice([x for x in range(10) if x != current])
+    result[r, c] = new_color
+    
+    return result
+
+
+def corrupt_few_pixels(grid: np.ndarray, num_pixels: int = None) -> np.ndarray:
+    """Corrupt 2-5 random pixels"""
+    result = grid.copy()
+    
+    if num_pixels is None:
+        num_pixels = random.randint(2, 5)
+    
+    positions = get_nonzero_positions(grid)
+    if len(positions) < num_pixels:
+        positions = [(r, c) for r in range(grid.shape[0]) for c in range(grid.shape[1])]
+    
+    chosen = random.sample(positions, min(num_pixels, len(positions)))
+    
+    for r, c in chosen:
+        current = result[r, c]
+        new_color = random.choice([x for x in range(10) if x != current])
+        result[r, c] = new_color
+    
+    return result
+
+
+def corrupt_local_region(grid: np.ndarray) -> np.ndarray:
+    """Corrupt a small contiguous region (2x2 or 3x3)"""
+    result = grid.copy()
+    h, w = grid.shape
+    
+    # Choose region size
+    size = random.choice([2, 2, 2, 3])  # Bias toward 2x2
+    
+    # Find a position where we can place the region
+    positions = get_nonzero_positions(grid)
+    if positions:
+        center_r, center_c = random.choice(positions)
+    else:
+        center_r = random.randint(0, h - size)
+        center_c = random.randint(0, w - size)
+    
+    # Ensure region fits
+    start_r = max(0, min(center_r, h - size))
+    start_c = max(0, min(center_c, w - size))
+    
+    # Corrupt the region
+    for dr in range(size):
+        for dc in range(size):
+            r, c = start_r + dr, start_c + dc
+            if r < h and c < w:
+                current = result[r, c]
+                new_color = random.choice([x for x in range(10) if x != current])
+                result[r, c] = new_color
+    
+    return result
+
+
+def corrupt_color_swap(grid: np.ndarray) -> np.ndarray:
+    """Swap two colors throughout the grid"""
+    colors = get_colors_used(grid)
+    
+    if len(colors) < 2:
+        # Fallback to single pixel corruption
+        return corrupt_single_pixel(grid)
+    
+    c1, c2 = random.sample(colors, 2)
+    
+    result = grid.copy()
+    mask1 = grid == c1
+    mask2 = grid == c2
+    result[mask1] = c2
+    result[mask2] = c1
+    
+    return result
+
+
+def corrupt_partial_color_swap(grid: np.ndarray) -> np.ndarray:
+    """Swap two colors but only in part of the grid"""
+    colors = get_colors_used(grid)
+    
+    if len(colors) < 2:
+        return corrupt_single_pixel(grid)
+    
+    c1, c2 = random.sample(colors, 2)
+    
+    result = grid.copy()
+    h, w = grid.shape
+    
+    # Only swap in top half, bottom half, left half, or right half
+    region = random.choice(['top', 'bottom', 'left', 'right'])
+    
+    if region == 'top':
+        mask = np.zeros_like(grid, dtype=bool)
+        mask[:h//2, :] = True
+    elif region == 'bottom':
+        mask = np.zeros_like(grid, dtype=bool)
+        mask[h//2:, :] = True
+    elif region == 'left':
+        mask = np.zeros_like(grid, dtype=bool)
+        mask[:, :w//2] = True
+    else:
+        mask = np.zeros_like(grid, dtype=bool)
+        mask[:, w//2:] = True
+    
+    swap1 = (grid == c1) & mask
+    swap2 = (grid == c2) & mask
+    result[swap1] = c2
+    result[swap2] = c1
+    
+    return result
+
+
+def corrupt_shift_row_or_col(grid: np.ndarray) -> np.ndarray:
+    """Shift a single row or column by 1 pixel"""
+    result = grid.copy()
+    h, w = grid.shape
+    
+    if random.random() < 0.5:
+        # Shift a row
+        row = random.randint(0, h - 1)
+        direction = random.choice([-1, 1])
+        result[row, :] = np.roll(grid[row, :], direction)
+    else:
+        # Shift a column
+        col = random.randint(0, w - 1)
+        direction = random.choice([-1, 1])
+        result[:, col] = np.roll(grid[:, col], direction)
+    
+    return result
+
+
+def corrupt_boundary_pixels(grid: np.ndarray) -> np.ndarray:
+    """Corrupt 1-3 pixels at shape boundaries"""
+    result = grid.copy()
+    boundary = get_boundary_positions(grid)
+    
+    if not boundary:
+        return corrupt_single_pixel(grid)
+    
+    num_corrupt = random.randint(1, min(3, len(boundary)))
+    chosen = random.sample(boundary, num_corrupt)
+    
+    for r, c in chosen:
+        current = result[r, c]
+        new_color = random.choice([x for x in range(10) if x != current])
+        result[r, c] = new_color
+    
+    return result
+
+
+def corrupt_extend_wrong(grid: np.ndarray) -> np.ndarray:
+    """Add or remove pixels at the edge of shapes"""
+    result = grid.copy()
+    h, w = grid.shape
+    
+    # Find edges of non-zero regions
+    positions = get_nonzero_positions(grid)
+    if not positions:
+        return corrupt_single_pixel(grid)
+    
+    # Try to extend a shape
+    attempts = 0
+    while attempts < 20:
+        r, c = random.choice(positions)
+        color = grid[r, c]
+        
+        # Pick a direction
+        dr, dc = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
+        nr, nc = r + dr, c + dc
+        
+        if 0 <= nr < h and 0 <= nc < w:
+            if grid[nr, nc] == 0:
+                # Extend: add pixel where there was none
+                result[nr, nc] = color
+                return result
+            elif grid[nr, nc] != color:
+                # Different color neighbor: change it
+                result[nr, nc] = color
+                return result
+        
+        attempts += 1
+    
+    # Fallback
+    return corrupt_single_pixel(grid)
+
+
+def corrupt_wrong_color_fill(grid: np.ndarray) -> np.ndarray:
+    """Change one instance of a color to a different color (like wrong fill)"""
+    result = grid.copy()
+    
+    # Find connected components
+    colors = get_colors_used(grid)
+    if not colors:
+        return corrupt_single_pixel(grid)
+    
+    target_color = random.choice(colors)
+    labeled, num_features = ndimage.label(grid == target_color)
+    
+    if num_features == 0:
+        return corrupt_single_pixel(grid)
+    
+    # Pick one component to change
+    component_id = random.randint(1, num_features)
+    mask = labeled == component_id
+    
+    # Change to a different color
+    new_color = random.choice([x for x in range(10) if x != target_color])
+    result[mask] = new_color
+    
+    return result
+
+
+def corrupt_almost_correct(grid: np.ndarray) -> np.ndarray:
+    """
+    Generate a hard negative that's almost correct.
+    Randomly picks one of the hard corruption strategies.
+    """
+    strategies = [
+        (corrupt_single_pixel, 3),           # Weight 3 - most common
+        (corrupt_few_pixels, 2),              # Weight 2
+        (corrupt_local_region, 1),            # Weight 1
+        (corrupt_boundary_pixels, 2),         # Weight 2
+        (corrupt_shift_row_or_col, 1),        # Weight 1
+        (corrupt_color_swap, 1),              # Weight 1
+        (corrupt_partial_color_swap, 1),      # Weight 1
+        (corrupt_extend_wrong, 1),            # Weight 1
+        (corrupt_wrong_color_fill, 1),        # Weight 1
+    ]
+    
+    # Build weighted list
+    weighted = []
+    for func, weight in strategies:
+        weighted.extend([func] * weight)
+    
+    chosen_func = random.choice(weighted)
+    
+    try:
+        return chosen_func(grid)
+    except Exception:
+        # Fallback to single pixel if anything goes wrong
+        return corrupt_single_pixel(grid)
 
 
 # =============================================================================
@@ -214,12 +515,15 @@ class PixelErrorCNN(nn.Module):
 
 
 # =============================================================================
-# Dataset
+# Dataset with Hard Negatives
 # =============================================================================
 
-class PixelErrorDataset(Dataset):
+class HardNegativeDataset(Dataset):
     """
-    Dataset for pixel-level error detection.
+    Dataset for pixel-level error detection with HARD negatives.
+
+    All negatives are "almost correct" - only a few pixels wrong.
+    This forces the CNN to learn fine-grained correctness detection.
 
     Returns:
         input_grid: (30, 30) the puzzle input
@@ -233,9 +537,13 @@ class PixelErrorDataset(Dataset):
         puzzles: Dict,
         num_negatives: int = 4,
         augment: bool = True,
+        include_easy_negatives: bool = False,
+        easy_negative_ratio: float = 0.1,
     ):
         self.num_negatives = num_negatives
         self.augment = augment
+        self.include_easy_negatives = include_easy_negatives
+        self.easy_negative_ratio = easy_negative_ratio
 
         # Extract all (input, output) pairs
         self.examples = []
@@ -262,6 +570,9 @@ class PixelErrorDataset(Dataset):
             self.all_outputs.extend(outputs)
 
         print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles")
+        print(f"Hard negatives mode: num_negatives={num_negatives}")
+        if include_easy_negatives:
+            print(f"Including {easy_negative_ratio:.0%} easy negatives for diversity")
 
     def __len__(self):
         return len(self.examples) * (1 + self.num_negatives)
@@ -273,47 +584,41 @@ class PixelErrorDataset(Dataset):
         padded[:h, :w] = grid
         return padded
 
+    def _generate_easy_negative(self, correct_output: np.ndarray) -> np.ndarray:
+        """Generate an easy negative (for diversity)"""
+        strategy = random.choice(["random_noise", "blank", "full_random"])
+        
+        if strategy == "blank":
+            return np.zeros_like(correct_output, dtype=np.uint8)
+        elif strategy == "full_random":
+            return np.random.randint(0, 10, size=correct_output.shape, dtype=np.uint8)
+        else:
+            # Heavy random noise
+            result = correct_output.copy()
+            num_changes = random.randint(correct_output.size // 4, correct_output.size // 2)
+            for _ in range(num_changes):
+                r = random.randint(0, result.shape[0] - 1)
+                c = random.randint(0, result.shape[1] - 1)
+                result[r, c] = random.randint(0, 9)
+            return result
+
     def _generate_negative(self, correct_output: np.ndarray, puzzle_id: str) -> Tuple[np.ndarray, np.ndarray]:
         """
         Generate a wrong output and the corresponding error mask.
+        Primarily uses HARD negatives (almost correct).
 
         Returns:
             wrong_output: the incorrect output grid
             error_mask: 1 where pixels match correct_output, 0 where they differ
         """
-        if len(self.outputs_by_puzzle) == 1:
-            strategy = random.choice(["wrong_augment", "random_noise", "blank_grid", "full_random"])
+        # Occasionally include easy negatives for diversity
+        if self.include_easy_negatives and random.random() < self.easy_negative_ratio:
+            wrong_output = self._generate_easy_negative(correct_output)
         else:
-            strategy = random.choice(["other_puzzle", "wrong_augment", "random_noise", "blank_grid", "full_random"])
-
-        if strategy == "other_puzzle":
-            wrong_output = random.choice(self.all_outputs)
-            while np.array_equal(wrong_output, correct_output):
-                wrong_output = random.choice(self.all_outputs)
-
-        elif strategy == "wrong_augment":
-            trans_id = random.randint(1, 7)
-            color_map = random_color_permutation()
-            wrong_output = apply_augmentation(correct_output, trans_id, color_map)
-
-        elif strategy == "blank_grid":
-            # Completely blank (all zeros) grid with same shape as correct output
-            wrong_output = np.zeros_like(correct_output, dtype=np.uint8)
-
-        elif strategy == "full_random":
-            # Grid filled with completely random pixel values
-            wrong_output = np.random.randint(0, 10, size=correct_output.shape, dtype=np.uint8)
-
-        else:  # random_noise - add noise to correct output
-            wrong_output = correct_output.copy()
-            num_changes = random.randint(1, max(1, wrong_output.size // 10))
-            for _ in range(num_changes):
-                r = random.randint(0, wrong_output.shape[0] - 1)
-                c = random.randint(0, wrong_output.shape[1] - 1)
-                wrong_output[r, c] = random.randint(0, 9)
+            # HARD negative - almost correct
+            wrong_output = corrupt_almost_correct(correct_output)
 
         # Compute error mask: 1 = correct, 0 = wrong
-        # Need to pad both to compare
         padded_correct = self._pad_grid(correct_output)
         padded_wrong = self._pad_grid(wrong_output)
         error_mask = (padded_wrong == padded_correct).astype(np.float32)
@@ -332,7 +637,7 @@ class PixelErrorDataset(Dataset):
             pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
             is_positive = 1.0
         else:
-            # Negative sample
+            # Negative sample - HARD negative
             output_grid, pixel_mask = self._generate_negative(correct_output, puzzle_id)
             is_positive = 0.0
 
@@ -378,7 +683,9 @@ def train_epoch(
     total_loss = 0.0
     total_pixel_correct = 0
     total_pixels = 0
-    total_error_iou = 0.0
+    total_error_tp = 0
+    total_error_fp = 0
+    total_error_fn = 0
     num_batches = 0
 
     pbar = tqdm(loader, desc="Training")
@@ -398,190 +705,172 @@ def train_epoch(
         # Metrics
         with torch.no_grad():
             preds = (logits > 0).float()
-            total_loss += loss.item() * input_grid.size(0)
-            total_pixel_correct += (preds == pixel_mask).sum().item()
-            total_pixels += pixel_mask.numel()
+            
+            # Pixel accuracy
+            correct = (preds == pixel_mask).sum().item()
+            total = pixel_mask.numel()
+            total_pixel_correct += correct
+            total_pixels += total
 
-            # IoU for error pixels (where mask == 0)
+            # Error detection metrics (where mask = 0, i.e., pixel is wrong)
+            error_target = (pixel_mask == 0)
             error_pred = (preds == 0)
-            error_true = (pixel_mask == 0)
-            intersection = (error_pred & error_true).sum().item()
-            union = (error_pred | error_true).sum().item()
-            if union > 0:
-                total_error_iou += intersection / union
+            
+            total_error_tp += (error_target & error_pred).sum().item()
+            total_error_fp += (~error_target & error_pred).sum().item()
+            total_error_fn += (error_target & ~error_pred).sum().item()
+
+            total_loss += loss.item()
             num_batches += 1
 
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "px_acc": f"{total_pixel_correct/total_pixels:.2%}"
-        })
+        pbar.set_postfix(loss=loss.item())
+
+    # Compute aggregate metrics
+    pixel_accuracy = total_pixel_correct / max(total_pixels, 1)
+    
+    precision = total_error_tp / max(total_error_tp + total_error_fp, 1)
+    recall = total_error_tp / max(total_error_tp + total_error_fn, 1)
+    error_iou = total_error_tp / max(total_error_tp + total_error_fp + total_error_fn, 1)
 
     return {
-        "loss": total_loss / (total_pixels / (GRID_SIZE * GRID_SIZE)),
-        "pixel_accuracy": total_pixel_correct / total_pixels,
-        "error_iou": total_error_iou / num_batches if num_batches > 0 else 0,
+        "loss": total_loss / max(num_batches, 1),
+        "pixel_accuracy": pixel_accuracy,
+        "error_precision": precision,
+        "error_recall": recall,
+        "error_iou": error_iou,
     }
 
 
-@torch.no_grad()
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Evaluate the model"""
+    """Evaluate model"""
     model.eval()
 
     total_loss = 0.0
     total_pixel_correct = 0
     total_pixels = 0
-    total_error_iou = 0.0
+    total_error_tp = 0
+    total_error_fp = 0
+    total_error_fn = 0
+    total_perfect = 0
+    total_samples = 0
     num_batches = 0
 
-    # Track per-sample accuracy
-    total_samples = 0
-    perfect_predictions = 0
+    with torch.no_grad():
+        for input_grid, output_grid, pixel_mask, is_positive in loader:
+            input_grid = input_grid.to(device)
+            output_grid = output_grid.to(device)
+            pixel_mask = pixel_mask.to(device)
 
-    for input_grid, output_grid, pixel_mask, is_positive in loader:
-        input_grid = input_grid.to(device)
-        output_grid = output_grid.to(device)
-        pixel_mask = pixel_mask.to(device)
+            logits = model(input_grid, output_grid)
+            loss = F.binary_cross_entropy_with_logits(logits, pixel_mask)
 
-        logits = model(input_grid, output_grid)
-        loss = F.binary_cross_entropy_with_logits(logits, pixel_mask)
+            preds = (logits > 0).float()
 
-        preds = (logits > 0).float()
-        total_loss += loss.item() * input_grid.size(0)
-        total_pixel_correct += (preds == pixel_mask).sum().item()
-        total_pixels += pixel_mask.numel()
+            # Pixel accuracy
+            correct = (preds == pixel_mask).sum().item()
+            total = pixel_mask.numel()
+            total_pixel_correct += correct
+            total_pixels += total
 
-        # IoU for error pixels
-        error_pred = (preds == 0)
-        error_true = (pixel_mask == 0)
-        intersection = (error_pred & error_true).sum().item()
-        union = (error_pred | error_true).sum().item()
-        if union > 0:
-            total_error_iou += intersection / union
-        num_batches += 1
+            # Error detection metrics
+            error_target = (pixel_mask == 0)
+            error_pred = (preds == 0)
+            
+            total_error_tp += (error_target & error_pred).sum().item()
+            total_error_fp += (~error_target & error_pred).sum().item()
+            total_error_fn += (error_target & ~error_pred).sum().item()
 
-        # Perfect predictions (all pixels correct)
-        for i in range(input_grid.size(0)):
-            if (preds[i] == pixel_mask[i]).all():
-                perfect_predictions += 1
-            total_samples += 1
+            # Perfect predictions
+            batch_perfect = (preds == pixel_mask).all(dim=-1).all(dim=-1).sum().item()
+            total_perfect += batch_perfect
+            total_samples += input_grid.size(0)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    pixel_accuracy = total_pixel_correct / max(total_pixels, 1)
+    precision = total_error_tp / max(total_error_tp + total_error_fp, 1)
+    recall = total_error_tp / max(total_error_tp + total_error_fn, 1)
+    error_iou = total_error_tp / max(total_error_tp + total_error_fp + total_error_fn, 1)
+    perfect_rate = total_perfect / max(total_samples, 1)
 
     return {
-        "loss": total_loss / (total_pixels / (GRID_SIZE * GRID_SIZE)),
-        "pixel_accuracy": total_pixel_correct / total_pixels,
-        "error_iou": total_error_iou / num_batches if num_batches > 0 else 0,
-        "perfect_rate": perfect_predictions / total_samples if total_samples > 0 else 0,
+        "loss": total_loss / max(num_batches, 1),
+        "pixel_accuracy": pixel_accuracy,
+        "error_precision": precision,
+        "error_recall": recall,
+        "error_iou": error_iou,
+        "perfect_rate": perfect_rate,
     }
 
 
 def visualize_predictions(
     model: nn.Module,
-    dataset: PixelErrorDataset,
+    dataset: Dataset,
     device: torch.device,
-    num_samples: int = 3,
+    num_samples: int = 5
 ):
-    """
-    Visualize pixel-level predictions showing the full task:
-    - Input grid
-    - Correct output
-    - Distractor (wrong) output
-    - Where errors are
-    - What the model predicts
-    """
+    """Visualize model predictions on some examples"""
     model.eval()
 
     print("\n" + "="*80)
-    print("VISUALIZATION: What the model is learning")
-    print("="*80)
-    print("\nThe model sees: INPUT + DISTRACTOR")
-    print("The model predicts: which pixels in DISTRACTOR are WRONG")
+    print("Sample Predictions (Hard Negatives)")
     print("="*80)
 
-    # Get raw examples from dataset (before augmentation)
-    # Use test examples (at end of list) to match train.py visualization
-    examples = dataset.examples[-num_samples:]
+    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
 
-    for i, (input_grid_raw, correct_output_raw, puzzle_id) in enumerate(examples):
-        print(f"\n{'━'*80}")
-        print(f"Example {i+1}: Puzzle {puzzle_id}")
-        print(f"{'━'*80}")
+    for idx in indices:
+        input_grid, output_grid, pixel_mask, is_positive = dataset[idx]
 
-        # Generate a distractor (wrong output)
-        wrong_output, _ = dataset._generate_negative(correct_output_raw, puzzle_id)
-
-        # Pad all grids
-        input_padded = dataset._pad_grid(input_grid_raw)
-        correct_padded = dataset._pad_grid(correct_output_raw)
-        wrong_padded = dataset._pad_grid(wrong_output)
-
-        # Compute error mask
-        error_mask = (wrong_padded != correct_padded).astype(np.float32)
-
-        # Get model prediction
-        inp_t = torch.from_numpy(input_padded.copy()).long().unsqueeze(0).to(device)
-        wrong_t = torch.from_numpy(wrong_padded.copy()).long().unsqueeze(0).to(device)
+        inp_t = input_grid.unsqueeze(0).to(device)
+        out_t = output_grid.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred_proba = model.predict_proba(inp_t, wrong_t)[0].cpu().numpy()
+            pred_proba = model.predict_proba(inp_t, out_t)[0].cpu().numpy()
 
-        # Find bounds based on correct output (the actual content)
-        h, w = correct_output_raw.shape
-        r_min, c_min = 0, 0
-        r_max = min(h, 12)
-        c_max = min(w, 12)
+        input_np = input_grid.numpy()
+        output_np = output_grid.numpy()
+        mask_np = pixel_mask.numpy()
 
-        # Print grids side by side
-        print(f"\n{'INPUT':<15} {'CORRECT OUTPUT':<15} {'DISTRACTOR':<15} {'ERRORS (X=wrong)':<18} {'MODEL PRED':<15}")
-        print(f"{'─'*15} {'─'*15} {'─'*15} {'─'*18} {'─'*15}")
+        # Find content bounds
+        nonzero = np.where(output_np > 0)
+        if len(nonzero[0]) > 0:
+            r_min, r_max = nonzero[0].min(), min(nonzero[0].max() + 1, 12)
+            c_min, c_max = nonzero[1].min(), min(nonzero[1].max() + 1, 12)
+        else:
+            r_min, r_max, c_min, c_max = 0, 8, 0, 8
 
-        for r in range(r_max):
-            inp_row = ""
-            correct_row = ""
-            wrong_row = ""
-            error_row = ""
-            pred_row = ""
+        sample_type = "POSITIVE (correct)" if is_positive > 0.5 else "NEGATIVE (corrupted)"
+        num_errors = int((mask_np == 0).sum())
+        
+        print(f"\n{'─'*80}")
+        print(f"Sample {idx}: {sample_type}, {num_errors} error pixels")
+        print(f"{'─'*80}")
 
-            for c in range(c_max):
-                # Input
-                if r < input_grid_raw.shape[0] and c < input_grid_raw.shape[1]:
-                    inp_row += f"{input_grid_raw[r, c]} "
-                else:
-                    inp_row += ". "
+        # Print grids
+        print(f"{'INPUT':<15} {'OUTPUT':<15} {'ACTUAL ERRORS':<18} {'CNN PRED ERRORS':<18}")
 
-                # Correct output
-                if r < correct_output_raw.shape[0] and c < correct_output_raw.shape[1]:
-                    correct_row += f"{correct_output_raw[r, c]} "
-                else:
-                    correct_row += ". "
+        for r in range(r_min, r_max):
+            inp_row = " ".join(str(input_np[r, c]) for c in range(c_min, c_max))
+            out_row = " ".join(str(output_np[r, c]) for c in range(c_min, c_max))
+            actual_row = " ".join("X" if mask_np[r, c] == 0 else "." for c in range(c_min, c_max))
+            pred_row = " ".join("X" if pred_proba[r, c] < 0.5 else "." for c in range(c_min, c_max))
+            print(f"{inp_row:<15} {out_row:<15} {actual_row:<18} {pred_row:<18}")
 
-                # Wrong output (distractor)
-                if r < wrong_output.shape[0] and c < wrong_output.shape[1]:
-                    wrong_row += f"{wrong_output[r, c]} "
-                else:
-                    wrong_row += ". "
+        # Stats
+        actual_errors = (mask_np == 0)
+        pred_errors = (pred_proba < 0.5)
+        tp = (actual_errors & pred_errors).sum()
+        fp = (~actual_errors & pred_errors).sum()
+        fn = (actual_errors & ~pred_errors).sum()
+        
+        print(f"\nTP={tp}, FP={fp}, FN={fn}")
 
-                # Error mask (X where distractor differs from correct)
-                error_row += "X " if error_mask[r, c] == 1 else ". "
-
-                # Model prediction (X where model thinks it's wrong)
-                pred_row += "X " if pred_proba[r, c] < 0.5 else ". "
-
-            print(f"{inp_row:<15} {correct_row:<15} {wrong_row:<15} {error_row:<18} {pred_row:<15}")
-
-        # Statistics
-        total_errors = int(error_mask.sum())
-        pred_errors = int((pred_proba < 0.5).sum())
-        true_positives = int(((error_mask == 1) & (pred_proba < 0.5)).sum())
-
-        precision = true_positives / pred_errors if pred_errors > 0 else 0
-        recall = true_positives / total_errors if total_errors > 0 else 0
-
-        print(f"\nStats: {total_errors} actual errors, {pred_errors} predicted errors, {true_positives} correctly found")
-        print(f"       Precision: {precision:.0%}, Recall: {recall:.0%}")
+    print("="*80 + "\n")
 
 
 # =============================================================================
@@ -626,7 +915,7 @@ def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined") -> Dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Pixel Error CNN")
+    parser = argparse.ArgumentParser(description="Train Pixel Error CNN with Hard Negatives")
 
     parser.add_argument("--dataset", type=str, default="arc-agi-1",
                         choices=["arc-agi-1", "arc-agi-2"])
@@ -634,15 +923,22 @@ def main():
     parser.add_argument("--single-puzzle", type=str, default=None)
 
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="More epochs needed for hard negatives")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--num-negatives", type=int, default=4)
+    parser.add_argument("--num-negatives", type=int, default=8,
+                        help="More negatives since they're harder")
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn.pt",
-                        help="Path to save best model checkpoint")
+    parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn_hard.pt")
+    
+    # Hard negative specific args
+    parser.add_argument("--include-easy", action="store_true",
+                        help="Include some easy negatives for diversity")
+    parser.add_argument("--easy-ratio", type=float, default=0.1,
+                        help="Ratio of easy negatives when --include-easy is set")
 
     args = parser.parse_args()
 
@@ -652,6 +948,7 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
+    print(f"Mode: HARD NEGATIVES")
 
     # Load puzzles
     print("\nLoading puzzles...")
@@ -682,9 +979,21 @@ def main():
 
     print(f"Train puzzles: {len(train_puzzles)}, Val puzzles: {len(val_puzzles)}")
 
-    # Create datasets
-    train_dataset = PixelErrorDataset(train_puzzles, num_negatives=args.num_negatives, augment=True)
-    val_dataset = PixelErrorDataset(val_puzzles, num_negatives=args.num_negatives, augment=False)
+    # Create datasets with HARD negatives
+    train_dataset = HardNegativeDataset(
+        train_puzzles, 
+        num_negatives=args.num_negatives, 
+        augment=True,
+        include_easy_negatives=args.include_easy,
+        easy_negative_ratio=args.easy_ratio,
+    )
+    val_dataset = HardNegativeDataset(
+        val_puzzles, 
+        num_negatives=args.num_negatives, 
+        augment=False,
+        include_easy_negatives=args.include_easy,
+        easy_negative_ratio=args.easy_ratio,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -706,7 +1015,7 @@ def main():
 
     # Training
     print("\n" + "="*60)
-    print("Starting Training")
+    print("Starting Training (Hard Negatives)")
     print("="*60)
 
     best_val_iou = 0.0
@@ -719,26 +1028,32 @@ def main():
 
         scheduler.step()
 
-        print(f"  Train Loss: {train_metrics['loss']:.4f}, Pixel Acc: {train_metrics['pixel_accuracy']:.2%}, Error IoU: {train_metrics['error_iou']:.2%}")
-        print(f"  Val Loss: {val_metrics['loss']:.4f}, Pixel Acc: {val_metrics['pixel_accuracy']:.2%}, Error IoU: {val_metrics['error_iou']:.2%}")
+        print(f"  Train Loss: {train_metrics['loss']:.4f}, Pix Acc: {train_metrics['pixel_accuracy']:.2%}, "
+              f"Err P/R: {train_metrics['error_precision']:.2%}/{train_metrics['error_recall']:.2%}, "
+              f"IoU: {train_metrics['error_iou']:.2%}")
+        print(f"  Val   Loss: {val_metrics['loss']:.4f}, Pix Acc: {val_metrics['pixel_accuracy']:.2%}, "
+              f"Err P/R: {val_metrics['error_precision']:.2%}/{val_metrics['error_recall']:.2%}, "
+              f"IoU: {val_metrics['error_iou']:.2%}")
         print(f"  Val Perfect Rate: {val_metrics['perfect_rate']:.2%}")
 
         if val_metrics['error_iou'] > best_val_iou:
             best_val_iou = val_metrics['error_iou']
             print(f"  [New best Error IoU: {best_val_iou:.2%}]")
+            
+            # Save best model
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'args': vars(args),
+                'epoch': epoch,
+                'best_val_iou': best_val_iou,
+            }
+            torch.save(checkpoint, args.save_path)
 
     # Final summary
     print("\n" + "="*60)
     print("Training Complete")
     print("="*60)
     print(f"Best Error IoU: {best_val_iou:.2%}")
-
-    # Save checkpoint
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'args': vars(args),
-    }
-    torch.save(checkpoint, args.save_path)
     print(f"Checkpoint saved to: {args.save_path}")
 
     # Visualize
