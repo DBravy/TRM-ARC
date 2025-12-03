@@ -196,6 +196,22 @@ class PixelErrorCNN(nn.Module):
         """Get probability map"""
         return torch.sigmoid(self.forward(input_grid, output_grid))
 
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
+        """Load model from checkpoint for inference"""
+        checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
+        
+        hidden_dim = checkpoint.get('args', {}).get('hidden_dim', 64)
+        
+        model = cls(hidden_dim=hidden_dim)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        if device:
+            model = model.to(device)
+        
+        return model
+
 
 # =============================================================================
 # Dataset
@@ -616,6 +632,8 @@ def main():
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn.pt",
+                        help="Path to save best model checkpoint")
 
     args = parser.parse_args()
 
@@ -674,6 +692,9 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
+    # Create checkpoint directory
+    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+
     # Training
     print("\n" + "="*60)
     print("Starting Training")
@@ -702,6 +723,14 @@ def main():
     print("Training Complete")
     print("="*60)
     print(f"Best Error IoU: {best_val_iou:.2%}")
+
+    # Save checkpoint
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'args': vars(args),
+    }
+    torch.save(checkpoint, args.save_path)
+    print(f"Checkpoint saved to: {args.save_path}")
 
     # Visualize
     visualize_predictions(model, val_dataset, DEVICE)
