@@ -494,7 +494,8 @@ def visualize_predictions(
     print("="*80)
 
     # Get raw examples from dataset (before augmentation)
-    examples = dataset.examples[:num_samples]
+    # Use test examples (at end of list) to match train.py visualization
+    examples = dataset.examples[-num_samples:]
 
     for i, (input_grid_raw, correct_output_raw, puzzle_id) in enumerate(examples):
         print(f"\n{'━'*80}")
