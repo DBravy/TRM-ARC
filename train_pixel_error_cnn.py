@@ -282,9 +282,9 @@ class PixelErrorDataset(Dataset):
             error_mask: 1 where pixels match correct_output, 0 where they differ
         """
         if len(self.outputs_by_puzzle) == 1:
-            strategy = random.choice(["wrong_augment", "random_noise"])
+            strategy = random.choice(["wrong_augment", "random_noise", "blank_grid", "full_random"])
         else:
-            strategy = random.choice(["other_puzzle", "wrong_augment", "random_noise"])
+            strategy = random.choice(["other_puzzle", "wrong_augment", "random_noise", "blank_grid", "full_random"])
 
         if strategy == "other_puzzle":
             wrong_output = random.choice(self.all_outputs)
@@ -296,7 +296,15 @@ class PixelErrorDataset(Dataset):
             color_map = random_color_permutation()
             wrong_output = apply_augmentation(correct_output, trans_id, color_map)
 
-        else:  # random_noise
+        elif strategy == "blank_grid":
+            # Completely blank (all zeros) grid with same shape as correct output
+            wrong_output = np.zeros_like(correct_output, dtype=np.uint8)
+
+        elif strategy == "full_random":
+            # Grid filled with completely random pixel values
+            wrong_output = np.random.randint(0, 10, size=correct_output.shape, dtype=np.uint8)
+
+        else:  # random_noise - add noise to correct output
             wrong_output = correct_output.copy()
             num_changes = random.randint(1, max(1, wrong_output.size // 10))
             for _ in range(num_changes):
