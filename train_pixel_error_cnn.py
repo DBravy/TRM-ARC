@@ -618,17 +618,17 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
             expected = "ALL CORRECT" if is_positive > 0.5 else f"{num_errors} errors"
             
             print(f"\nExpected: {expected}")
-            print(f"{'INPUT':<20} {'OUTPUT':<20} {'CNN CONFIDENCE':<20}")
+            print(f"{'INPUT':<20} {'OUTPUT':<20} {'PREDICTED ERRORS':<20}")
 
             for r in range(r_max):
                 inp_row = " ".join(f"{input_np[r, c]}" for c in range(c_max))
                 out_row = " ".join(f"{output_np[r, c]}" for c in range(c_max))
-                conf_row = " ".join(f"{pred_proba[r, c]:.1f}"[1:] for c in range(c_max))
-                print(f"{inp_row:<20} {out_row:<20} {conf_row:<20}")
+                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "·" for c in range(c_max))
+                print(f"{inp_row:<20} {out_row:<20} {err_row:<20}")
 
             # Stats
-            mean_conf = pred_proba.mean()
-            print(f"Mean confidence: {mean_conf:.2%}")
+            num_predicted_errors = (pred_proba < 0.5).sum()
+            print(f"Predicted errors: {num_predicted_errors}")
 
     print("="*80 + "\n")
 
