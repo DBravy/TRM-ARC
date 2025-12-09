@@ -459,36 +459,45 @@ class CorrespondenceDataset(Dataset):
             # Output is all zeros (blank/empty) - obvious garbage
             trans_id, color_map = get_random_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_all_zeros(correct_output)
 
             final_input = aug_input
             final_output = garbage_output
-            # ALL pixels are wrong
-            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Compute which pixels are actually wrong (differ from correct)
+            padded_correct = self._pad_grid(aug_output)
+            padded_garbage = self._pad_grid(garbage_output)
+            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
             is_positive = 0.0
 
         elif sample_type == "constant_fill":
             # Output is all one color (1-9) - obvious garbage
             trans_id, color_map = get_random_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_constant_fill(correct_output)
 
             final_input = aug_input
             final_output = garbage_output
-            # ALL pixels are wrong
-            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Compute which pixels are actually wrong (differ from correct)
+            padded_correct = self._pad_grid(aug_output)
+            padded_garbage = self._pad_grid(garbage_output)
+            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
             is_positive = 0.0
 
         else:  # random_noise
             # Output is random noise - obvious garbage
             trans_id, color_map = get_random_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_random_noise(correct_output)
 
             final_input = aug_input
             final_output = garbage_output
-            # ALL pixels are wrong
-            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Compute which pixels are actually wrong (differ from correct)
+            padded_correct = self._pad_grid(aug_output)
+            padded_garbage = self._pad_grid(garbage_output)
+            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
             is_positive = 0.0
 
         # Pad grids
