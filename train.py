@@ -584,6 +584,7 @@ def create_model(args, metadata, device):
         "dynamic_min_steps": args.dynamic_min_steps,
         # Force error pixel changes
         "force_error_changes": args.force_error_changes,
+        "force_error_scale": args.force_error_scale,
     }
 
     model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
@@ -1180,6 +1181,8 @@ def parse_args():
     # Force error pixel changes (CNN-guided)
     parser.add_argument("--force-error-changes", action="store_true",
                         help="Force model to output different values for pixels CNN marks as errors")
+    parser.add_argument("--force-error-scale", type=float, default=1.0,
+                        help="Scale of perturbation applied to stuck error pixels (default: 1.0)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100000)

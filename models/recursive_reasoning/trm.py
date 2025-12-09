@@ -74,10 +74,9 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     dynamic_max_steps: int = 8  # Maximum iterations in dynamic mode (keep low for memory)
     dynamic_min_steps: int = 1  # Minimum iterations before checking threshold
 
-    # Force error pixel changes
+    # Force error pixel changes (in-loop perturbation)
     force_error_changes: bool = False  # Force model to change pixels CNN marks as errors
-    force_error_method: str = "mask_logits"  # "mask_logits" or "second_best"
-    force_error_temperature: float = 1.0  # Temperature for sampling when forcing changes
+    force_error_scale: float = 1.0  # Scale of perturbation applied to stuck error pixels
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -430,6 +429,105 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         
         return modified_logits
 
+    def _get_current_predictions(self, z_H: torch.Tensor) -> torch.Tensor:
+        """Get current token predictions from hidden states.
+        
+        Args:
+            z_H: Hidden states [B, L, D] (includes puzzle_emb positions)
+            
+        Returns:
+            Predictions [B, seq_len] in vocab space
+        """
+        with torch.no_grad():
+            logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
+            return logits.argmax(dim=-1)  # [B, seq_len]
+
+    def _apply_error_forcing_to_hidden(
+        self,
+        z_H: torch.Tensor,
+        prev_preds: Optional[torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply error forcing by perturbing hidden states for stuck error pixels.
+        
+        For pixels that the CNN marks as errors AND that haven't changed from
+        previous predictions, we perturb z_H to push it away from the current
+        prediction. This is done by subtracting a scaled version of the lm_head
+        weight for the current prediction (like a gradient step).
+        
+        Args:
+            z_H: Hidden states [B, L, D]
+            prev_preds: Previous predictions [B, seq_len], or None for first iteration
+            batch: Input batch
+            
+        Returns:
+            Tuple of (modified z_H, current predictions for next iteration)
+        """
+        if self.correctness_cnn is None or not self.config.force_error_changes:
+            current_preds = self._get_current_predictions(z_H)
+            return z_H, current_preds
+        
+        perturbation_scale = self.config.force_error_scale
+        
+        # Get current predictions
+        current_preds = self._get_current_predictions(z_H)  # [B, seq_len]
+        
+        # Get error mask from CNN
+        error_mask = self._get_error_mask(z_H, batch)  # [B, seq_len]
+        if error_mask is None or not error_mask.any():
+            return z_H, current_preds
+        
+        # If we have previous predictions, only force pixels that are stuck
+        if prev_preds is not None:
+            stuck_mask = error_mask & (current_preds == prev_preds)
+        else:
+            # First iteration: force all error pixels
+            stuck_mask = error_mask
+        
+        if not stuck_mask.any():
+            return z_H, current_preds
+        
+        # Perturb z_H to push away from current predictions
+        # Strategy: subtract the lm_head weight vector for the current prediction
+        # This decreases the logit for that class
+        
+        # Get lm_head weights [vocab, hidden_size]
+        lm_weight = self.lm_head.weight  # [vocab, hidden_size]
+        
+        # For stuck positions, get the weight vector of the current prediction
+        # and subtract it from z_H (scaled)
+        B, L_full, D = z_H.shape
+        L = self.config.seq_len  # actual sequence length without puzzle_emb
+        
+        # Create perturbation tensor
+        perturbation = torch.zeros_like(z_H)
+        
+        # Get the weight vectors for current predictions at stuck positions
+        # stuck_mask: [B, seq_len], current_preds: [B, seq_len]
+        # We need to index into lm_weight with current_preds where stuck
+        
+        # Expand stuck_mask to full sequence (add puzzle_emb prefix as False)
+        stuck_mask_full = F.pad(stuck_mask, (self.puzzle_emb_len, 0), value=False)  # [B, L_full]
+        
+        # Also expand current_preds (pad with 0, won't be used)
+        current_preds_full = F.pad(current_preds, (self.puzzle_emb_len, 0), value=0)  # [B, L_full]
+        
+        # Get weight vectors for all positions (we'll mask later)
+        # lm_weight[current_preds_full] -> [B, L_full, D]
+        pred_weights = lm_weight[current_preds_full]  # [B, L_full, D]
+        
+        # Apply perturbation only at stuck positions
+        perturbation = torch.where(
+            stuck_mask_full.unsqueeze(-1),
+            -perturbation_scale * pred_weights,
+            torch.zeros_like(pred_weights)
+        )
+        
+        # Apply perturbation to z_H
+        z_H_modified = z_H + perturbation.to(z_H.dtype)
+        
+        return z_H_modified, current_preds
+
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -457,6 +555,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # All iterations except the last run without grad
             # We track how many steps we've done and break early if error is low enough
             steps_done = 0
+            prev_preds = None  # Track predictions for error forcing
 
             with torch.no_grad():
                 while steps_done < max_steps - 1:  # -1 because final step is with grad
@@ -474,6 +573,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                     if frozen_mask is not None:
                         z_H = torch.where(frozen_mask, z_H_cached, z_H)
                         z_L = torch.where(frozen_mask, z_L_cached, z_L)
+
+                    # Apply error forcing: perturb z_H to change stuck error pixels
+                    if self.config.force_error_changes:
+                        z_H, prev_preds = self._apply_error_forcing_to_hidden(z_H, prev_preds, batch)
 
                     steps_done += 1
 
@@ -497,9 +600,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 z_H = torch.where(frozen_mask, z_H_cached, z_H)
                 z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
+            # Apply error forcing on final step too (no grad context for the forcing itself)
+            if self.config.force_error_changes:
+                with torch.no_grad():
+                    z_H, _ = self._apply_error_forcing_to_hidden(z_H, prev_preds, batch)
+
         else:
             # Original fixed H_cycles mode
             # H_cycles-1 without grad
+            prev_preds = None  # Track predictions for error forcing
+            
             with torch.no_grad():
                 for _H_step in range(self.config.H_cycles-1):
                     # Get frozen mask at start of this H step (only after warmup)
@@ -516,6 +626,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                         z_H = torch.where(frozen_mask, z_H_cached, z_H)
                         z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
+                    # Apply error forcing: perturb z_H to change stuck error pixels
+                    if self.config.force_error_changes:
+                        z_H, prev_preds = self._apply_error_forcing_to_hidden(z_H, prev_preds, batch)
+
             # 1 with grad
             # Get frozen mask for final step (only after warmup)
             frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
@@ -531,6 +645,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 z_H = torch.where(frozen_mask, z_H_cached, z_H)
                 z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
+            # Apply error forcing on final step too (no grad context for the forcing itself)
+            if self.config.force_error_changes:
+                with torch.no_grad():
+                    z_H, _ = self._apply_error_forcing_to_hidden(z_H, prev_preds, batch)
+
         # Compute CNN loss for joint training (always, if CNN exists)
         cnn_loss = self._compute_cnn_loss(z_H, batch) if self.training else None
 
@@ -541,13 +660,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        
-        # Force error pixels to change (if enabled)
-        # This masks out the current prediction for pixels the CNN marks as errors
-        if self.config.force_error_changes and self.correctness_cnn is not None:
-            error_mask = self._get_error_mask(z_H, batch)
-            if error_mask is not None:
-                output = self._force_error_changes_in_logits(output, error_mask, batch)
         
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), cnn_loss
