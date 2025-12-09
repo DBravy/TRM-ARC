@@ -292,14 +292,16 @@ def run_pixel_error_test(
     step: int,
     num_negatives: int = 100,
     batch_size: int = 32,
+    quiet: bool = True,
 ) -> Dict[str, float]:
     """
     Run pixel error test with augmentations on training puzzles.
     This verifies the CNN is working correctly by testing on synthetic samples.
     """
-    print(f"\n{'='*60}")
-    print(f"PIXEL ERROR CNN TEST (Step {step})")
-    print(f"{'='*60}")
+    if not quiet:
+        print(f"\n{'='*60}")
+        print(f"PIXEL ERROR CNN TEST (Step {step})")
+        print(f"{'='*60}")
 
     # Create dataset with the specified negatives
     # Auto-distribute: 35% corrupted, 15% wrong_input, 15% mismatched_aug, 15% color_swap, 20% degenerate
@@ -337,18 +339,19 @@ def run_pixel_error_test(
     # Run evaluation
     metrics = evaluate_pixel_error_cnn(cnn_model, test_loader, DEVICE)
 
-    print(f"\nResults:")
-    print(f"  Loss: {metrics['loss']:.4f}")
-    print(f"  Pixel Accuracy: {metrics['pixel_accuracy']:.2%}")
-    print(f"  Error Precision: {metrics['error_precision']:.2%}")
-    print(f"  Error Recall: {metrics['error_recall']:.2%}")
-    print(f"  Error IoU: {metrics['error_iou']:.2%}")
-    print(f"  Perfect Rate: {metrics['perfect_rate']:.2%}")
+    if not quiet:
+        print(f"\nResults:")
+        print(f"  Loss: {metrics['loss']:.4f}")
+        print(f"  Pixel Accuracy: {metrics['pixel_accuracy']:.2%}")
+        print(f"  Error Precision: {metrics['error_precision']:.2%}")
+        print(f"  Error Recall: {metrics['error_recall']:.2%}")
+        print(f"  Error IoU: {metrics['error_iou']:.2%}")
+        print(f"  Perfect Rate: {metrics['perfect_rate']:.2%}")
 
-    # Show visualization
-    visualize_pixel_error_cnn(cnn_model, test_dataset, DEVICE, num_samples=8)
+        # Show visualization
+        visualize_pixel_error_cnn(cnn_model, test_dataset, DEVICE, num_samples=8)
 
-    print(f"{'='*60}\n")
+        print(f"{'='*60}\n")
 
     return {f"pixel_error_test/{k}": v for k, v in metrics.items()}
 
@@ -361,7 +364,6 @@ def visualize_predictions(
     num_samples: int = 3,
     identifier_map: Optional[List[str]] = None,
     cnn_model: Optional[nn.Module] = None,
-    show_pixel_errors: bool = False,
 ):
     """Visualize predictions at eval interval, optionally with CNN error detection."""
     model.eval()
@@ -411,9 +413,9 @@ def visualize_predictions(
                 total = mask.sum()
                 acc = correct / total if total > 0 else 0
 
-                # Get CNN error predictions if available and display is enabled
+                # Get CNN error predictions if available
                 cnn_error_mask = None
-                if cnn_model is not None and show_pixel_errors:
+                if cnn_model is not None:
                     # Convert grids to CNN format (values 0-9, not tokens 2-11)
                     inp_grid = np.clip(inputs - 2, 0, 9).astype(np.int64)
                     pred_grid = np.clip(pred - 2, 0, 9).astype(np.int64)
@@ -1105,7 +1107,6 @@ def train(args):
                 num_samples=args.vis_samples,
                 identifier_map=identifier_map,
                 cnn_model=cnn_model,
-                show_pixel_errors=args.show_pixel_errors,
             )
 
         # Pixel error CNN test (runs at same rate as eval visualizations)
@@ -1113,6 +1114,7 @@ def train(args):
             pixel_error_metrics = run_pixel_error_test(
                 cnn_model, raw_puzzles, step,
                 num_negatives=args.pixel_error_test_negatives,
+                quiet=args.quiet_pixel_error_test,
             )
             if not args.no_wandb:
                 wandb.log(pixel_error_metrics, step=step)
@@ -1227,10 +1229,10 @@ def parse_args():
                         help="Disable pixel error CNN test")
     parser.add_argument("--pixel-error-test-negatives", type=int, default=100,
                         help="Number of negatives for pixel error test")
-    parser.add_argument("--show-pixel-errors", action="store_true", default=False,
-                        help="Show CNN pixel error predictions in visualizations")
-    parser.add_argument("--no-show-pixel-errors", action="store_false", dest="show_pixel_errors",
-                        help="Hide CNN pixel error predictions in visualizations (default)")
+    parser.add_argument("--quiet-pixel-error-test", action="store_true", default=True,
+                        help="Suppress pixel error test console output (default)")
+    parser.add_argument("--verbose-pixel-error-test", action="store_false", dest="quiet_pixel_error_test",
+                        help="Show pixel error test console output")
 
     # Logging (WandB enabled by default)
     parser.add_argument("--no-wandb", action="store_true",
