@@ -70,9 +70,14 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
 
     # Dynamic iteration mode (replaces fixed H_cycles with CNN-guided stopping)
     dynamic_iterations: bool = False  # Enable dynamic iteration mode
-    dynamic_error_threshold: float = 0.05  # Stop when CNN error rate < this (0.1 = 10% errors)
-    dynamic_max_steps: int = 50  # Maximum iterations in dynamic mode
+    dynamic_error_threshold: float = 0.1  # Stop when CNN error rate < this (0.1 = 10% errors)
+    dynamic_max_steps: int = 8  # Maximum iterations in dynamic mode (keep low for memory)
     dynamic_min_steps: int = 1  # Minimum iterations before checking threshold
+
+    # Force error pixel changes
+    force_error_changes: bool = False  # Force model to change pixels CNN marks as errors
+    force_error_method: str = "mask_logits"  # "mask_logits" or "second_best"
+    force_error_temperature: float = 1.0  # Temperature for sampling when forcing changes
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -350,6 +355,81 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
             return 1.0
 
+    def _get_error_mask(self, z_H: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Get mask of positions that CNN predicts are errors.
+        
+        Returns:
+            Tensor of shape [B, seq_len] where True = error pixel that should change.
+            Returns None if CNN is not enabled.
+        """
+        if self.correctness_cnn is None:
+            return None
+        
+        with torch.no_grad():
+            # Get current predictions from z_H
+            logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
+            current_output = logits.argmax(dim=-1)  # [B, seq_len]
+            
+            # Convert from vocab space to color space
+            current_output_colors = (current_output - 2).clamp(0, 9)
+            current_output_2d = current_output_colors.view(-1, 30, 30).long()
+            
+            # Get input grid and convert from vocab space to color space
+            input_colors = (batch["inputs"] - 2).clamp(0, 9)
+            input_2d = input_colors.view(-1, 30, 30).long()
+            
+            # Run CNN to get correctness confidence
+            confidence = self.correctness_cnn.predict_proba(input_2d, current_output_2d)  # [B, 30, 30]
+            
+            # Error mask - True where CNN thinks it's wrong (low confidence)
+            error_2d = confidence < self.config.cnn_freeze_threshold  # [B, 30, 30]
+            error_seq = error_2d.view(-1, self.config.seq_len)  # [B, seq_len]
+            
+            # Also mask out non-output positions (where labels are IGNORE_LABEL_ID)
+            labels = batch["labels"]
+            valid_mask = (labels != IGNORE_LABEL_ID)  # [B, seq_len]
+            
+            return error_seq & valid_mask  # [B, seq_len]
+
+    def _force_error_changes_in_logits(
+        self, 
+        logits: torch.Tensor,
+        error_mask: torch.Tensor,
+        batch: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Modify logits to force different predictions for error pixels.
+        
+        For pixels that the CNN marks as errors, we mask out the current
+        top prediction so the model must output something different.
+        
+        Args:
+            logits: Output logits [B, seq_len, vocab]
+            error_mask: Boolean mask [B, seq_len] where True = error pixel
+            batch: Input batch (for reference)
+            
+        Returns:
+            Modified logits with forced changes for error pixels
+        """
+        if not error_mask.any():
+            return logits
+        
+        # Get current predictions
+        current_preds = logits.argmax(dim=-1)  # [B, seq_len]
+        
+        # Create modified logits
+        modified_logits = logits.clone()
+        
+        # For each position marked as error, set its current prediction logit to -inf
+        # This forces argmax to pick a different token
+        B, L, V = logits.shape
+        batch_idx = torch.arange(B, device=logits.device)[:, None].expand(B, L)
+        seq_idx = torch.arange(L, device=logits.device)[None, :].expand(B, L)
+        
+        # Scatter -inf to force different predictions for error pixels
+        modified_logits[batch_idx[error_mask], seq_idx[error_mask], current_preds[error_mask]] = float('-inf')
+        
+        return modified_logits
+
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -461,6 +541,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        
+        # Force error pixels to change (if enabled)
+        # This masks out the current prediction for pixels the CNN marks as errors
+        if self.config.force_error_changes and self.correctness_cnn is not None:
+            error_mask = self._get_error_mask(z_H, batch)
+            if error_mask is not None:
+                output = self._force_error_changes_in_logits(output, error_mask, batch)
+        
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), cnn_loss
 
