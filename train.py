@@ -577,6 +577,11 @@ def create_model(args, metadata, device):
         "cnn_freeze_threshold": 0.5,
         "cnn_loss_weight": 0.0,  # Don't train the CNN, use pretrained weights
         "cnn_freeze_warmup_steps": 0,  # Use CNN freezing from the start
+        # Dynamic iteration mode (CNN-guided stopping)
+        "dynamic_iterations": args.dynamic_iterations,
+        "dynamic_error_threshold": args.dynamic_error_threshold,
+        "dynamic_max_steps": args.dynamic_max_steps,
+        "dynamic_min_steps": args.dynamic_min_steps,
     }
 
     model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
@@ -1159,6 +1164,16 @@ def parse_args():
     parser.add_argument("--halt-max-steps", type=int, default=16)
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for optimization")
+
+    # Dynamic iteration mode (CNN-guided stopping)
+    parser.add_argument("--dynamic-iterations", action="store_true",
+                        help="Enable dynamic iteration mode (stop when CNN error < threshold)")
+    parser.add_argument("--dynamic-error-threshold", type=float, default=0.1,
+                        help="Stop iterating when CNN error rate drops below this (0.1 = 10%)")
+    parser.add_argument("--dynamic-max-steps", type=int, default=10,
+                        help="Maximum iterations in dynamic mode")
+    parser.add_argument("--dynamic-min-steps", type=int, default=1,
+                        help="Minimum iterations before checking error threshold")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100000)

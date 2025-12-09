@@ -68,6 +68,12 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     cnn_loss_weight: float = 0.1  # Weight for CNN loss in joint training
     cnn_freeze_warmup_steps: int = 0  # Steps before using CNN for freezing
 
+    # Dynamic iteration mode (replaces fixed H_cycles with CNN-guided stopping)
+    dynamic_iterations: bool = False  # Enable dynamic iteration mode
+    dynamic_error_threshold: float = 0.05  # Stop when CNN error rate < this (0.1 = 10% errors)
+    dynamic_max_steps: int = 50  # Maximum iterations in dynamic mode
+    dynamic_min_steps: int = 1  # Minimum iterations before checking threshold
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -302,6 +308,48 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             return loss
         return None
 
+    def _compute_cnn_error_rate(self, z_H: torch.Tensor, batch: Dict[str, torch.Tensor]) -> float:
+        """Compute the average CNN-predicted error rate across the batch.
+
+        Used for dynamic iteration stopping - returns the fraction of pixels
+        that the CNN predicts are incorrect (error rate).
+
+        Returns:
+            Float between 0 and 1 representing the error rate.
+            Returns 1.0 if CNN is not available.
+        """
+        if self.correctness_cnn is None:
+            return 1.0
+
+        with torch.no_grad():
+            # Get current predictions from z_H
+            logits = self.lm_head(z_H)[:, self.puzzle_emb_len:]  # [B, seq_len, vocab]
+            current_output = logits.argmax(dim=-1)  # [B, seq_len]
+
+            # Convert from vocab space to color space
+            current_output_colors = (current_output - 2).clamp(0, 9)
+            current_output_2d = current_output_colors.view(-1, 30, 30).long()  # [B, 30, 30]
+
+            # Get input grid and convert from vocab space to color space
+            input_colors = (batch["inputs"] - 2).clamp(0, 9)
+            input_2d = input_colors.view(-1, 30, 30).long()  # [B, 30, 30]
+
+            # Get labels to create valid mask (only count output positions)
+            labels = batch["labels"]
+            valid_mask = (labels != IGNORE_LABEL_ID).view(-1, 30, 30)  # [B, 30, 30]
+
+            # Run CNN to get correctness confidence (higher = more correct)
+            confidence = self.correctness_cnn.predict_proba(input_2d, current_output_2d)  # [B, 30, 30]
+
+            # Error rate = fraction of pixels with low confidence (CNN thinks they're wrong)
+            # Only count valid output positions
+            if valid_mask.any():
+                error_pixels = (confidence < self.config.cnn_freeze_threshold) & valid_mask
+                error_rate = error_pixels.float().sum() / valid_mask.float().sum()
+                return error_rate.item()
+
+            return 1.0
+
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -317,37 +365,91 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         use_cnn_freezing = (self.correctness_cnn is not None and
                            self.cnn_step_counter.item() >= self.config.cnn_freeze_warmup_steps)
 
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                # Get frozen mask at start of this H step (only after warmup)
-                frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
-                if frozen_mask is not None:
-                    z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+        # Check if dynamic iteration mode is enabled
+        use_dynamic = (self.config.dynamic_iterations and self.correctness_cnn is not None)
 
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+        if use_dynamic:
+            # Dynamic iteration mode: iterate until CNN error rate < threshold or max steps
+            max_steps = self.config.dynamic_max_steps
+            min_steps = self.config.dynamic_min_steps
+            error_threshold = self.config.dynamic_error_threshold
 
-                # Restore frozen positions
-                if frozen_mask is not None:
-                    z_H = torch.where(frozen_mask, z_H_cached, z_H)
-                    z_L = torch.where(frozen_mask, z_L_cached, z_L)
+            # All iterations except the last run without grad
+            # We track how many steps we've done and break early if error is low enough
+            steps_done = 0
 
-        # 1 with grad
-        # Get frozen mask for final step (only after warmup)
-        frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
-        if frozen_mask is not None:
-            z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+            with torch.no_grad():
+                while steps_done < max_steps - 1:  # -1 because final step is with grad
+                    # Get frozen mask at start of this step (only after warmup)
+                    frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
+                    if frozen_mask is not None:
+                        z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
 
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+                    # L_cycles iterations
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    z_H = self.L_level(z_H, z_L, **seq_info)
 
-        # Restore frozen positions (with grad - uses torch.where which is differentiable)
-        if frozen_mask is not None:
-            z_H = torch.where(frozen_mask, z_H_cached, z_H)
-            z_L = torch.where(frozen_mask, z_L_cached, z_L)
+                    # Restore frozen positions
+                    if frozen_mask is not None:
+                        z_H = torch.where(frozen_mask, z_H_cached, z_H)
+                        z_L = torch.where(frozen_mask, z_L_cached, z_L)
+
+                    steps_done += 1
+
+                    # Check if we can stop early (after min_steps)
+                    if steps_done >= min_steps:
+                        error_rate = self._compute_cnn_error_rate(z_H, batch)
+                        if error_rate < error_threshold:
+                            break
+
+            # Final step with grad
+            frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
+            if frozen_mask is not None:
+                z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
+
+            # Restore frozen positions (with grad)
+            if frozen_mask is not None:
+                z_H = torch.where(frozen_mask, z_H_cached, z_H)
+                z_L = torch.where(frozen_mask, z_L_cached, z_L)
+
+        else:
+            # Original fixed H_cycles mode
+            # H_cycles-1 without grad
+            with torch.no_grad():
+                for _H_step in range(self.config.H_cycles-1):
+                    # Get frozen mask at start of this H step (only after warmup)
+                    frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
+                    if frozen_mask is not None:
+                        z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    z_H = self.L_level(z_H, z_L, **seq_info)
+
+                    # Restore frozen positions
+                    if frozen_mask is not None:
+                        z_H = torch.where(frozen_mask, z_H_cached, z_H)
+                        z_L = torch.where(frozen_mask, z_L_cached, z_L)
+
+            # 1 with grad
+            # Get frozen mask for final step (only after warmup)
+            frozen_mask = self._get_frozen_mask(z_H, batch) if use_cnn_freezing else None
+            if frozen_mask is not None:
+                z_H_cached, z_L_cached = z_H.clone(), z_L.clone()
+
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
+
+            # Restore frozen positions (with grad - uses torch.where which is differentiable)
+            if frozen_mask is not None:
+                z_H = torch.where(frozen_mask, z_H_cached, z_H)
+                z_L = torch.where(frozen_mask, z_L_cached, z_L)
 
         # Compute CNN loss for joint training (always, if CNN exists)
         cnn_loss = self._compute_cnn_loss(z_H, batch) if self.training else None
