@@ -771,7 +771,7 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
             else:
                 r_max, c_max = 6, 6
 
-            num_errors = int((mask_np == 0).sum())
+            num_errors = int((mask_np[:r_max, :c_max] == 0).sum())
             expected = "ALL CORRECT" if is_positive > 0.5 else f"{num_errors} errors"
             
             print(f"\nExpected: {expected}")
