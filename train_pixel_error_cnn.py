@@ -124,6 +124,26 @@ def corrupt_output(grid: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
+# Degenerate Output Generators (for detecting obvious garbage)
+# =============================================================================
+
+def generate_all_zeros(grid: np.ndarray) -> np.ndarray:
+    """Generate output that is all zeros (blank/empty)"""
+    return np.zeros_like(grid)
+
+
+def generate_constant_fill(grid: np.ndarray) -> np.ndarray:
+    """Generate output that is all one color (1-9)"""
+    color = random.randint(1, 9)
+    return np.full_like(grid, color)
+
+
+def generate_random_noise(grid: np.ndarray) -> np.ndarray:
+    """Generate output that is random noise (0-9)"""
+    return np.random.randint(0, 10, size=grid.shape, dtype=np.uint8)
+
+
+# =============================================================================
 # Model Architecture (same as before but with explicit comparison)
 # =============================================================================
 
@@ -270,14 +290,17 @@ class PixelErrorCNN(nn.Module):
 class CorrespondenceDataset(Dataset):
     """
     Dataset that forces learning of input-output CORRESPONDENCE.
-    
+
     Sample types:
     1. POSITIVE: (input, output) with SAME augmentation applied to both
-    2. NEGATIVE - corrupted: (input, corrupted_output) 
+    2. NEGATIVE - corrupted: (input, corrupted_output)
     3. NEGATIVE - wrong input: (wrong_input, correct_output) ← CRITICAL
     4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) ← CRITICAL
-    
-    Types 3 and 4 force the CNN to actually look at the input!
+    5. NEGATIVE - all_zeros: output is all zeros (blank)
+    6. NEGATIVE - constant_fill: output is all one color (1-9)
+    7. NEGATIVE - random_noise: output is random values
+
+    Types 3-7 force the CNN to detect various failure modes!
     """
 
     def __init__(
@@ -287,18 +310,27 @@ class CorrespondenceDataset(Dataset):
         num_corrupted: int = 2,
         num_wrong_input: int = 2,
         num_mismatched_aug: int = 2,
+        num_all_zeros: int = 1,
+        num_constant_fill: int = 1,
+        num_random_noise: int = 1,
         augment: bool = True,
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
         self.num_wrong_input = num_wrong_input
         self.num_mismatched_aug = num_mismatched_aug
-        self.samples_per_example = num_positives + num_corrupted + num_wrong_input + num_mismatched_aug
+        self.num_all_zeros = num_all_zeros
+        self.num_constant_fill = num_constant_fill
+        self.num_random_noise = num_random_noise
+        self.samples_per_example = (
+            num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
+            num_all_zeros + num_constant_fill + num_random_noise
+        )
         self.augment = augment
 
         # Extract all (input, output) pairs
         self.examples = []
-        
+
         for puzzle_id, puzzle in puzzles.items():
             for example in puzzle.get("train", []):
                 inp = np.array(example["input"], dtype=np.uint8)
@@ -313,7 +345,8 @@ class CorrespondenceDataset(Dataset):
         print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles")
         print(f"Samples per example: {self.samples_per_example} "
               f"({num_positives} pos, {num_corrupted} corrupt, "
-              f"{num_wrong_input} wrong_input, {num_mismatched_aug} mismatch)")
+              f"{num_wrong_input} wrong_input, {num_mismatched_aug} mismatch, "
+              f"{num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise)")
 
     def __len__(self):
         return len(self.examples) * self.samples_per_example
@@ -334,29 +367,38 @@ class CorrespondenceDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         example_idx = idx // self.samples_per_example
         sample_type_idx = idx % self.samples_per_example
-        
+
         input_grid, correct_output, puzzle_id = self.examples[example_idx]
-        
+
         # Determine sample type based on configurable counts
         pos_end = self.num_positives
         corrupt_end = pos_end + self.num_corrupted
         wrong_input_end = corrupt_end + self.num_wrong_input
-        
+        mismatch_end = wrong_input_end + self.num_mismatched_aug
+        all_zeros_end = mismatch_end + self.num_all_zeros
+        const_fill_end = all_zeros_end + self.num_constant_fill
+
         if sample_type_idx < pos_end:
             sample_type = "positive"
         elif sample_type_idx < corrupt_end:
             sample_type = "corrupted"
         elif sample_type_idx < wrong_input_end:
             sample_type = "wrong_input"
-        else:
+        elif sample_type_idx < mismatch_end:
             sample_type = "mismatched_aug"
+        elif sample_type_idx < all_zeros_end:
+            sample_type = "all_zeros"
+        elif sample_type_idx < const_fill_end:
+            sample_type = "constant_fill"
+        else:
+            sample_type = "random_noise"
 
         if sample_type == "positive":
             # Same augmentation to both input and output
             trans_id, color_map = get_random_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
-            
+
             final_input = aug_input
             final_output = aug_output
             # All pixels are correct
@@ -369,7 +411,7 @@ class CorrespondenceDataset(Dataset):
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             corrupted = corrupt_output(aug_output)
-            
+
             final_input = aug_input
             final_output = corrupted
             # Compute which pixels are wrong
@@ -382,34 +424,70 @@ class CorrespondenceDataset(Dataset):
             # CRITICAL: Correct output but WRONG input
             # This forces CNN to check the input!
             wrong_input, _ = self._get_different_example(example_idx)
-            
+
             # Apply same augmentation to both (so aug isn't the signal)
             trans_id, color_map = get_random_augmentation()
             aug_wrong_input = apply_augmentation(wrong_input, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
-            
+
             final_input = aug_wrong_input
             final_output = aug_output
             # ALL pixels are wrong (wrong input-output correspondence)
             pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
             is_positive = 0.0
 
-        else:  # mismatched_aug
+        elif sample_type == "mismatched_aug":
             # CRITICAL: Input and output have DIFFERENT augmentations
             # Same puzzle, but augmentations don't match
             trans_id_1, color_map_1 = get_random_augmentation()
             trans_id_2, color_map_2 = get_random_augmentation()
-            
+
             # Ensure they're actually different
             while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
                 trans_id_2, color_map_2 = get_random_augmentation()
-            
+
             aug_input = apply_augmentation(input_grid, trans_id_1, color_map_1)
             aug_output = apply_augmentation(correct_output, trans_id_2, color_map_2)
-            
+
             final_input = aug_input
             final_output = aug_output
             # ALL pixels are wrong (mismatched augmentation)
+            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            is_positive = 0.0
+
+        elif sample_type == "all_zeros":
+            # Output is all zeros (blank/empty) - obvious garbage
+            trans_id, color_map = get_random_augmentation()
+            aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            garbage_output = generate_all_zeros(correct_output)
+
+            final_input = aug_input
+            final_output = garbage_output
+            # ALL pixels are wrong
+            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            is_positive = 0.0
+
+        elif sample_type == "constant_fill":
+            # Output is all one color (1-9) - obvious garbage
+            trans_id, color_map = get_random_augmentation()
+            aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            garbage_output = generate_constant_fill(correct_output)
+
+            final_input = aug_input
+            final_output = garbage_output
+            # ALL pixels are wrong
+            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            is_positive = 0.0
+
+        else:  # random_noise
+            # Output is random noise - obvious garbage
+            trans_id, color_map = get_random_augmentation()
+            aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            garbage_output = generate_random_noise(correct_output)
+
+            final_input = aug_input
+            final_output = garbage_output
+            # ALL pixels are wrong
             pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
             is_positive = 0.0
 
@@ -570,12 +648,22 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
     print("="*80)
 
     # Get samples of each type with their counts
+    base = 0
     type_info = [
-        ("positive", 0, dataset.num_positives),
-        ("corrupted", dataset.num_positives, dataset.num_corrupted),
-        ("wrong_input", dataset.num_positives + dataset.num_corrupted, dataset.num_wrong_input),
-        ("mismatched_aug", dataset.num_positives + dataset.num_corrupted + dataset.num_wrong_input, dataset.num_mismatched_aug),
+        ("positive", base, dataset.num_positives),
     ]
+    base += dataset.num_positives
+    type_info.append(("corrupted", base, dataset.num_corrupted))
+    base += dataset.num_corrupted
+    type_info.append(("wrong_input", base, dataset.num_wrong_input))
+    base += dataset.num_wrong_input
+    type_info.append(("mismatched_aug", base, dataset.num_mismatched_aug))
+    base += dataset.num_mismatched_aug
+    type_info.append(("all_zeros", base, dataset.num_all_zeros))
+    base += dataset.num_all_zeros
+    type_info.append(("constant_fill", base, dataset.num_constant_fill))
+    base += dataset.num_constant_fill
+    type_info.append(("random_noise", base, dataset.num_random_noise))
     
     for sample_type, offset, count in type_info:
         if count == 0:
@@ -734,34 +822,47 @@ def main():
     print(f"Train puzzles: {len(train_puzzles)}, Val puzzles: {len(val_puzzles)}")
 
     # Auto-distribute negatives across types
-    # Ratio: 1 positive per 4 negatives, negatives split as 2:1:1 (corrupted:wrong_input:mismatch)
+    # Ratio: 1 positive per 4 negatives
+    # Negatives split: 40% corrupted, 20% wrong_input, 20% mismatched_aug, 20% degenerate (split 3 ways)
     num_negatives = args.num_negatives
     num_positives = max(1, num_negatives // 4)
-    
-    # Split negatives: 50% corrupted, 25% wrong_input, 25% mismatched_aug
-    num_corrupted = num_negatives // 2
-    num_wrong_input = num_negatives // 4
-    num_mismatched_aug = num_negatives - num_corrupted - num_wrong_input
-    
+
+    # Split negatives across 6 types
+    num_corrupted = max(1, int(num_negatives * 0.40))
+    num_wrong_input = max(1, int(num_negatives * 0.20))
+    num_mismatched_aug = max(1, int(num_negatives * 0.20))
+    # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
+    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug
+    num_all_zeros = max(1, remaining // 3)
+    num_constant_fill = max(1, remaining // 3)
+    num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+
     print(f"Auto-distributed {num_negatives} negatives: "
-          f"{num_corrupted} corrupted, {num_wrong_input} wrong_input, {num_mismatched_aug} mismatched_aug")
+          f"{num_corrupted} corrupted, {num_wrong_input} wrong_input, {num_mismatched_aug} mismatched_aug, "
+          f"{num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise")
     print(f"Plus {num_positives} positives per example")
 
     # Create datasets
     train_dataset = CorrespondenceDataset(
-        train_puzzles, 
+        train_puzzles,
         num_positives=num_positives,
         num_corrupted=num_corrupted,
         num_wrong_input=num_wrong_input,
         num_mismatched_aug=num_mismatched_aug,
+        num_all_zeros=num_all_zeros,
+        num_constant_fill=num_constant_fill,
+        num_random_noise=num_random_noise,
         augment=True,
     )
     val_dataset = CorrespondenceDataset(
-        val_puzzles, 
+        val_puzzles,
         num_positives=num_positives,
         num_corrupted=num_corrupted,
         num_wrong_input=num_wrong_input,
         num_mismatched_aug=num_mismatched_aug,
+        num_all_zeros=num_all_zeros,
+        num_constant_fill=num_constant_fill,
+        num_random_noise=num_random_noise,
         augment=True,  # Keep augment for val to test correspondence
     )
 
