@@ -60,6 +60,14 @@ from tqdm import tqdm
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Import pixel error CNN components for intermittent testing
+from train_pixel_error_cnn import (
+    CorrespondenceDataset,
+    evaluate as evaluate_pixel_error_cnn,
+    visualize_predictions as visualize_pixel_error_cnn,
+    load_puzzles as load_raw_puzzles,
+)
+
 # Determine device and dtype
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -276,6 +284,63 @@ def grid_to_str(grid: np.ndarray, r1: int, r2: int, c1: int, c2: int) -> str:
                 row.append(str(val - 2))
         lines.append(" ".join(row))
     return "\n".join(lines)
+
+
+def run_pixel_error_test(
+    cnn_model: nn.Module,
+    raw_puzzles: Dict,
+    step: int,
+    num_negatives: int = 100,
+    batch_size: int = 32,
+) -> Dict[str, float]:
+    """
+    Run pixel error test with augmentations on training puzzles.
+    This verifies the CNN is working correctly by testing on synthetic samples.
+    """
+    print(f"\n{'='*60}")
+    print(f"PIXEL ERROR CNN TEST (Step {step})")
+    print(f"{'='*60}")
+
+    # Create dataset with the specified negatives
+    # Auto-distribute: 50% corrupted, 25% wrong_input, 25% mismatched_aug
+    num_positives = max(1, num_negatives // 4)
+    num_corrupted = num_negatives // 2
+    num_wrong_input = num_negatives // 4
+    num_mismatched_aug = num_negatives - num_corrupted - num_wrong_input
+
+    test_dataset = CorrespondenceDataset(
+        raw_puzzles,
+        num_positives=num_positives,
+        num_corrupted=num_corrupted,
+        num_wrong_input=num_wrong_input,
+        num_mismatched_aug=num_mismatched_aug,
+        augment=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    # Run evaluation
+    metrics = evaluate_pixel_error_cnn(cnn_model, test_loader, DEVICE)
+
+    print(f"\nResults:")
+    print(f"  Loss: {metrics['loss']:.4f}")
+    print(f"  Pixel Accuracy: {metrics['pixel_accuracy']:.2%}")
+    print(f"  Error Precision: {metrics['error_precision']:.2%}")
+    print(f"  Error Recall: {metrics['error_recall']:.2%}")
+    print(f"  Error IoU: {metrics['error_iou']:.2%}")
+    print(f"  Perfect Rate: {metrics['perfect_rate']:.2%}")
+
+    # Show visualization
+    visualize_pixel_error_cnn(cnn_model, test_dataset, DEVICE, num_samples=8)
+
+    print(f"{'='*60}\n")
+
+    return {f"pixel_error_test/{k}": v for k, v in metrics.items()}
 
 
 def visualize_predictions(
@@ -794,6 +859,15 @@ def train(args):
         with open(identifiers_path) as f:
             identifier_map = json.load(f)
 
+    # Load raw puzzles for pixel error test
+    raw_puzzles = None
+    if args.pixel_error_test:
+        print(f"\nLoading raw puzzles for pixel error test...")
+        raw_puzzles = load_raw_puzzles(args.dataset)
+        if args.single_puzzle and args.single_puzzle in raw_puzzles:
+            raw_puzzles = {args.single_puzzle: raw_puzzles[args.single_puzzle]}
+        print(f"Loaded {len(raw_puzzles)} puzzles for pixel error test")
+
     # Create model
     print(f"\nCreating model...")
     model = create_model(args, metadata, DEVICE)
@@ -1014,6 +1088,15 @@ def train(args):
                 cnn_model=cnn_model,
             )
 
+        # Pixel error CNN test (runs at same rate as eval visualizations)
+        if args.pixel_error_test and cnn_model is not None and raw_puzzles is not None:
+            pixel_error_metrics = run_pixel_error_test(
+                cnn_model, raw_puzzles, step,
+                num_negatives=args.pixel_error_test_negatives,
+            )
+            if not args.no_wandb:
+                wandb.log(pixel_error_metrics, step=step)
+
         # Save checkpoint
         ckpt_metadata = CheckpointMetadata(
             step=step,
@@ -1102,6 +1185,12 @@ def parse_args():
                         help="Number of samples to visualize per eval")
     parser.add_argument("--cnn-checkpoint", type=str, default="checkpoints/pixel_error_cnn.pt",
                         help="Path to CNN error detector checkpoint for visualization")
+    parser.add_argument("--pixel-error-test", action="store_true", default=True,
+                        help="Run pixel error CNN test with augmentations at each eval")
+    parser.add_argument("--no-pixel-error-test", action="store_false", dest="pixel_error_test",
+                        help="Disable pixel error CNN test")
+    parser.add_argument("--pixel-error-test-negatives", type=int, default=100,
+                        help="Number of negatives for pixel error test")
 
     # Logging (WandB enabled by default)
     parser.add_argument("--no-wandb", action="store_true",
