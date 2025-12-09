@@ -143,6 +143,35 @@ def generate_random_noise(grid: np.ndarray) -> np.ndarray:
     return np.random.randint(0, 10, size=grid.shape, dtype=np.uint8)
 
 
+def generate_color_swap(grid: np.ndarray) -> np.ndarray:
+    """Swap one color with another in the grid.
+
+    Picks a color that exists in the grid and swaps it with a different color.
+    Returns the swapped grid and a mask of which pixels were changed.
+    """
+    result = grid.copy()
+
+    # Find colors present in the grid (excluding 0 for more interesting swaps)
+    unique_colors = np.unique(grid)
+    non_zero_colors = unique_colors[unique_colors > 0]
+
+    if len(non_zero_colors) == 0:
+        # No non-zero colors, swap 0 with something
+        color_from = 0
+        color_to = random.randint(1, 9)
+    else:
+        # Pick a color to swap
+        color_from = random.choice(non_zero_colors)
+        # Pick a different color to swap to
+        available_colors = [c for c in range(10) if c != color_from]
+        color_to = random.choice(available_colors)
+
+    # Perform the swap
+    result[grid == color_from] = color_to
+
+    return result
+
+
 # =============================================================================
 # Model Architecture (same as before but with explicit comparison)
 # =============================================================================
@@ -299,8 +328,9 @@ class CorrespondenceDataset(Dataset):
     5. NEGATIVE - all_zeros: output is all zeros (blank)
     6. NEGATIVE - constant_fill: output is all one color (1-9)
     7. NEGATIVE - random_noise: output is random values
+    8. NEGATIVE - color_swap: one color swapped with another
 
-    Types 3-7 force the CNN to detect various failure modes!
+    Types 3-8 force the CNN to detect various failure modes!
     """
 
     def __init__(
@@ -313,6 +343,7 @@ class CorrespondenceDataset(Dataset):
         num_all_zeros: int = 1,
         num_constant_fill: int = 1,
         num_random_noise: int = 1,
+        num_color_swap: int = 1,
         augment: bool = True,
     ):
         self.num_positives = num_positives
@@ -322,9 +353,10 @@ class CorrespondenceDataset(Dataset):
         self.num_all_zeros = num_all_zeros
         self.num_constant_fill = num_constant_fill
         self.num_random_noise = num_random_noise
+        self.num_color_swap = num_color_swap
         self.samples_per_example = (
             num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
-            num_all_zeros + num_constant_fill + num_random_noise
+            num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
         )
         self.augment = augment
 
@@ -346,7 +378,8 @@ class CorrespondenceDataset(Dataset):
         print(f"Samples per example: {self.samples_per_example} "
               f"({num_positives} pos, {num_corrupted} corrupt, "
               f"{num_wrong_input} wrong_input, {num_mismatched_aug} mismatch, "
-              f"{num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise)")
+              f"{num_all_zeros} all_zeros, {num_constant_fill} const_fill, "
+              f"{num_random_noise} noise, {num_color_swap} color_swap)")
 
     def __len__(self):
         return len(self.examples) * self.samples_per_example
@@ -377,6 +410,7 @@ class CorrespondenceDataset(Dataset):
         mismatch_end = wrong_input_end + self.num_mismatched_aug
         all_zeros_end = mismatch_end + self.num_all_zeros
         const_fill_end = all_zeros_end + self.num_constant_fill
+        noise_end = const_fill_end + self.num_random_noise
 
         if sample_type_idx < pos_end:
             sample_type = "positive"
@@ -390,8 +424,10 @@ class CorrespondenceDataset(Dataset):
             sample_type = "all_zeros"
         elif sample_type_idx < const_fill_end:
             sample_type = "constant_fill"
-        else:
+        elif sample_type_idx < noise_end:
             sample_type = "random_noise"
+        else:
+            sample_type = "color_swap"
 
         if sample_type == "positive":
             # Same augmentation to both input and output
@@ -485,7 +521,7 @@ class CorrespondenceDataset(Dataset):
             pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
             is_positive = 0.0
 
-        else:  # random_noise
+        elif sample_type == "random_noise":
             # Output is random noise - obvious garbage
             trans_id, color_map = get_random_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
@@ -498,6 +534,21 @@ class CorrespondenceDataset(Dataset):
             padded_correct = self._pad_grid(aug_output)
             padded_garbage = self._pad_grid(garbage_output)
             pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
+            is_positive = 0.0
+
+        else:  # color_swap
+            # One color swapped with another - subtle corruption
+            trans_id, color_map = get_random_augmentation()
+            aug_input = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output = apply_augmentation(correct_output, trans_id, color_map)
+            swapped_output = generate_color_swap(aug_output)
+
+            final_input = aug_input
+            final_output = swapped_output
+            # Compute which pixels are actually wrong (differ from correct)
+            padded_correct = self._pad_grid(aug_output)
+            padded_swapped = self._pad_grid(swapped_output)
+            pixel_mask = (padded_correct == padded_swapped).astype(np.float32)
             is_positive = 0.0
 
         # Pad grids
@@ -673,6 +724,8 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
     type_info.append(("constant_fill", base, dataset.num_constant_fill))
     base += dataset.num_constant_fill
     type_info.append(("random_noise", base, dataset.num_random_noise))
+    base += dataset.num_random_noise
+    type_info.append(("color_swap", base, dataset.num_color_swap))
     
     for sample_type, offset, count in type_info:
         if count == 0:
@@ -832,23 +885,24 @@ def main():
 
     # Auto-distribute negatives across types
     # Ratio: 1 positive per 4 negatives
-    # Negatives split: 40% corrupted, 20% wrong_input, 20% mismatched_aug, 20% degenerate (split 3 ways)
+    # Negatives split: 35% corrupted, 15% wrong_input, 15% mismatched_aug, 15% color_swap, 20% degenerate
     num_negatives = args.num_negatives
     num_positives = max(1, num_negatives // 4)
 
-    # Split negatives across 6 types
-    num_corrupted = max(1, int(num_negatives * 0.40))
-    num_wrong_input = max(1, int(num_negatives * 0.20))
-    num_mismatched_aug = max(1, int(num_negatives * 0.20))
+    # Split negatives across 7 types
+    num_corrupted = max(1, int(num_negatives * 0.35))
+    num_wrong_input = max(1, int(num_negatives * 0.15))
+    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    num_color_swap = max(1, int(num_negatives * 0.15))
     # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
-    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug
+    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
     num_all_zeros = max(1, remaining // 3)
     num_constant_fill = max(1, remaining // 3)
     num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
 
     print(f"Auto-distributed {num_negatives} negatives: "
           f"{num_corrupted} corrupted, {num_wrong_input} wrong_input, {num_mismatched_aug} mismatched_aug, "
-          f"{num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise")
+          f"{num_color_swap} color_swap, {num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise")
     print(f"Plus {num_positives} positives per example")
 
     # Create datasets
@@ -861,6 +915,7 @@ def main():
         num_all_zeros=num_all_zeros,
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
+        num_color_swap=num_color_swap,
         augment=True,
     )
     val_dataset = CorrespondenceDataset(
@@ -872,6 +927,7 @@ def main():
         num_all_zeros=num_all_zeros,
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
+        num_color_swap=num_color_swap,
         augment=True,  # Keep augment for val to test correspondence
     )
 

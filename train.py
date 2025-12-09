@@ -302,13 +302,14 @@ def run_pixel_error_test(
     print(f"{'='*60}")
 
     # Create dataset with the specified negatives
-    # Auto-distribute: 40% corrupted, 20% wrong_input, 20% mismatched_aug, 20% degenerate
+    # Auto-distribute: 35% corrupted, 15% wrong_input, 15% mismatched_aug, 15% color_swap, 20% degenerate
     num_positives = max(1, num_negatives // 4)
-    num_corrupted = max(1, int(num_negatives * 0.40))
-    num_wrong_input = max(1, int(num_negatives * 0.20))
-    num_mismatched_aug = max(1, int(num_negatives * 0.20))
+    num_corrupted = max(1, int(num_negatives * 0.35))
+    num_wrong_input = max(1, int(num_negatives * 0.15))
+    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    num_color_swap = max(1, int(num_negatives * 0.15))
     # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
-    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug
+    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
     num_all_zeros = max(1, remaining // 3)
     num_constant_fill = max(1, remaining // 3)
     num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
@@ -322,6 +323,7 @@ def run_pixel_error_test(
         num_all_zeros=num_all_zeros,
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
+        num_color_swap=num_color_swap,
         augment=True,
     )
 
