@@ -468,8 +468,10 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_wrong_input
             final_output = aug_output
-            # ALL pixels are wrong (wrong input-output correspondence)
-            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Content area is wrong, but padding (0==0) is still correct
+            h, w = aug_output.shape
+            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            pixel_mask[:h, :w] = 0.0  # Only content region marked as error
             is_positive = 0.0
 
         elif sample_type == "mismatched_aug":
@@ -487,8 +489,13 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = aug_output
-            # ALL pixels are wrong (mismatched augmentation)
-            pixel_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Content area is wrong, but padding (0==0) is still correct
+            # Use max dimensions since augmentations may rotate/transpose
+            h1, w1 = aug_input.shape
+            h2, w2 = aug_output.shape
+            h_max, w_max = max(h1, h2), max(w1, w2)
+            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            pixel_mask[:h_max, :w_max] = 0.0  # Only content region marked as error
             is_positive = 0.0
 
         elif sample_type == "all_zeros":
@@ -776,8 +783,8 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
                 err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "·" for c in range(c_max))
                 print(f"{inp_row:<20} {out_row:<20} {err_row:<20}")
 
-            # Stats
-            num_predicted_errors = (pred_proba < 0.5).sum()
+            # Stats (only count within content area)
+            num_predicted_errors = (pred_proba[:r_max, :c_max] < 0.5).sum()
             print(f"Predicted errors: {num_predicted_errors}")
 
     print("="*80 + "\n")
