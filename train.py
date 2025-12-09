@@ -361,6 +361,7 @@ def visualize_predictions(
     num_samples: int = 3,
     identifier_map: Optional[List[str]] = None,
     cnn_model: Optional[nn.Module] = None,
+    show_pixel_errors: bool = False,
 ):
     """Visualize predictions at eval interval, optionally with CNN error detection."""
     model.eval()
@@ -410,9 +411,9 @@ def visualize_predictions(
                 total = mask.sum()
                 acc = correct / total if total > 0 else 0
 
-                # Get CNN error predictions if available
+                # Get CNN error predictions if available and display is enabled
                 cnn_error_mask = None
-                if cnn_model is not None:
+                if cnn_model is not None and show_pixel_errors:
                     # Convert grids to CNN format (values 0-9, not tokens 2-11)
                     inp_grid = np.clip(inputs - 2, 0, 9).astype(np.int64)
                     pred_grid = np.clip(pred - 2, 0, 9).astype(np.int64)
@@ -1104,6 +1105,7 @@ def train(args):
                 num_samples=args.vis_samples,
                 identifier_map=identifier_map,
                 cnn_model=cnn_model,
+                show_pixel_errors=args.show_pixel_errors,
             )
 
         # Pixel error CNN test (runs at same rate as eval visualizations)
@@ -1225,6 +1227,10 @@ def parse_args():
                         help="Disable pixel error CNN test")
     parser.add_argument("--pixel-error-test-negatives", type=int, default=100,
                         help="Number of negatives for pixel error test")
+    parser.add_argument("--show-pixel-errors", action="store_true", default=False,
+                        help="Show CNN pixel error predictions in visualizations")
+    parser.add_argument("--no-show-pixel-errors", action="store_false", dest="show_pixel_errors",
+                        help="Hide CNN pixel error predictions in visualizations (default)")
 
     # Logging (WandB enabled by default)
     parser.add_argument("--no-wandb", action="store_true",
