@@ -144,10 +144,10 @@ def generate_random_noise(grid: np.ndarray) -> np.ndarray:
 
 
 def generate_color_swap(grid: np.ndarray) -> np.ndarray:
-    """Swap one color with another in the grid.
+    """Swap one color with another in the grid, potentially only partially.
 
     Picks a color that exists in the grid and swaps it with a different color.
-    Returns the swapped grid and a mask of which pixels were changed.
+    With some probability, only a random fraction of pixels of that color get swapped.
     """
     result = grid.copy()
 
@@ -166,8 +166,28 @@ def generate_color_swap(grid: np.ndarray) -> np.ndarray:
         available_colors = [c for c in range(10) if c != color_from]
         color_to = random.choice(available_colors)
 
-    # Perform the swap
-    result[grid == color_from] = color_to
+    # Get all pixel locations with this color
+    swap_locations = np.argwhere(grid == color_from)
+
+    if len(swap_locations) == 0:
+        return result
+
+    # Decide whether to do full swap or partial swap
+    # 50% chance of partial swap
+    if random.random() < 0.5:
+        # Full swap - all pixels of that color
+        result[grid == color_from] = color_to
+    else:
+        # Partial swap - random fraction of pixels
+        # Use randomish ratios: 25%, 33%, 50%, 67%, 75%
+        ratio = random.choice([0.25, 0.33, 0.5, 0.67, 0.75])
+        num_to_swap = max(1, int(len(swap_locations) * ratio))
+
+        # Randomly select which pixels to swap
+        indices_to_swap = random.sample(range(len(swap_locations)), num_to_swap)
+        for idx in indices_to_swap:
+            r, c = swap_locations[idx]
+            result[r, c] = color_to
 
     return result
 
