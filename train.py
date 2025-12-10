@@ -578,7 +578,7 @@ def create_model(args, metadata, device):
         # Use pretrained checkpoint if it exists, otherwise disable CNN
         "cnn_checkpoint_path": "checkpoints/pixel_error_cnn.pt" if os.path.exists("checkpoints/pixel_error_cnn.pt") else None,
         "cnn_freeze_threshold": 0.5,
-        "cnn_loss_weight": 0.0,  # Don't train the CNN, use pretrained weights
+        "cnn_loss_weight": 1.0,  # Don't train the CNN, use pretrained weights
         "cnn_freeze_warmup_steps": 0,  # Use CNN freezing from the start
         # Dynamic iteration mode (CNN-guided stopping)
         "dynamic_iterations": args.dynamic_iterations,
