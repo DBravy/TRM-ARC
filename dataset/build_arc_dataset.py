@@ -25,6 +25,9 @@ class DataProcessConfig(BaseModel):
     test_num_aug: int = 0  # Number of augmentations for test split (0 = no augmentation)
     puzzle_identifiers_start: int = 1 # start > 1 to handle multiple datasets
     single_puzzle: str = None  # If set, only include this puzzle ID
+    # Augmentation mode options
+    augment: bool = True  # If False, use identity transform (no augmentation)
+    dihedral_only: bool = False  # If True, only dihedral transforms (no color permutation)
     
 ARCMaxGridSize = 30
 ARCAugmentRetriesFactor = 5
@@ -124,16 +127,36 @@ def puzzle_hash(puzzle: dict):
     return hashlib.sha256("|".join(hashes).encode()).hexdigest()
 
 
-def aug(name: str):
-    # Augment plan
-    trans_id = np.random.randint(0, 8)
-    mapping = np.concatenate([np.arange(0, 1, dtype=np.uint8), np.random.permutation(np.arange(1, 10, dtype=np.uint8))])  # Permute colors, Excluding "0" (black)
-    
+def aug(name: str, augment: bool = True, dihedral_only: bool = False):
+    """
+    Generate augmentation for a puzzle.
+
+    Args:
+        name: Puzzle name
+        augment: If False, return identity transform
+        dihedral_only: If True, only apply dihedral transform (no color permutation)
+
+    Returns:
+        (augmented_name, mapping_function)
+    """
+    if not augment:
+        # Identity transform - no augmentation
+        trans_id = 0
+        mapping = np.arange(10, dtype=np.uint8)
+    elif dihedral_only:
+        # Only dihedral transform, no color permutation
+        trans_id = np.random.randint(0, 8)
+        mapping = np.arange(10, dtype=np.uint8)
+    else:
+        # Full augmentation: dihedral + color permutation
+        trans_id = np.random.randint(0, 8)
+        mapping = np.concatenate([np.arange(0, 1, dtype=np.uint8), np.random.permutation(np.arange(1, 10, dtype=np.uint8))])  # Permute colors, Excluding "0" (black)
+
     name_with_aug_repr = f"{name}{PuzzleIdSeparator}t{trans_id}{PuzzleIdSeparator}{''.join(str(x) for x in mapping)}"
 
     def _map_grid(grid: np.ndarray):
         return dihedral_transform(mapping[grid], trans_id)
-    
+
     return name_with_aug_repr, _map_grid
 
 
@@ -152,7 +175,7 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
-def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], test_aug_count: int = 0):
+def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], test_aug_count: int = 0, augment: bool = True, dihedral_only: bool = False):
     # Convert
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
@@ -162,13 +185,13 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
         converted[dest].examples.extend([(arc_grid_to_np(example["input"]), arc_grid_to_np(example["output"])) for example in examples])
 
     group = [converted]
-    
+
     # Augment
-    if aug_count > 0:
+    if aug_count > 0 and augment:
         hashes = {puzzle_hash(converted)}
 
         for _trial in range(ARCAugmentRetriesFactor * aug_count):
-            aug_name, _map_grid = aug(name)
+            aug_name, _map_grid = aug(name, augment=augment, dihedral_only=dihedral_only)
 
             # Check duplicate
             augmented = {dest: ARCPuzzle(aug_name, [(_map_grid(input), _map_grid(label)) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
@@ -260,7 +283,7 @@ def load_puzzles_arcagi(config: DataProcessConfig):
                 if test_examples_dest[0] == "test":
                     test_puzzles[name] = puzzle
 
-            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest}, test_aug_count=config.test_num_aug)
+            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest}, test_aug_count=config.test_num_aug, augment=config.augment, dihedral_only=config.dihedral_only)
             total_puzzles += 1
 
             if config.single_puzzle is not None:

@@ -296,6 +296,8 @@ def run_pixel_error_test(
     num_negatives: int = 100,
     batch_size: int = 32,
     quiet: bool = True,
+    augment: bool = True,
+    dihedral_only: bool = False,
 ) -> Dict[str, float]:
     """
     Run pixel error test with augmentations on training puzzles.
@@ -311,7 +313,8 @@ def run_pixel_error_test(
     num_positives = max(1, num_negatives // 4)
     num_corrupted = max(1, int(num_negatives * 0.35))
     num_wrong_input = max(1, int(num_negatives * 0.15))
-    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    # mismatched_aug only makes sense when augmentation is enabled
+    num_mismatched_aug = max(1, int(num_negatives * 0.15)) if augment else 0
     num_color_swap = max(1, int(num_negatives * 0.15))
     # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
     remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
@@ -329,7 +332,8 @@ def run_pixel_error_test(
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
-        augment=True,
+        augment=augment,
+        dihedral_only=dihedral_only,
     )
 
     test_loader = DataLoader(
@@ -503,11 +507,19 @@ def build_dataset_if_needed(args) -> str:
     """Build dataset from raw JSON if it doesn't exist. Returns dataset path."""
     config = DATASET_CONFIGS[args.dataset]
 
+    # Determine augmentation suffix for directory name
+    if args.no_augment:
+        aug_suffix = "-noaug"
+    elif args.dihedral_only:
+        aug_suffix = "-dihedral"
+    else:
+        aug_suffix = ""  # Default full augmentation
+
     # Use separate directory for single puzzle mode
     if args.single_puzzle:
-        output_dir = os.path.join(args.data_root, f"single-puzzle-{args.single_puzzle}")
+        output_dir = os.path.join(args.data_root, f"single-puzzle-{args.single_puzzle}{aug_suffix}")
     else:
-        output_dir = os.path.join(args.data_root, config["output_dir_suffix"])
+        output_dir = os.path.join(args.data_root, config["output_dir_suffix"] + aug_suffix)
 
     # Check if dataset already exists
     train_dataset_json = os.path.join(output_dir, "train", "dataset.json")
@@ -536,6 +548,8 @@ def build_dataset_if_needed(args) -> str:
         test_num_aug=args.test_num_aug,
         puzzle_identifiers_start=1,
         single_puzzle=args.single_puzzle,
+        augment=not args.no_augment,
+        dihedral_only=args.dihedral_only,
     )
 
     convert_dataset(build_config)
@@ -873,6 +887,15 @@ def train(args):
     print(f"{'='*60}")
     print(f"Device: {DEVICE}, dtype: {DTYPE}")
     print(f"Dataset: {args.dataset}")
+
+    # Determine augmentation mode
+    if args.no_augment:
+        aug_mode = "none"
+    elif args.dihedral_only:
+        aug_mode = "dihedral-only (rotations/flips, no color permutations)"
+    else:
+        aug_mode = "full (dihedral + color permutations)"
+    print(f"Augmentation: {aug_mode}")
     print(f"{'='*60}\n")
 
     # Set seeds
@@ -1187,6 +1210,8 @@ def train(args):
                 cnn_model, raw_puzzles, step,
                 num_negatives=args.pixel_error_test_negatives,
                 quiet=args.quiet_pixel_error_test,
+                augment=not args.no_augment,
+                dihedral_only=args.dihedral_only,
             )
             if not args.no_wandb:
                 wandb.log(pixel_error_metrics, step=step)
@@ -1320,6 +1345,12 @@ def parse_args():
                         help="Suppress pixel error test console output (default)")
     parser.add_argument("--verbose-pixel-error-test", action="store_false", dest="quiet_pixel_error_test",
                         help="Show pixel error test console output")
+
+    # Augmentation options (for pixel error test and dataset building)
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Disable augmentations (use raw example grids)")
+    parser.add_argument("--dihedral-only", action="store_true",
+                        help="Only use dihedral transforms (rotations/flips), no color permutations")
 
     # Logging (WandB enabled by default)
     parser.add_argument("--no-wandb", action="store_true",
