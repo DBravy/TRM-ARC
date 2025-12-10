@@ -224,9 +224,11 @@ class ColorPredictorDataset(Dataset):
         puzzles: Dict,
         num_augmentations: int = 100,
         augment: bool = True,
+        dihedral_only: bool = False,
     ):
         self.num_augmentations = num_augmentations
         self.augment = augment
+        self.dihedral_only = dihedral_only
 
         # Extract all (input, output) pairs
         self.examples = []
@@ -262,18 +264,26 @@ class ColorPredictorDataset(Dataset):
         colors_present[unique_colors] = 1.0
         return colors_present
 
+    def _get_augmentation(self) -> Tuple[int, np.ndarray]:
+        """Get augmentation params based on augment and dihedral_only settings"""
+        if not self.augment:
+            return 0, np.arange(10, dtype=np.uint8)  # Identity transform
+        elif self.dihedral_only:
+            # Random dihedral transform, but identity color mapping
+            trans_id = random.randint(0, 7)
+            color_map = np.arange(10, dtype=np.uint8)
+            return trans_id, color_map
+        else:
+            return get_random_augmentation()  # Full augmentation
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         example_idx = idx // self.num_augmentations
         input_grid, output_grid, puzzle_id = self.examples[example_idx]
 
-        if self.augment:
-            # Apply same augmentation to both input and output
-            trans_id, color_map = get_random_augmentation()
-            aug_input = apply_augmentation(input_grid, trans_id, color_map)
-            aug_output = apply_augmentation(output_grid, trans_id, color_map)
-        else:
-            aug_input = input_grid
-            aug_output = output_grid
+        # Get augmentation params based on settings
+        trans_id, color_map = self._get_augmentation()
+        aug_input = apply_augmentation(input_grid, trans_id, color_map)
+        aug_output = apply_augmentation(output_grid, trans_id, color_map)
 
         # Pad input grid
         padded_input = self._pad_grid(aug_input)
@@ -537,6 +547,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="checkpoints/color_predictor_cnn.pt")
 
+    # Augmentation options
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Train without augmentations (use raw example grids)")
+    parser.add_argument("--dihedral-only", action="store_true",
+                        help="Only use dihedral transforms (rotations/flips), no color permutations")
+
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -545,6 +561,16 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
+
+    # Determine augmentation mode
+    use_augment = not args.no_augment
+    if args.no_augment:
+        aug_mode = "none"
+    elif args.dihedral_only:
+        aug_mode = "dihedral-only (rotations/flips, no color permutations)"
+    else:
+        aug_mode = "full (dihedral + color permutations)"
+    print(f"Augmentation: {aug_mode}")
 
     # Load puzzles
     print("\nLoading puzzles...")
@@ -579,12 +605,14 @@ def main():
     train_dataset = ColorPredictorDataset(
         train_puzzles,
         num_augmentations=args.num_augmentations,
-        augment=True,
+        augment=use_augment,
+        dihedral_only=args.dihedral_only,
     )
     val_dataset = ColorPredictorDataset(
         val_puzzles,
         num_augmentations=args.num_augmentations,
-        augment=True,
+        augment=use_augment,
+        dihedral_only=args.dihedral_only,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
