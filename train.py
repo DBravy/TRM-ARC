@@ -69,7 +69,7 @@ from train_pixel_error_cnn import (
 )
 
 # Import sparse TRM (CNN-gated attention)
-from trm_sparse import TRMSparse, TRMSparseConfig
+from models.recursive_reasoning.trm_sparse import TRMSparse, TRMSparseConfig
 
 # Determine device and dtype
 if torch.cuda.is_available():
