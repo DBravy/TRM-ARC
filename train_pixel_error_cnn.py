@@ -401,6 +401,7 @@ class CorrespondenceDataset(Dataset):
         augment: bool = True,
         dihedral_only: bool = False,
         mode: str = "binary",  # "binary" or "color"
+        include_test: bool = True,  # Whether to include test examples
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
@@ -417,6 +418,7 @@ class CorrespondenceDataset(Dataset):
         self.augment = augment
         self.dihedral_only = dihedral_only
         self.mode = mode
+        self.include_test = include_test
 
         # Extract all (input, output) pairs
         self.examples = []
@@ -426,13 +428,14 @@ class CorrespondenceDataset(Dataset):
                 inp = np.array(example["input"], dtype=np.uint8)
                 out = np.array(example["output"], dtype=np.uint8)
                 self.examples.append((inp, out, puzzle_id))
-            for example in puzzle.get("test", []):
-                if "output" in example:
-                    inp = np.array(example["input"], dtype=np.uint8)
-                    out = np.array(example["output"], dtype=np.uint8)
-                    self.examples.append((inp, out, puzzle_id))
+            if include_test:
+                for example in puzzle.get("test", []):
+                    if "output" in example:
+                        inp = np.array(example["input"], dtype=np.uint8)
+                        out = np.array(example["output"], dtype=np.uint8)
+                        self.examples.append((inp, out, puzzle_id))
 
-        print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles")
+        print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles (include_test={include_test})")
         print(f"Mode: {mode.upper()}")
         print(f"Samples per example: {self.samples_per_example} "
               f"({num_positives} pos, {num_corrupted} corrupt, "
@@ -668,6 +671,145 @@ class CorrespondenceDataset(Dataset):
 # =============================================================================
 # Training
 # =============================================================================
+
+class TestEvalDataset(Dataset):
+    """
+    Simple dataset for evaluating on held-out test examples.
+    No augmentation, no corruptions - just raw (input, output) pairs.
+    
+    For the critical generalization test: did the CNN learn the rule?
+    """
+    
+    def __init__(self, puzzles: Dict, mode: str = "color", test_only: bool = True):
+        self.mode = mode
+        self.examples = []
+        
+        for puzzle_id, puzzle in puzzles.items():
+            # Get examples from the appropriate split
+            if test_only:
+                examples = puzzle.get("test", [])
+            else:
+                examples = puzzle.get("train", [])
+            
+            for example in examples:
+                if "output" in example:
+                    inp = np.array(example["input"], dtype=np.uint8)
+                    out = np.array(example["output"], dtype=np.uint8)
+                    self.examples.append((inp, out, puzzle_id))
+        
+        split_name = "test" if test_only else "train"
+        print(f"TestEvalDataset: {len(self.examples)} {split_name} examples from {len(puzzles)} puzzles")
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
+        h, w = grid.shape
+        padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        padded[:h, :w] = grid
+        return padded
+    
+    def __getitem__(self, idx: int):
+        input_grid, output_grid, puzzle_id = self.examples[idx]
+        
+        # Pad grids
+        input_padded = self._pad_grid(input_grid)
+        output_padded = self._pad_grid(output_grid)
+        
+        # Store original dimensions for accurate evaluation
+        h, w = output_grid.shape
+        
+        return (
+            torch.from_numpy(input_padded).long(),
+            torch.from_numpy(output_padded).long(),
+            torch.tensor([h, w], dtype=torch.long),  # Original dimensions
+            puzzle_id
+        )
+
+
+def evaluate_test_examples(
+    model: nn.Module,
+    dataset: TestEvalDataset,
+    device: torch.device,
+    mode: str = "color",
+    verbose: bool = True
+) -> Dict[str, float]:
+    """
+    Evaluate model on held-out test examples.
+    This is the critical generalization test.
+    """
+    model.eval()
+    
+    total_pixels = 0
+    total_correct = 0
+    total_examples = 0
+    perfect_examples = 0
+    
+    results = []
+    
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            input_grid, output_grid, dims, puzzle_id = dataset[i]
+            h, w = dims[0].item(), dims[1].item()
+            
+            inp_t = input_grid.unsqueeze(0).to(device)
+            out_t = output_grid.unsqueeze(0).to(device)
+            
+            if mode == "color":
+                # Predict colors
+                logits = model(inp_t, out_t)  # (1, 10, H, W)
+                pred_colors = logits.argmax(dim=1)[0].cpu().numpy()  # (H, W)
+                target_colors = output_grid.numpy()
+                
+                # Only evaluate within original dimensions (not padding)
+                pred_region = pred_colors[:h, :w]
+                target_region = target_colors[:h, :w]
+                
+                correct = (pred_region == target_region).sum()
+                total = h * w
+                is_perfect = (correct == total)
+                
+            else:  # binary mode
+                # For binary, we check if model predicts all pixels as "correct"
+                # since these are actual correct outputs
+                logits = model(inp_t, out_t)  # (1, H, W)
+                pred_correct = (logits > 0)[0].cpu().numpy()
+                
+                pred_region = pred_correct[:h, :w]
+                # All should be predicted as correct (True/1)
+                correct = pred_region.sum()
+                total = h * w
+                is_perfect = (correct == total)
+            
+            total_correct += correct
+            total_pixels += total
+            total_examples += 1
+            if is_perfect:
+                perfect_examples += 1
+            
+            results.append({
+                'puzzle_id': puzzle_id,
+                'correct': correct,
+                'total': total,
+                'accuracy': correct / total,
+                'perfect': is_perfect
+            })
+            
+            if verbose:
+                status = "✓ PERFECT" if is_perfect else f"✗ {correct}/{total} ({100*correct/total:.1f}%)"
+                print(f"  Example {i+1}: {puzzle_id} - {status}")
+    
+    overall_accuracy = total_correct / max(total_pixels, 1)
+    perfect_rate = perfect_examples / max(total_examples, 1)
+    
+    return {
+        'pixel_accuracy': overall_accuracy,
+        'perfect_rate': perfect_rate,
+        'total_examples': total_examples,
+        'perfect_examples': perfect_examples,
+        'results': results
+    }
+
 
 def train_epoch_binary(
     model: nn.Module,
@@ -1158,6 +1300,11 @@ def main():
                         help="Train without augmentations (use raw example grids)")
     parser.add_argument("--dihedral-only", action="store_true",
                         help="Only use dihedral transforms (rotations/flips), no color permutations")
+    
+    # Test-time evaluation (for single-puzzle mode)
+    parser.add_argument("--eval-on-test", action="store_true",
+                        help="Train only on puzzle's train examples, evaluate on held-out test examples. "
+                             "This tests true generalization - did CNN learn the rule or just memorize?")
 
     args = parser.parse_args()
 
@@ -1192,6 +1339,28 @@ def main():
             return
         puzzles = {args.single_puzzle: puzzles[args.single_puzzle]}
         print(f"Single puzzle mode: {args.single_puzzle}")
+        
+        # Check if test examples have outputs
+        test_examples = puzzles[args.single_puzzle].get("test", [])
+        test_has_outputs = any("output" in ex for ex in test_examples)
+        if args.eval_on_test and not test_has_outputs:
+            print(f"Warning: --eval-on-test specified but puzzle has no test outputs!")
+            print(f"         Will train on all available examples instead.")
+            args.eval_on_test = False
+    
+    if args.eval_on_test and not args.single_puzzle:
+        print("Error: --eval-on-test requires --single-puzzle")
+        return
+    
+    # For --eval-on-test mode, explain what we're doing
+    if args.eval_on_test:
+        puzzle = puzzles[args.single_puzzle]
+        n_train = len(puzzle.get("train", []))
+        n_test = sum(1 for ex in puzzle.get("test", []) if "output" in ex)
+        print(f"\n*** GENERALIZATION TEST MODE ***")
+        print(f"Training on {n_train} train examples (with augmentation)")
+        print(f"Evaluating on {n_test} held-out test examples (no augmentation)")
+        print(f"This tests if CNN learned the RULE, not just memorized examples.\n")
 
     # Split
     puzzle_ids = list(puzzles.keys())
@@ -1234,6 +1403,10 @@ def main():
           f"{num_color_swap} color_swap, {num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise")
     print(f"Plus {num_positives} positives per example")
 
+    # Determine whether to include test examples in training
+    # For --eval-on-test mode, we train ONLY on train examples
+    include_test_in_train = not args.eval_on_test
+    
     # Create datasets
     train_dataset = CorrespondenceDataset(
         train_puzzles,
@@ -1248,6 +1421,7 @@ def main():
         augment=use_augment,
         dihedral_only=args.dihedral_only,
         mode=args.mode,
+        include_test=include_test_in_train,
     )
     val_dataset = CorrespondenceDataset(
         val_puzzles,
@@ -1262,7 +1436,13 @@ def main():
         augment=use_augment,
         dihedral_only=args.dihedral_only,
         mode=args.mode,
+        include_test=include_test_in_train,
     )
+    
+    # For --eval-on-test, create separate test evaluation dataset
+    test_eval_dataset = None
+    if args.eval_on_test:
+        test_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=True)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -1344,15 +1524,82 @@ def main():
     print(f"Best {metric_name}: {best_val_metric:.2%}")
     print(f"Checkpoint saved to: {args.save_path}")
 
-    # Visualize
+    # Visualize on training data
     if args.mode == "binary":
         visualize_predictions_binary(model, val_dataset, DEVICE)
     else:
         visualize_predictions_color(model, val_dataset, DEVICE)
 
+    # =========================================================================
+    # CRITICAL: Evaluate on held-out test examples
+    # =========================================================================
+    if args.eval_on_test and test_eval_dataset is not None:
+        print("\n" + "="*60)
+        print("GENERALIZATION TEST: Evaluating on HELD-OUT test examples")
+        print("="*60)
+        print("These examples were NOT seen during training (even with augmentation).")
+        print("This tests if the CNN learned the actual transformation RULE.\n")
+        
+        # Load best model
+        checkpoint = torch.load(args.save_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        test_results = evaluate_test_examples(
+            model, test_eval_dataset, DEVICE, 
+            mode=args.mode, verbose=True
+        )
+        
+        print(f"\n{'─'*60}")
+        print(f"TEST SET RESULTS:")
+        print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
+        print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
+        print(f"{'─'*60}")
+        
+        if test_results['perfect_rate'] == 1.0:
+            print("\n🎉 PERFECT GENERALIZATION! The CNN learned the transformation rule!")
+            print("   This suggests the CNN can solve this puzzle from training examples alone.")
+        elif test_results['pixel_accuracy'] > 0.95:
+            print("\n✓ Strong generalization - CNN learned most of the rule.")
+            print("  Minor errors may be edge cases or noise.")
+        elif test_results['pixel_accuracy'] > 0.8:
+            print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
+        else:
+            print("\n✗ Poor generalization - CNN may have memorized training examples.")
+            print("  The transformation rule was not learned.")
+        
+        # Also show comparison with training examples
+        print("\n" + "─"*60)
+        print("Comparison - Evaluating on TRAINING examples (sanity check):")
+        train_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=False)
+        train_results = evaluate_test_examples(
+            model, train_eval_dataset, DEVICE,
+            mode=args.mode, verbose=True
+        )
+        print(f"\nTRAINING SET RESULTS:")
+        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
+        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
+        
+        # Summary comparison
+        print("\n" + "="*60)
+        print("GENERALIZATION SUMMARY")
+        print("="*60)
+        print(f"  Training examples: {train_results['pixel_accuracy']:.2%} accuracy, {train_results['perfect_rate']:.2%} perfect")
+        print(f"  Test examples:     {test_results['pixel_accuracy']:.2%} accuracy, {test_results['perfect_rate']:.2%} perfect")
+        gap = train_results['pixel_accuracy'] - test_results['pixel_accuracy']
+        if gap > 0.1:
+            print(f"  Gap: {gap:.2%} - significant overfitting to training examples")
+        elif gap > 0.02:
+            print(f"  Gap: {gap:.2%} - mild overfitting")
+        else:
+            print(f"  Gap: {gap:.2%} - good generalization!")
+
     print("\nDone!")
-    print(f"\nRun the diagnostic to verify the CNN (binary mode only):")
-    print(f"  python diagnose_cnn.py --checkpoint {args.save_path}")
+    if not args.eval_on_test:
+        print(f"\nRun the diagnostic to verify the CNN (binary mode only):")
+        print(f"  python diagnose_cnn.py --checkpoint {args.save_path}")
+    print(f"\nTo test generalization on a single puzzle:")
+    print(f"  python train_pixel_error_cnn.py --single-puzzle PUZZLE_ID --mode color --eval-on-test")
 
 
 if __name__ == "__main__":
