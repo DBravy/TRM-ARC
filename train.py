@@ -68,6 +68,9 @@ from train_pixel_error_cnn import (
     load_puzzles as load_raw_puzzles,
 )
 
+# Import sparse TRM (CNN-gated attention)
+from trm_sparse import TRMSparse, TRMSparseConfig
+
 # Determine device and dtype
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -546,56 +549,114 @@ def build_dataset_if_needed(args) -> str:
 # =============================================================================
 
 def create_model(args, metadata, device):
-    """Create TRM model with ACTLossHead."""
+    """Create TRM model with ACTLossHead.
+    
+    Supports two modes:
+    - Standard TRM (default)
+    - Sparse TRM with CNN-gated attention (--sparse-attention)
+    """
     from utils.functions import load_model_class
 
     dtype_str = "float32" if DTYPE == torch.float32 else "bfloat16"
+    
+    # Determine CNN checkpoint path
+    cnn_path = args.cnn_checkpoint if os.path.exists(args.cnn_checkpoint) else None
+    
+    if args.sparse_attention:
+        # =====================================================================
+        # Sparse TRM: CNN-gated attention
+        # Only positions the CNN thinks are WRONG actively compute
+        # =====================================================================
+        print(f"\n*** Using SPARSE ATTENTION mode ***")
+        print(f"  Sparsity mode: {args.sparsity_mode}")
+        print(f"  CNN error threshold: {args.cnn_error_threshold}")
+        print(f"  CNN checkpoint: {cnn_path or 'None (will train from scratch)'}")
+        
+        config_dict = {
+            "batch_size": args.batch_size,
+            "seq_len": metadata.seq_len,
+            "vocab_size": metadata.vocab_size,
+            "num_puzzle_identifiers": metadata.num_puzzle_identifiers,
+            "hidden_size": args.hidden_size,
+            "num_heads": args.num_heads,
+            "L_layers": args.num_layers,
+            "H_layers": 0,
+            "H_cycles": args.H_cycles,
+            "L_cycles": args.L_cycles,
+            "expansion": 4.0,
+            "puzzle_emb_ndim": args.hidden_size,
+            "puzzle_emb_len": 16,
+            "halt_max_steps": args.halt_max_steps,
+            "halt_exploration_prob": 0.1,
+            "pos_encodings": "rope",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "forward_dtype": dtype_str,
+            "mlp_t": False,
+            "no_ACT_continue": True,
+            # Sparse attention config
+            "cnn_checkpoint_path": cnn_path,
+            "cnn_error_threshold": args.cnn_error_threshold,
+            "cnn_warmup_steps": args.cnn_warmup_steps,
+            "cnn_loss_weight": args.cnn_loss_weight,
+            "sparsity_mode": args.sparsity_mode,
+            "min_active_ratio": args.min_active_ratio,
+        }
+        
+        loss_cls = load_model_class("losses@ACTLossHead")
+        
+        with torch.device(device):
+            model = TRMSparse(config_dict)
+            model = loss_cls(model, loss_type="stablemax_cross_entropy", cnn_loss_weight=config_dict["cnn_loss_weight"])
+        
+    else:
+        # =====================================================================
+        # Standard TRM (original behavior)
+        # =====================================================================
+        config_dict = {
+            "batch_size": args.batch_size,
+            "seq_len": metadata.seq_len,
+            "vocab_size": metadata.vocab_size,
+            "num_puzzle_identifiers": metadata.num_puzzle_identifiers,
+            "hidden_size": args.hidden_size,
+            "num_heads": args.num_heads,
+            "L_layers": args.num_layers,
+            "H_layers": 0,
+            "H_cycles": args.H_cycles,
+            "L_cycles": args.L_cycles,
+            "expansion": 4.0,
+            "puzzle_emb_ndim": args.hidden_size,
+            "puzzle_emb_len": 16,
+            "halt_max_steps": args.halt_max_steps,
+            "halt_exploration_prob": 0.1,
+            "pos_encodings": "rope",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "forward_dtype": dtype_str,
+            "mlp_t": False,
+            "no_ACT_continue": True,
+            "causal": False,
+            # CNN-guided pixel freezing (uses pretrained CNN)
+            "cnn_checkpoint_path": cnn_path,
+            "cnn_freeze_threshold": 0.5,
+            "cnn_loss_weight": 0.0,
+            "cnn_freeze_warmup_steps": 0,
+            # Dynamic iteration mode (CNN-guided stopping)
+            "dynamic_iterations": args.dynamic_iterations,
+            "dynamic_error_threshold": args.dynamic_error_threshold,
+            "dynamic_max_steps": args.dynamic_max_steps,
+            "dynamic_min_steps": args.dynamic_min_steps,
+            # Force error pixel changes
+            "force_error_changes": args.force_error_changes,
+            "force_error_scale": args.force_error_scale,
+        }
 
-    config_dict = {
-        "batch_size": args.batch_size,
-        "seq_len": metadata.seq_len,
-        "vocab_size": metadata.vocab_size,
-        "num_puzzle_identifiers": metadata.num_puzzle_identifiers,
-        "hidden_size": args.hidden_size,
-        "num_heads": args.num_heads,
-        "L_layers": args.num_layers,
-        "H_layers": 0,
-        "H_cycles": args.H_cycles,
-        "L_cycles": args.L_cycles,
-        "expansion": 4.0,
-        "puzzle_emb_ndim": args.hidden_size,
-        "puzzle_emb_len": 16,
-        "halt_max_steps": args.halt_max_steps,
-        "halt_exploration_prob": 0.1,
-        "pos_encodings": "rope",
-        "rms_norm_eps": 1e-5,
-        "rope_theta": 10000.0,
-        "forward_dtype": dtype_str,
-        "mlp_t": False,
-        "no_ACT_continue": True,
-        "causal": False,
-        # CNN-guided pixel freezing (uses pretrained CNN)
-        # Use pretrained checkpoint if it exists, otherwise disable CNN
-        "cnn_checkpoint_path": "checkpoints/pixel_error_cnn.pt" if os.path.exists("checkpoints/pixel_error_cnn.pt") else None,
-        "cnn_freeze_threshold": 0.5,
-        "cnn_loss_weight": 1.0,  # Don't train the CNN, use pretrained weights
-        "cnn_freeze_warmup_steps": 0,  # Use CNN freezing from the start
-        # Dynamic iteration mode (CNN-guided stopping)
-        "dynamic_iterations": args.dynamic_iterations,
-        "dynamic_error_threshold": args.dynamic_error_threshold,
-        "dynamic_max_steps": args.dynamic_max_steps,
-        "dynamic_min_steps": args.dynamic_min_steps,
-        # Force error pixel changes
-        "force_error_changes": args.force_error_changes,
-        "force_error_scale": args.force_error_scale,
-    }
+        model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
+        loss_cls = load_model_class("losses@ACTLossHead")
 
-    model_cls = load_model_class("recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1")
-    loss_cls = load_model_class("losses@ACTLossHead")
-
-    with torch.device(device):
-        model = model_cls(config_dict)
-        model = loss_cls(model, loss_type="stablemax_cross_entropy", cnn_loss_weight=config_dict["cnn_loss_weight"])
+        with torch.device(device):
+            model = model_cls(config_dict)
+            model = loss_cls(model, loss_type="stablemax_cross_entropy", cnn_loss_weight=config_dict["cnn_loss_weight"])
 
     if args.compile and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model)
@@ -705,6 +766,12 @@ def train_step(
     # Add CNN loss if present
     if "cnn_loss" in metrics:
         result_metrics["train/cnn_loss"] = metrics["cnn_loss"].item()
+
+    # Add sparsity metrics if present (from sparse attention mode)
+    if "sparsity/active_ratio" in metrics:
+        result_metrics["train/sparsity_active_ratio"] = metrics["sparsity/active_ratio"]
+    if "sparsity/inactive_ratio" in metrics:
+        result_metrics["train/sparsity_inactive_ratio"] = metrics["sparsity/inactive_ratio"]
 
     return carry, result_metrics
 
@@ -1017,6 +1084,8 @@ def train(args):
             }
             if "train/cnn_loss" in metrics:
                 postfix["cnn"] = f"{metrics['train/cnn_loss']:.4f}"
+            if "train/sparsity_active_ratio" in metrics:
+                postfix["sparse"] = f"{metrics['train/sparsity_active_ratio']:.1%}"
             pbar.set_postfix(postfix)
 
             memory_manager.step_update(step)
@@ -1039,10 +1108,13 @@ def train(args):
                 print(f"\n  Step {step:,}/{total_steps:,} ({100*step/total_steps:.1f}%) | "
                       f"Time: {hours:02d}:{minutes:02d}:{seconds:02d} | "
                       f"{steps_per_sec:.1f} steps/s")
+                sparsity_str = ""
+                if "train/sparsity_active_ratio" in metrics:
+                    sparsity_str = f" | Sparse: {metrics['train/sparsity_active_ratio']:.1%} active"
                 print(f"    Loss: {avg_interval_loss:.4f} | "
                       f"Acc: {avg_interval_acc:.2%} | "
                       f"Exact: {avg_interval_exact:.2%} | "
-                      f"LR: {metrics['train/lr']:.2e}")
+                      f"LR: {metrics['train/lr']:.2e}{sparsity_str}")
 
                 # Reset interval tracking
                 interval_loss = 0.0
@@ -1187,6 +1259,21 @@ def parse_args():
                         help="Force model to output different values for pixels CNN marks as errors")
     parser.add_argument("--force-error-scale", type=float, default=1.0,
                         help="Scale of perturbation applied to stuck error pixels (default: 1.0)")
+
+    # Sparse attention mode (CNN-gated computation)
+    parser.add_argument("--sparse-attention", action="store_true",
+                        help="Enable CNN-gated sparse attention (only compute on positions CNN thinks are wrong)")
+    parser.add_argument("--sparsity-mode", type=str, default="soft",
+                        choices=["soft", "hard"],
+                        help="Sparsity mode: 'soft' (mask outputs) or 'hard' (gather/scatter)")
+    parser.add_argument("--cnn-error-threshold", type=float, default=0.5,
+                        help="CNN confidence below this = active/needs work (default: 0.5)")
+    parser.add_argument("--cnn-warmup-steps", type=int, default=0,
+                        help="Training steps before enabling sparse attention (default: 0)")
+    parser.add_argument("--cnn-loss-weight", type=float, default=0.0,
+                        help="Weight for CNN loss in joint training (default: 0.0 = frozen CNN)")
+    parser.add_argument("--min-active-ratio", type=float, default=0.01,
+                        help="Minimum ratio of positions that must be active (default: 0.01)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100000)
