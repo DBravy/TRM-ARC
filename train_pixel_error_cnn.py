@@ -417,6 +417,13 @@ class CorrespondenceDataset(Dataset):
             idx = random.randint(0, len(self.examples) - 1)
         return self.examples[idx][0], self.examples[idx][1]
 
+    def _get_augmentation(self) -> Tuple[int, np.ndarray]:
+        """Get augmentation params - random if augment=True, identity otherwise"""
+        if self.augment:
+            return get_random_augmentation()
+        else:
+            return 0, np.arange(10, dtype=np.uint8)  # Identity transform
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         example_idx = idx // self.samples_per_example
         sample_type_idx = idx % self.samples_per_example
@@ -451,7 +458,7 @@ class CorrespondenceDataset(Dataset):
 
         if sample_type == "positive":
             # Same augmentation to both input and output
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
 
@@ -463,7 +470,7 @@ class CorrespondenceDataset(Dataset):
 
         elif sample_type == "corrupted":
             # Corrupted output (standard negative)
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             corrupted = corrupt_output(aug_output)
@@ -482,7 +489,7 @@ class CorrespondenceDataset(Dataset):
             wrong_input, _ = self._get_different_example(example_idx)
 
             # Apply same augmentation to both (so aug isn't the signal)
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_wrong_input = apply_augmentation(wrong_input, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
 
@@ -497,6 +504,7 @@ class CorrespondenceDataset(Dataset):
         elif sample_type == "mismatched_aug":
             # CRITICAL: Input and output have DIFFERENT augmentations
             # Same puzzle, but augmentations don't match
+            # Note: This sample type only makes sense when augment=True
             trans_id_1, color_map_1 = get_random_augmentation()
             trans_id_2, color_map_2 = get_random_augmentation()
 
@@ -520,7 +528,7 @@ class CorrespondenceDataset(Dataset):
 
         elif sample_type == "all_zeros":
             # Output is all zeros (blank/empty) - obvious garbage
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_all_zeros(correct_output)
@@ -535,7 +543,7 @@ class CorrespondenceDataset(Dataset):
 
         elif sample_type == "constant_fill":
             # Output is all one color (1-9) - obvious garbage
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_constant_fill(correct_output)
@@ -550,7 +558,7 @@ class CorrespondenceDataset(Dataset):
 
         elif sample_type == "random_noise":
             # Output is random noise - obvious garbage
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             garbage_output = generate_random_noise(correct_output)
@@ -565,7 +573,7 @@ class CorrespondenceDataset(Dataset):
 
         else:  # color_swap
             # One color swapped with another - subtle corruption
-            trans_id, color_map = get_random_augmentation()
+            trans_id, color_map = self._get_augmentation()
             aug_input = apply_augmentation(input_grid, trans_id, color_map)
             aug_output = apply_augmentation(correct_output, trans_id, color_map)
             swapped_output = generate_color_swap(aug_output)
@@ -869,6 +877,8 @@ def main():
     # Architecture options
     parser.add_argument("--no-force-comparison", action="store_true",
                         help="Disable explicit comparison features (for ablation)")
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Train without augmentations (use raw example grids)")
 
     args = parser.parse_args()
 
@@ -880,6 +890,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Mode: CORRESPONDENCE LEARNING")
     print(f"Force comparison: {not args.no_force_comparison}")
+    print(f"Augmentation: {not args.no_augment}")
 
     # Load puzzles
     print("\nLoading puzzles...")
@@ -915,11 +926,13 @@ def main():
     # Negatives split: 35% corrupted, 15% wrong_input, 15% mismatched_aug, 15% color_swap, 20% degenerate
     num_negatives = args.num_negatives
     num_positives = max(1, num_negatives // 4)
+    use_augment = not args.no_augment
 
     # Split negatives across 7 types
     num_corrupted = max(1, int(num_negatives * 0.35))
     num_wrong_input = max(1, int(num_negatives * 0.15))
-    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    # mismatched_aug only makes sense when augmentation is enabled
+    num_mismatched_aug = max(1, int(num_negatives * 0.15)) if use_augment else 0
     num_color_swap = max(1, int(num_negatives * 0.15))
     # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
     remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
@@ -943,7 +956,7 @@ def main():
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
-        augment=True,
+        augment=use_augment,
     )
     val_dataset = CorrespondenceDataset(
         val_puzzles,
@@ -955,7 +968,7 @@ def main():
         num_constant_fill=num_constant_fill,
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
-        augment=True,  # Keep augment for val to test correspondence
+        augment=use_augment,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
