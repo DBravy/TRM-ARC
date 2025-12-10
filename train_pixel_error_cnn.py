@@ -10,9 +10,14 @@ This version forces the CNN to learn input-output correspondence by:
 The key insight: the CNN must see the SAME output labeled both "correct" and 
 "incorrect" depending on the input. This forces it to actually compare them.
 
+Modes:
+- binary: Predict whether each pixel is correct (1) or incorrect (0)
+- color: Predict what color each pixel SHOULD be (0-9)
+
 Usage:
     python train_pixel_error_cnn.py --dataset arc-agi-1
     python train_pixel_error_cnn.py --single-puzzle 00d62c1b
+    python train_pixel_error_cnn.py --mode color  # Color prediction mode
 """
 
 import argparse
@@ -251,12 +256,17 @@ class PixelErrorCNN(nn.Module):
     - element-wise product (input * output)
     
     This forces the network to see both and compare them.
+    
+    Modes:
+    - binary (num_classes=1): Predict correct (1) vs incorrect (0) per pixel
+    - color (num_classes=10): Predict what color each pixel SHOULD be
     """
 
-    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True):
+    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1):
         super().__init__()
         
         self.force_comparison = force_comparison
+        self.num_classes = num_classes
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -282,8 +292,8 @@ class PixelErrorCNN(nn.Module):
         self.up2 = Up(base_ch * 4, base_ch * 2)
         self.up3 = Up(base_ch * 2, base_ch)
 
-        # Output
-        self.outc = nn.Conv2d(base_ch, 1, kernel_size=1)
+        # Output: 1 channel for binary, 10 channels for color prediction
+        self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
 
     def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
         # Embed both grids
@@ -311,10 +321,27 @@ class PixelErrorCNN(nn.Module):
         x = self.up3(x, x1)
 
         logits = self.outc(x)
-        return logits.squeeze(1)
+        
+        if self.num_classes == 1:
+            return logits.squeeze(1)  # (B, H, W) for binary
+        else:
+            return logits  # (B, 10, H, W) for color prediction
 
     def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.forward(input_grid, output_grid))
+        """For binary mode: return probability of pixel being correct"""
+        logits = self.forward(input_grid, output_grid)
+        if self.num_classes == 1:
+            return torch.sigmoid(logits)
+        else:
+            # For color mode, return softmax probabilities
+            return F.softmax(logits, dim=1)
+    
+    def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        """For color mode: return predicted color per pixel"""
+        logits = self.forward(input_grid, output_grid)
+        if self.num_classes == 1:
+            raise ValueError("predict_colors only valid for color mode (num_classes=10)")
+        return logits.argmax(dim=1)  # (B, H, W)
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
@@ -322,8 +349,11 @@ class PixelErrorCNN(nn.Module):
         args = checkpoint.get('args', {})
         hidden_dim = args.get('hidden_dim', 64)
         force_comparison = args.get('force_comparison', True)
+        # Support both old checkpoints (binary only) and new ones
+        mode = args.get('mode', 'binary')
+        num_classes = 10 if mode == 'color' else 1
         
-        model = cls(hidden_dim=hidden_dim, force_comparison=force_comparison)
+        model = cls(hidden_dim=hidden_dim, force_comparison=force_comparison, num_classes=num_classes)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         
@@ -351,6 +381,10 @@ class CorrespondenceDataset(Dataset):
     8. NEGATIVE - color_swap: one color swapped with another
 
     Types 3-8 force the CNN to detect various failure modes!
+    
+    Modes:
+    - binary: Returns pixel_mask where 1=correct, 0=incorrect
+    - color: Returns target_colors where each pixel has the correct color (0-9)
     """
 
     def __init__(
@@ -366,6 +400,7 @@ class CorrespondenceDataset(Dataset):
         num_color_swap: int = 1,
         augment: bool = True,
         dihedral_only: bool = False,
+        mode: str = "binary",  # "binary" or "color"
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
@@ -381,6 +416,7 @@ class CorrespondenceDataset(Dataset):
         )
         self.augment = augment
         self.dihedral_only = dihedral_only
+        self.mode = mode
 
         # Extract all (input, output) pairs
         self.examples = []
@@ -397,6 +433,7 @@ class CorrespondenceDataset(Dataset):
                     self.examples.append((inp, out, puzzle_id))
 
         print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles")
+        print(f"Mode: {mode.upper()}")
         print(f"Samples per example: {self.samples_per_example} "
               f"({num_positives} pos, {num_corrupted} corrupt, "
               f"{num_wrong_input} wrong_input, {num_mismatched_aug} mismatch, "
@@ -471,8 +508,8 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = aug_output
-            # All pixels are correct
-            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            # Target: the correct output itself (for both binary and color modes)
+            target_correct = aug_output
             is_positive = 1.0
 
         elif sample_type == "corrupted":
@@ -484,10 +521,7 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = corrupted
-            # Compute which pixels are wrong
-            padded_correct = self._pad_grid(aug_output)
-            padded_corrupted = self._pad_grid(corrupted)
-            pixel_mask = (padded_correct == padded_corrupted).astype(np.float32)
+            target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
         elif sample_type == "wrong_input":
@@ -502,10 +536,10 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_wrong_input
             final_output = aug_output
-            # Content area is wrong, but padding (0==0) is still correct
-            h, w = aug_output.shape
-            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
-            pixel_mask[:h, :w] = 0.0  # Only content region marked as error
+            # For wrong_input: we don't know what the "correct" output should be
+            # since the input doesn't match. Mark entire content as "wrong"
+            # For color mode, we can't know the correct colors, so use special handling
+            target_correct = aug_output  # Use output as target (will be marked wrong via mask)
             is_positive = 0.0
 
         elif sample_type == "mismatched_aug":
@@ -532,13 +566,8 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = aug_output
-            # Content area is wrong, but padding (0==0) is still correct
-            # Use max dimensions since augmentations may rotate/transpose
-            h1, w1 = aug_input.shape
-            h2, w2 = aug_output.shape
-            h_max, w_max = max(h1, h2), max(w1, w2)
-            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
-            pixel_mask[:h_max, :w_max] = 0.0  # Only content region marked as error
+            # Similar to wrong_input - mismatch means we can't know correct colors
+            target_correct = aug_output
             is_positive = 0.0
 
         elif sample_type == "all_zeros":
@@ -550,10 +579,7 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = garbage_output
-            # Compute which pixels are actually wrong (differ from correct)
-            padded_correct = self._pad_grid(aug_output)
-            padded_garbage = self._pad_grid(garbage_output)
-            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
+            target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
         elif sample_type == "constant_fill":
@@ -565,10 +591,7 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = garbage_output
-            # Compute which pixels are actually wrong (differ from correct)
-            padded_correct = self._pad_grid(aug_output)
-            padded_garbage = self._pad_grid(garbage_output)
-            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
+            target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
         elif sample_type == "random_noise":
@@ -580,10 +603,7 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = garbage_output
-            # Compute which pixels are actually wrong (differ from correct)
-            padded_correct = self._pad_grid(aug_output)
-            padded_garbage = self._pad_grid(garbage_output)
-            pixel_mask = (padded_correct == padded_garbage).astype(np.float32)
+            target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
         else:  # color_swap
@@ -595,39 +615,67 @@ class CorrespondenceDataset(Dataset):
 
             final_input = aug_input
             final_output = swapped_output
-            # Compute which pixels are actually wrong (differ from correct)
-            padded_correct = self._pad_grid(aug_output)
-            padded_swapped = self._pad_grid(swapped_output)
-            pixel_mask = (padded_correct == padded_swapped).astype(np.float32)
+            target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
         # Pad grids
         final_input = self._pad_grid(final_input)
         final_output = self._pad_grid(final_output)
+        target_correct = self._pad_grid(target_correct)
+
+        # Compute binary mask (always needed for metrics)
+        pixel_mask = (final_output == target_correct).astype(np.float32)
+        
+        # Handle special cases for wrong_input and mismatched_aug
+        # These have the entire content area marked as wrong
+        if sample_type == "wrong_input":
+            h, w = correct_output.shape
+            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            pixel_mask[:h, :w] = 0.0  # Only content region marked as error
+        elif sample_type == "mismatched_aug":
+            h1, w1 = input_grid.shape
+            h2, w2 = correct_output.shape
+            # After augmentation, dimensions might be swapped
+            trans_id_1 = trans_id_1 if 'trans_id_1' in dir() else trans_id
+            if trans_id_1 in [1, 3, 6, 7]:  # Transforms that swap dimensions
+                h1, w1 = w1, h1
+            h_max, w_max = max(h1, h2), max(w1, w2)
+            pixel_mask = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            pixel_mask[:h_max, :w_max] = 0.0
 
         # Ensure contiguous
         final_input = np.ascontiguousarray(final_input)
         final_output = np.ascontiguousarray(final_output)
         pixel_mask = np.ascontiguousarray(pixel_mask)
+        target_correct = np.ascontiguousarray(target_correct)
 
-        return (
-            torch.from_numpy(final_input.copy()).long(),
-            torch.from_numpy(final_output.copy()).long(),
-            torch.from_numpy(pixel_mask.copy()).float(),
-            torch.tensor(is_positive, dtype=torch.float32)
-        )
+        if self.mode == "binary":
+            return (
+                torch.from_numpy(final_input.copy()).long(),
+                torch.from_numpy(final_output.copy()).long(),
+                torch.from_numpy(pixel_mask.copy()).float(),
+                torch.tensor(is_positive, dtype=torch.float32)
+            )
+        else:  # color mode
+            return (
+                torch.from_numpy(final_input.copy()).long(),
+                torch.from_numpy(final_output.copy()).long(),
+                torch.from_numpy(target_correct.copy()).long(),  # Target colors (0-9)
+                torch.from_numpy(pixel_mask.copy()).float(),  # Still useful for metrics
+            )
 
 
 # =============================================================================
 # Training
 # =============================================================================
 
-def train_epoch(
+def train_epoch_binary(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> Dict[str, float]:
+    """Training epoch for binary mode"""
     model.train()
 
     total_loss = 0.0
@@ -686,11 +734,76 @@ def train_epoch(
     }
 
 
-def evaluate(
+def train_epoch_color(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Training epoch for color prediction mode"""
+    model.train()
+
+    total_loss = 0.0
+    total_color_correct = 0
+    total_pixels = 0
+    total_error_pixels = 0
+    total_error_color_correct = 0
+    num_batches = 0
+
+    pbar = tqdm(loader, desc="Training")
+    for input_grid, output_grid, target_colors, pixel_mask in pbar:
+        input_grid = input_grid.to(device)
+        output_grid = output_grid.to(device)
+        target_colors = target_colors.to(device)
+        pixel_mask = pixel_mask.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(input_grid, output_grid)  # (B, 10, H, W)
+        
+        # Cross-entropy loss for color prediction
+        loss = F.cross_entropy(logits, target_colors)
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            pred_colors = logits.argmax(dim=1)  # (B, H, W)
+            
+            # Overall color accuracy
+            correct = (pred_colors == target_colors).sum().item()
+            total = target_colors.numel()
+            total_color_correct += correct
+            total_pixels += total
+
+            # Accuracy on error pixels only (pixels where output != target)
+            error_mask = (pixel_mask == 0)  # pixels that are wrong
+            if error_mask.sum() > 0:
+                error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
+                total_error_color_correct += error_correct
+                total_error_pixels += error_mask.sum().item()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        pbar.set_postfix(loss=loss.item())
+
+    color_accuracy = total_color_correct / max(total_pixels, 1)
+    error_color_accuracy = total_error_color_correct / max(total_error_pixels, 1)
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "color_accuracy": color_accuracy,
+        "error_color_accuracy": error_color_accuracy,
+    }
+
+
+def evaluate_binary(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
+    """Evaluation for binary mode"""
     model.eval()
 
     total_loss = 0.0
@@ -749,12 +862,74 @@ def evaluate(
     }
 
 
-def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
-    """Visualize predictions across different sample types"""
+def evaluate_color(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluation for color prediction mode"""
+    model.eval()
+
+    total_loss = 0.0
+    total_color_correct = 0
+    total_pixels = 0
+    total_error_pixels = 0
+    total_error_color_correct = 0
+    total_perfect = 0
+    total_samples = 0
+    num_batches = 0
+
+    with torch.no_grad():
+        for input_grid, output_grid, target_colors, pixel_mask in loader:
+            input_grid = input_grid.to(device)
+            output_grid = output_grid.to(device)
+            target_colors = target_colors.to(device)
+            pixel_mask = pixel_mask.to(device)
+
+            logits = model(input_grid, output_grid)  # (B, 10, H, W)
+            loss = F.cross_entropy(logits, target_colors)
+
+            pred_colors = logits.argmax(dim=1)  # (B, H, W)
+            
+            # Overall color accuracy
+            correct = (pred_colors == target_colors).sum().item()
+            total = target_colors.numel()
+            total_color_correct += correct
+            total_pixels += total
+
+            # Accuracy on error pixels only
+            error_mask = (pixel_mask == 0)
+            if error_mask.sum() > 0:
+                error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
+                total_error_color_correct += error_correct
+                total_error_pixels += error_mask.sum().item()
+
+            # Perfect predictions (all pixels correct)
+            batch_perfect = (pred_colors == target_colors).all(dim=-1).all(dim=-1).sum().item()
+            total_perfect += batch_perfect
+            total_samples += input_grid.size(0)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    color_accuracy = total_color_correct / max(total_pixels, 1)
+    error_color_accuracy = total_error_color_correct / max(total_error_pixels, 1)
+    perfect_rate = total_perfect / max(total_samples, 1)
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "color_accuracy": color_accuracy,
+        "error_color_accuracy": error_color_accuracy,
+        "perfect_rate": perfect_rate,
+    }
+
+
+def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
+    """Visualize predictions for binary mode"""
     model.eval()
 
     print("\n" + "="*80)
-    print("Sample Predictions (Correspondence Learning)")
+    print("Sample Predictions (Binary Mode - Error Detection)")
     print("="*80)
 
     # Get samples of each type with their counts
@@ -833,6 +1008,89 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
     print("="*80 + "\n")
 
 
+def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
+    """Visualize predictions for color mode"""
+    model.eval()
+
+    print("\n" + "="*80)
+    print("Sample Predictions (Color Mode - Color Prediction)")
+    print("="*80)
+
+    # Get samples of each type with their counts
+    base = 0
+    type_info = [
+        ("positive", base, dataset.num_positives),
+    ]
+    base += dataset.num_positives
+    type_info.append(("corrupted", base, dataset.num_corrupted))
+    base += dataset.num_corrupted
+    type_info.append(("wrong_input", base, dataset.num_wrong_input))
+    base += dataset.num_wrong_input
+    type_info.append(("mismatched_aug", base, dataset.num_mismatched_aug))
+    base += dataset.num_mismatched_aug
+    type_info.append(("all_zeros", base, dataset.num_all_zeros))
+    base += dataset.num_all_zeros
+    type_info.append(("constant_fill", base, dataset.num_constant_fill))
+    base += dataset.num_constant_fill
+    type_info.append(("random_noise", base, dataset.num_random_noise))
+    base += dataset.num_random_noise
+    type_info.append(("color_swap", base, dataset.num_color_swap))
+    
+    for sample_type, offset, count in type_info:
+        if count == 0:
+            continue
+            
+        print(f"\n{'─'*80}")
+        print(f"Sample Type: {sample_type.upper()}")
+        print(f"{'─'*80}")
+        
+        samples_to_show = min(2, count)
+        for i in range(samples_to_show):
+            # Calculate index for this sample type
+            example_idx = random.randint(0, len(dataset.examples) - 1)
+            sample_idx = example_idx * dataset.samples_per_example + offset + i
+            
+            if sample_idx >= len(dataset):
+                continue
+                
+            input_grid, output_grid, target_colors, pixel_mask = dataset[sample_idx]
+
+            inp_t = input_grid.unsqueeze(0).to(device)
+            out_t = output_grid.unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                pred_colors = model.predict_colors(inp_t, out_t)[0].cpu().numpy()
+
+            input_np = input_grid.numpy()
+            output_np = output_grid.numpy()
+            target_np = target_colors.numpy()
+            mask_np = pixel_mask.numpy()
+
+            # Find content bounds
+            nonzero = np.where(output_np > 0)
+            if len(nonzero[0]) > 0:
+                r_max = min(nonzero[0].max() + 1, 8)
+                c_max = min(nonzero[1].max() + 1, 8)
+            else:
+                r_max, c_max = 6, 6
+
+            num_errors = int((mask_np[:r_max, :c_max] == 0).sum())
+            num_correct_preds = int((pred_colors[:r_max, :c_max] == target_np[:r_max, :c_max]).sum())
+            total_pixels = r_max * c_max
+            
+            print(f"\nActual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
+            print(f"{'INPUT':<20} {'OUTPUT':<20} {'TARGET':<20} {'PREDICTED':<20}")
+
+            for r in range(r_max):
+                inp_row = " ".join(f"{input_np[r, c]}" for c in range(c_max))
+                out_row = " ".join(f"{output_np[r, c]}" for c in range(c_max))
+                tgt_row = " ".join(f"{target_np[r, c]}" for c in range(c_max))
+                pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(c_max))
+                print(f"{inp_row:<20} {out_row:<20} {tgt_row:<20} {pred_row:<20}")
+
+    print("="*80 + "\n")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -889,6 +1147,10 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn.pt")
     
+    # Mode selection
+    parser.add_argument("--mode", type=str, default="binary", choices=["binary", "color"],
+                        help="binary: detect errors (correct/incorrect), color: predict correct colors (0-9)")
+    
     # Architecture options
     parser.add_argument("--no-force-comparison", action="store_true",
                         help="Disable explicit comparison features (for ablation)")
@@ -905,7 +1167,9 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
-    print(f"Mode: CORRESPONDENCE LEARNING")
+    print(f"Mode: {args.mode.upper()}")
+    print(f"  - binary: Predict if each pixel is correct (1) or incorrect (0)")
+    print(f"  - color: Predict what color each pixel SHOULD be (0-9)")
     print(f"Force comparison: {not args.no_force_comparison}")
 
     # Determine augmentation mode
@@ -983,6 +1247,7 @@ def main():
         num_color_swap=num_color_swap,
         augment=use_augment,
         dihedral_only=args.dihedral_only,
+        mode=args.mode,
     )
     val_dataset = CorrespondenceDataset(
         val_puzzles,
@@ -996,19 +1261,22 @@ def main():
         num_color_swap=num_color_swap,
         augment=use_augment,
         dihedral_only=args.dihedral_only,
+        mode=args.mode,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # Create model with explicit comparison
+    # Create model
     print("\nCreating model...")
     force_comparison = not args.no_force_comparison
-    model = PixelErrorCNN(hidden_dim=args.hidden_dim, force_comparison=force_comparison)
+    num_classes = 10 if args.mode == "color" else 1
+    model = PixelErrorCNN(hidden_dim=args.hidden_dim, force_comparison=force_comparison, num_classes=num_classes)
     model = model.to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
+    print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -1019,36 +1287,53 @@ def main():
 
     # Training
     print("\n" + "="*60)
-    print("Starting Training (Correspondence Learning)")
+    print(f"Starting Training ({args.mode.upper()} mode)")
     print("="*60)
 
-    best_val_iou = 0.0
+    best_val_metric = 0.0
+    metric_name = "error_iou" if args.mode == "binary" else "color_accuracy"
 
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
-        val_metrics = evaluate(model, val_loader, DEVICE)
+        if args.mode == "binary":
+            train_metrics = train_epoch_binary(model, train_loader, optimizer, DEVICE)
+            val_metrics = evaluate_binary(model, val_loader, DEVICE)
+            
+            print(f"  Train Loss: {train_metrics['loss']:.4f}, Pix Acc: {train_metrics['pixel_accuracy']:.2%}, "
+                  f"Err P/R: {train_metrics['error_precision']:.2%}/{train_metrics['error_recall']:.2%}, "
+                  f"IoU: {train_metrics['error_iou']:.2%}")
+            print(f"  Val   Loss: {val_metrics['loss']:.4f}, Pix Acc: {val_metrics['pixel_accuracy']:.2%}, "
+                  f"Err P/R: {val_metrics['error_precision']:.2%}/{val_metrics['error_recall']:.2%}, "
+                  f"IoU: {val_metrics['error_iou']:.2%}")
+            
+            current_metric = val_metrics['error_iou']
+        else:
+            train_metrics = train_epoch_color(model, train_loader, optimizer, DEVICE)
+            val_metrics = evaluate_color(model, val_loader, DEVICE)
+            
+            print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
+                  f"Error Color Acc: {train_metrics['error_color_accuracy']:.2%}")
+            print(f"  Val   Loss: {val_metrics['loss']:.4f}, Color Acc: {val_metrics['color_accuracy']:.2%}, "
+                  f"Error Color Acc: {val_metrics['error_color_accuracy']:.2%}, "
+                  f"Perfect: {val_metrics['perfect_rate']:.2%}")
+            
+            current_metric = val_metrics['color_accuracy']
 
         scheduler.step()
 
-        print(f"  Train Loss: {train_metrics['loss']:.4f}, Pix Acc: {train_metrics['pixel_accuracy']:.2%}, "
-              f"Err P/R: {train_metrics['error_precision']:.2%}/{train_metrics['error_recall']:.2%}, "
-              f"IoU: {train_metrics['error_iou']:.2%}")
-        print(f"  Val   Loss: {val_metrics['loss']:.4f}, Pix Acc: {val_metrics['pixel_accuracy']:.2%}, "
-              f"Err P/R: {val_metrics['error_precision']:.2%}/{val_metrics['error_recall']:.2%}, "
-              f"IoU: {val_metrics['error_iou']:.2%}")
-
-        if val_metrics['error_iou'] > best_val_iou:
-            best_val_iou = val_metrics['error_iou']
-            print(f"  [New best Error IoU: {best_val_iou:.2%}]")
+        if current_metric > best_val_metric:
+            best_val_metric = current_metric
+            print(f"  [New best {metric_name}: {best_val_metric:.2%}]")
             
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'args': vars(args),
                 'epoch': epoch,
-                'best_val_iou': best_val_iou,
+                f'best_val_{metric_name}': best_val_metric,
                 'force_comparison': force_comparison,
+                'mode': args.mode,
+                'num_classes': num_classes,
             }
             torch.save(checkpoint, args.save_path)
 
@@ -1056,14 +1341,17 @@ def main():
     print("\n" + "="*60)
     print("Training Complete")
     print("="*60)
-    print(f"Best Error IoU: {best_val_iou:.2%}")
+    print(f"Best {metric_name}: {best_val_metric:.2%}")
     print(f"Checkpoint saved to: {args.save_path}")
 
     # Visualize
-    visualize_predictions(model, val_dataset, DEVICE)
+    if args.mode == "binary":
+        visualize_predictions_binary(model, val_dataset, DEVICE)
+    else:
+        visualize_predictions_color(model, val_dataset, DEVICE)
 
     print("\nDone!")
-    print("\nRun the diagnostic to verify the CNN now uses the input:")
+    print(f"\nRun the diagnostic to verify the CNN (binary mode only):")
     print(f"  python diagnose_cnn.py --checkpoint {args.save_path}")
 
 
