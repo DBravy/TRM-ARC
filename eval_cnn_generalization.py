@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+Evaluate CNN color prediction generalization across many puzzles.
+
+For each puzzle:
+1. Train CNN ONLY on training examples (with augmentation)
+2. Evaluate on held-out test examples
+3. Record whether it generalizes
+
+This answers: "How many ARC puzzles can be solved by test-time training a CNN?"
+
+Usage:
+    python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100
+    python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100 --max-puzzles 50
+"""
+
+import argparse
+import json
+import os
+import random
+import time
+from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# Determine device
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
+GRID_SIZE = 30
+NUM_COLORS = 10
+
+
+# =============================================================================
+# Model (copied from train_pixel_error_cnn.py for standalone use)
+# =============================================================================
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Down(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.pool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_ch, out_ch)
+        )
+
+    def forward(self, x):
+        return self.pool_conv(x)
+
+
+class Up(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_ch, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diff_h = x2.size(2) - x1.size(2)
+        diff_w = x2.size(3) - x1.size(3)
+        x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2,
+                       diff_h // 2, diff_h - diff_h // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class PixelErrorCNN(nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_classes: int = 10):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        self.input_embed = nn.Embedding(NUM_COLORS, 16)
+        self.output_embed = nn.Embedding(NUM_COLORS, 16)
+        
+        in_channels = 64  # force_comparison=True: 16+16+16+16
+        base_ch = hidden_dim
+
+        self.inc = DoubleConv(in_channels, base_ch)
+        self.down1 = Down(base_ch, base_ch * 2)
+        self.down2 = Down(base_ch * 2, base_ch * 4)
+        self.down3 = Down(base_ch * 4, base_ch * 8)
+        self.up1 = Up(base_ch * 8, base_ch * 4)
+        self.up2 = Up(base_ch * 4, base_ch * 2)
+        self.up3 = Up(base_ch * 2, base_ch)
+        self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
+
+    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        inp_emb = self.input_embed(input_grid)
+        out_emb = self.output_embed(output_grid)
+        
+        diff = inp_emb - out_emb
+        prod = inp_emb * out_emb
+        x = torch.cat([inp_emb, out_emb, diff, prod], dim=-1)
+        x = x.permute(0, 3, 1, 2).contiguous()
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x = self.up1(x4, x3)
+        x = self.up2(x, x2)
+        x = self.up3(x, x1)
+        return self.outc(x)
+
+    def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        return self.forward(input_grid, output_grid).argmax(dim=1)
+
+
+# =============================================================================
+# Augmentation
+# =============================================================================
+
+def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
+    if tid == 0: return arr
+    elif tid == 1: return np.rot90(arr, k=1)
+    elif tid == 2: return np.rot90(arr, k=2)
+    elif tid == 3: return np.rot90(arr, k=3)
+    elif tid == 4: return np.fliplr(arr)
+    elif tid == 5: return np.flipud(arr)
+    elif tid == 6: return arr.T
+    elif tid == 7: return np.fliplr(np.rot90(arr, k=1))
+    return arr
+
+
+def random_color_permutation() -> np.ndarray:
+    return np.concatenate([
+        np.array([0], dtype=np.uint8),
+        np.random.permutation(np.arange(1, 10, dtype=np.uint8))
+    ])
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
+
+class SinglePuzzleDataset(Dataset):
+    """Dataset for a single puzzle's training examples with augmentation."""
+    
+    def __init__(self, puzzle: Dict, num_augments: int = 50, dihedral_only: bool = True):
+        self.examples = []
+        self.num_augments = num_augments
+        self.dihedral_only = dihedral_only
+        
+        for example in puzzle.get("train", []):
+            inp = np.array(example["input"], dtype=np.uint8)
+            out = np.array(example["output"], dtype=np.uint8)
+            self.examples.append((inp, out))
+    
+    def __len__(self):
+        return len(self.examples) * self.num_augments
+    
+    def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
+        h, w = grid.shape
+        padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        padded[:h, :w] = grid
+        return padded
+    
+    def __getitem__(self, idx):
+        example_idx = idx // self.num_augments
+        inp, out = self.examples[example_idx]
+        
+        # Random augmentation
+        trans_id = random.randint(0, 7)
+        if self.dihedral_only:
+            color_map = np.arange(10, dtype=np.uint8)
+        else:
+            color_map = random_color_permutation()
+        
+        aug_inp = dihedral_transform(color_map[inp], trans_id)
+        aug_out = dihedral_transform(color_map[out], trans_id)
+        
+        return (
+            torch.from_numpy(self._pad_grid(aug_inp)).long(),
+            torch.from_numpy(self._pad_grid(aug_out)).long(),
+        )
+
+
+# =============================================================================
+# Training and Evaluation
+# =============================================================================
+
+def train_on_puzzle(
+    puzzle: Dict,
+    epochs: int = 100,
+    hidden_dim: int = 64,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    num_augments: int = 50,
+    dihedral_only: bool = True,
+    verbose: bool = False,
+) -> nn.Module:
+    """Train a CNN on a single puzzle's training examples."""
+    
+    dataset = SinglePuzzleDataset(puzzle, num_augments=num_augments, dihedral_only=dihedral_only)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    
+    model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for inp, out in loader:
+            inp, out = inp.to(DEVICE), out.to(DEVICE)
+            
+            optimizer.zero_grad()
+            logits = model(inp, out)
+            loss = F.cross_entropy(logits, out)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        scheduler.step()
+        
+        if verbose and (epoch + 1) % 20 == 0:
+            print(f"    Epoch {epoch+1}: loss={total_loss/len(loader):.4f}")
+    
+    return model
+
+
+def evaluate_on_test(model: nn.Module, puzzle: Dict) -> Dict:
+    """Evaluate trained model on puzzle's test examples."""
+    model.eval()
+    
+    test_examples = puzzle.get("test", [])
+    if not test_examples or not any("output" in ex for ex in test_examples):
+        return {"error": "no_test_outputs"}
+    
+    results = []
+    total_correct = 0
+    total_pixels = 0
+    
+    with torch.no_grad():
+        for ex in test_examples:
+            if "output" not in ex:
+                continue
+            
+            inp = np.array(ex["input"], dtype=np.uint8)
+            out = np.array(ex["output"], dtype=np.uint8)
+            h, w = out.shape
+            
+            # Pad
+            inp_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+            out_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+            inp_pad[:inp.shape[0], :inp.shape[1]] = inp
+            out_pad[:h, :w] = out
+            
+            inp_t = torch.from_numpy(inp_pad).long().unsqueeze(0).to(DEVICE)
+            out_t = torch.from_numpy(out_pad).long().unsqueeze(0).to(DEVICE)
+            
+            pred = model.predict_colors(inp_t, out_t)[0].cpu().numpy()
+            
+            correct = (pred[:h, :w] == out).sum()
+            total = h * w
+            
+            results.append({
+                "correct": int(correct),
+                "total": total,
+                "accuracy": correct / total,
+                "perfect": correct == total
+            })
+            
+            total_correct += correct
+            total_pixels += total
+    
+    return {
+        "pixel_accuracy": total_correct / max(total_pixels, 1),
+        "perfect_rate": sum(r["perfect"] for r in results) / max(len(results), 1),
+        "num_test_examples": len(results),
+        "all_perfect": all(r["perfect"] for r in results),
+        "results": results
+    }
+
+
+@dataclass
+class PuzzleResult:
+    puzzle_id: str
+    num_train: int
+    num_test: int
+    train_time: float
+    pixel_accuracy: float
+    perfect_rate: float
+    all_perfect: bool
+    error: str = None
+
+
+def evaluate_puzzle(
+    puzzle_id: str,
+    puzzle: Dict,
+    epochs: int,
+    hidden_dim: int,
+    num_augments: int,
+    dihedral_only: bool,
+    verbose: bool = False
+) -> PuzzleResult:
+    """Train and evaluate on a single puzzle."""
+    
+    num_train = len(puzzle.get("train", []))
+    test_examples = puzzle.get("test", [])
+    num_test = sum(1 for ex in test_examples if "output" in ex)
+    
+    if num_train == 0:
+        return PuzzleResult(puzzle_id, 0, 0, 0, 0, 0, False, "no_train")
+    if num_test == 0:
+        return PuzzleResult(puzzle_id, num_train, 0, 0, 0, 0, False, "no_test_outputs")
+    
+    start = time.time()
+    model = train_on_puzzle(
+        puzzle, epochs=epochs, hidden_dim=hidden_dim,
+        num_augments=num_augments, dihedral_only=dihedral_only,
+        verbose=verbose
+    )
+    train_time = time.time() - start
+    
+    eval_results = evaluate_on_test(model, puzzle)
+    
+    if "error" in eval_results:
+        return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, eval_results["error"])
+    
+    return PuzzleResult(
+        puzzle_id=puzzle_id,
+        num_train=num_train,
+        num_test=num_test,
+        train_time=train_time,
+        pixel_accuracy=eval_results["pixel_accuracy"],
+        perfect_rate=eval_results["perfect_rate"],
+        all_perfect=eval_results["all_perfect"],
+    )
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined") -> Dict:
+    config = {
+        "arc-agi-1": {"subsets": ["training", "evaluation"]},
+        "arc-agi-2": {"subsets": ["training2", "evaluation2"]},
+    }
+    
+    all_puzzles = {}
+    
+    for subset in config[dataset_name]["subsets"]:
+        challenges_path = f"{data_root}/arc-agi_{subset}_challenges.json"
+        solutions_path = f"{data_root}/arc-agi_{subset}_solutions.json"
+        
+        if not os.path.exists(challenges_path):
+            continue
+        
+        with open(challenges_path) as f:
+            puzzles = json.load(f)
+        
+        if os.path.exists(solutions_path):
+            with open(solutions_path) as f:
+                solutions = json.load(f)
+            for pid in puzzles:
+                if pid in solutions:
+                    for i, sol in enumerate(solutions[pid]):
+                        if i < len(puzzles[pid]["test"]):
+                            puzzles[pid]["test"][i]["output"] = sol
+        
+        all_puzzles.update(puzzles)
+    
+    return all_puzzles
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate CNN generalization across ARC puzzles")
+    parser.add_argument("--dataset", type=str, default="arc-agi-1", choices=["arc-agi-1", "arc-agi-2"])
+    parser.add_argument("--data-root", type=str, default="kaggle/combined")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--num-augments", type=int, default=50, help="Augmented samples per training example")
+    parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
+    parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
+    args = parser.parse_args()
+    
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    
+    print(f"Device: {DEVICE}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Epochs per puzzle: {args.epochs}")
+    print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
+    print(f"Augments per example: {args.num_augments}")
+    
+    # Load puzzles
+    puzzles = load_puzzles(args.dataset, args.data_root)
+    puzzle_ids = list(puzzles.keys())
+    
+    # Filter to puzzles with test outputs
+    puzzle_ids = [pid for pid in puzzle_ids 
+                  if any("output" in ex for ex in puzzles[pid].get("test", []))]
+    
+    if args.max_puzzles:
+        random.shuffle(puzzle_ids)
+        puzzle_ids = puzzle_ids[:args.max_puzzles]
+    
+    print(f"\nEvaluating {len(puzzle_ids)} puzzles...")
+    print("="*60)
+    
+    results: List[PuzzleResult] = []
+    
+    for puzzle_id in tqdm(puzzle_ids, desc="Puzzles"):
+        result = evaluate_puzzle(
+            puzzle_id, puzzles[puzzle_id],
+            epochs=args.epochs,
+            hidden_dim=args.hidden_dim,
+            num_augments=args.num_augments,
+            dihedral_only=args.dihedral_only,
+            verbose=args.verbose
+        )
+        results.append(result)
+        
+        if args.verbose or result.all_perfect:
+            status = "✓ PERFECT" if result.all_perfect else f"✗ {result.pixel_accuracy:.1%}"
+            print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s)")
+    
+    # Summary statistics
+    valid_results = [r for r in results if r.error is None]
+    perfect_results = [r for r in valid_results if r.all_perfect]
+    high_acc_results = [r for r in valid_results if r.pixel_accuracy >= 0.95]
+    
+    print("\n" + "="*60)
+    print("RESULTS SUMMARY")
+    print("="*60)
+    print(f"Total puzzles evaluated: {len(puzzle_ids)}")
+    print(f"Valid evaluations: {len(valid_results)}")
+    print(f"Perfect generalization (100%): {len(perfect_results)} ({100*len(perfect_results)/max(len(valid_results),1):.1f}%)")
+    print(f"High accuracy (≥95%): {len(high_acc_results)} ({100*len(high_acc_results)/max(len(valid_results),1):.1f}%)")
+    
+    if valid_results:
+        avg_accuracy = sum(r.pixel_accuracy for r in valid_results) / len(valid_results)
+        avg_time = sum(r.train_time for r in valid_results) / len(valid_results)
+        print(f"Average pixel accuracy: {avg_accuracy:.2%}")
+        print(f"Average training time: {avg_time:.1f}s")
+    
+    # Accuracy distribution
+    print("\nAccuracy distribution:")
+    bins = [(1.0, 1.0), (0.95, 1.0), (0.9, 0.95), (0.8, 0.9), (0.5, 0.8), (0.0, 0.5)]
+    for lo, hi in bins:
+        count = sum(1 for r in valid_results if lo <= r.pixel_accuracy < hi or (lo == hi == 1.0 and r.pixel_accuracy == 1.0))
+        pct = 100 * count / max(len(valid_results), 1)
+        label = f"{100*lo:.0f}%" if lo == hi else f"{100*lo:.0f}-{100*hi:.0f}%"
+        bar = "█" * int(pct / 2)
+        print(f"  {label:>10}: {count:>4} ({pct:>5.1f}%) {bar}")
+    
+    # List perfect puzzles
+    if perfect_results:
+        print(f"\nPerfect generalization puzzles ({len(perfect_results)}):")
+        for r in sorted(perfect_results, key=lambda x: x.puzzle_id)[:20]:
+            print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s)")
+        if len(perfect_results) > 20:
+            print(f"  ... and {len(perfect_results) - 20} more")
+    
+    # Save results
+    output_data = {
+        "config": vars(args),
+        "summary": {
+            "total_puzzles": len(puzzle_ids),
+            "valid_evaluations": len(valid_results),
+            "perfect_count": len(perfect_results),
+            "perfect_rate": len(perfect_results) / max(len(valid_results), 1),
+            "high_acc_count": len(high_acc_results),
+            "avg_pixel_accuracy": avg_accuracy if valid_results else 0,
+            "avg_train_time": avg_time if valid_results else 0,
+        },
+        "results": [
+            {
+                "puzzle_id": r.puzzle_id,
+                "num_train": r.num_train,
+                "num_test": r.num_test,
+                "train_time": r.train_time,
+                "pixel_accuracy": r.pixel_accuracy,
+                "perfect_rate": r.perfect_rate,
+                "all_perfect": r.all_perfect,
+                "error": r.error,
+            }
+            for r in results
+        ]
+    }
+    
+    with open(args.output, "w") as f:
+        json.dump(output_data, f, indent=2)
+    print(f"\nResults saved to: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
