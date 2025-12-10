@@ -365,6 +365,7 @@ class CorrespondenceDataset(Dataset):
         num_random_noise: int = 1,
         num_color_swap: int = 1,
         augment: bool = True,
+        dihedral_only: bool = False,
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
@@ -379,6 +380,7 @@ class CorrespondenceDataset(Dataset):
             num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
         )
         self.augment = augment
+        self.dihedral_only = dihedral_only
 
         # Extract all (input, output) pairs
         self.examples = []
@@ -418,11 +420,16 @@ class CorrespondenceDataset(Dataset):
         return self.examples[idx][0], self.examples[idx][1]
 
     def _get_augmentation(self) -> Tuple[int, np.ndarray]:
-        """Get augmentation params - random if augment=True, identity otherwise"""
-        if self.augment:
-            return get_random_augmentation()
-        else:
+        """Get augmentation params based on augment and dihedral_only settings"""
+        if not self.augment:
             return 0, np.arange(10, dtype=np.uint8)  # Identity transform
+        elif self.dihedral_only:
+            # Random dihedral transform, but identity color mapping
+            trans_id = random.randint(0, 7)
+            color_map = np.arange(10, dtype=np.uint8)
+            return trans_id, color_map
+        else:
+            return get_random_augmentation()  # Full augmentation
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         example_idx = idx // self.samples_per_example
@@ -505,12 +512,20 @@ class CorrespondenceDataset(Dataset):
             # CRITICAL: Input and output have DIFFERENT augmentations
             # Same puzzle, but augmentations don't match
             # Note: This sample type only makes sense when augment=True
-            trans_id_1, color_map_1 = get_random_augmentation()
-            trans_id_2, color_map_2 = get_random_augmentation()
-
-            # Ensure they're actually different
-            while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
+            if self.dihedral_only:
+                # Only mismatch dihedral transforms, not colors
+                identity_colors = np.arange(10, dtype=np.uint8)
+                trans_id_1 = random.randint(0, 7)
+                trans_id_2 = random.randint(0, 7)
+                while trans_id_1 == trans_id_2:
+                    trans_id_2 = random.randint(0, 7)
+                color_map_1, color_map_2 = identity_colors, identity_colors
+            else:
+                trans_id_1, color_map_1 = get_random_augmentation()
                 trans_id_2, color_map_2 = get_random_augmentation()
+                # Ensure they're actually different
+                while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
+                    trans_id_2, color_map_2 = get_random_augmentation()
 
             aug_input = apply_augmentation(input_grid, trans_id_1, color_map_1)
             aug_output = apply_augmentation(correct_output, trans_id_2, color_map_2)
@@ -879,6 +894,8 @@ def main():
                         help="Disable explicit comparison features (for ablation)")
     parser.add_argument("--no-augment", action="store_true",
                         help="Train without augmentations (use raw example grids)")
+    parser.add_argument("--dihedral-only", action="store_true",
+                        help="Only use dihedral transforms (rotations/flips), no color permutations")
 
     args = parser.parse_args()
 
@@ -890,7 +907,15 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Mode: CORRESPONDENCE LEARNING")
     print(f"Force comparison: {not args.no_force_comparison}")
-    print(f"Augmentation: {not args.no_augment}")
+
+    # Determine augmentation mode
+    if args.no_augment:
+        aug_mode = "none"
+    elif args.dihedral_only:
+        aug_mode = "dihedral-only (rotations/flips, no color permutations)"
+    else:
+        aug_mode = "full (dihedral + color permutations)"
+    print(f"Augmentation: {aug_mode}")
 
     # Load puzzles
     print("\nLoading puzzles...")
@@ -957,6 +982,7 @@ def main():
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
         augment=use_augment,
+        dihedral_only=args.dihedral_only,
     )
     val_dataset = CorrespondenceDataset(
         val_puzzles,
@@ -969,6 +995,7 @@ def main():
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
         augment=use_augment,
+        dihedral_only=args.dihedral_only,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
