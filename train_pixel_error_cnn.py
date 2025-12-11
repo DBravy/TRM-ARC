@@ -373,8 +373,8 @@ class CorrespondenceDataset(Dataset):
     Sample types:
     1. POSITIVE: (input, output) with SAME augmentation applied to both
     2. NEGATIVE - corrupted: (input, corrupted_output)
-    3. NEGATIVE - wrong input: (wrong_input, correct_output) ← CRITICAL
-    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) ← CRITICAL
+    3. NEGATIVE - wrong input: (wrong_input, correct_output) â† CRITICAL
+    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) â† CRITICAL
     5. NEGATIVE - all_zeros: output is all zeros (blank)
     6. NEGATIVE - constant_fill: output is all one color (1-9)
     7. NEGATIVE - random_noise: output is random values
@@ -778,13 +778,13 @@ def visualize_prediction(
     errors = (pred != tgt).sum()
     total = out_h * out_w
     
-    print(f"\n{'═'*50}")
+    print(f"\n{'â•'*50}")
     if errors == 0:
-        print(f"\033[92m✓ PERFECT: {puzzle_id}\033[0m")
+        print(f"\033[92mâœ“ PERFECT: {puzzle_id}\033[0m")
     else:
-        print(f"\033[91m✗ {puzzle_id}: {errors}/{total} errors ({100*errors/total:.1f}% wrong)\033[0m")
-    print(f"  Input: {inp_h}×{inp_w} → Output: {out_h}×{out_w}")
-    print(f"{'═'*50}")
+        print(f"\033[91mâœ— {puzzle_id}: {errors}/{total} errors ({100*errors/total:.1f}% wrong)\033[0m")
+    print(f"  Input: {inp_h}Ã—{inp_w} â†’ Output: {out_h}Ã—{out_w}")
+    print(f"{'â•'*50}")
     
     def print_grid(grid, label, rows, cols, highlight_errors=False, target=None):
         print(f"\n{label}:")
@@ -813,11 +813,15 @@ def evaluate_test_examples(
     device: torch.device,
     mode: str = "color",
     verbose: bool = True,
-    visualize: bool = True
+    visualize: bool = True,
+    recursive_iters: int = 1,
 ) -> Dict[str, float]:
     """
     Evaluate model on held-out test examples.
     This is the critical generalization test.
+    
+    With recursive_iters > 1, we feed the model's output back as the candidate
+    and iterate, tracking accuracy at each step.
     """
     model.eval()
     
@@ -825,6 +829,9 @@ def evaluate_test_examples(
     total_correct = 0
     total_examples = 0
     perfect_examples = 0
+    
+    # Track per-iteration stats
+    iter_stats = {i: {"correct": 0, "total": 0} for i in range(recursive_iters)}
     
     results = []
     
@@ -834,46 +841,53 @@ def evaluate_test_examples(
             inp_h, inp_w, out_h, out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
             
             inp_t = input_grid.unsqueeze(0).to(device)
+            target_colors = output_grid.numpy()
             
-            # CRITICAL: Pass BLANK candidate, not the correct output!
-            # The model must generate the output from scratch.
-            blank_candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
+            # Start with blank candidate
+            candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
             
             if mode == "color":
-                # Predict colors from INPUT + BLANK candidate
-                logits = model(inp_t, blank_candidate)  # (1, 10, H, W)
-                pred_colors = logits.argmax(dim=1)[0].cpu().numpy()  # (H, W)
-                target_colors = output_grid.numpy()
+                # Recursive iteration
+                for iter_idx in range(recursive_iters):
+                    # Predict colors from (input, current_candidate)
+                    logits = model(inp_t, candidate)  # (1, 10, H, W)
+                    pred_colors = logits.argmax(dim=1)  # (1, H, W)
+                    
+                    # Track accuracy at this iteration
+                    pred_np = pred_colors[0].cpu().numpy()
+                    pred_region = pred_np[:out_h, :out_w]
+                    target_region = target_colors[:out_h, :out_w]
+                    
+                    correct = (pred_region == target_region).sum()
+                    total = out_h * out_w
+                    
+                    iter_stats[iter_idx]["correct"] += correct
+                    iter_stats[iter_idx]["total"] += total
+                    
+                    # Update candidate for next iteration
+                    candidate = pred_colors.long()
                 
-                # Only evaluate within original output dimensions (not padding)
-                pred_region = pred_colors[:out_h, :out_w]
-                target_region = target_colors[:out_h, :out_w]
-                
-                correct = (pred_region == target_region).sum()
-                total = out_h * out_w
+                # Final results use last iteration
                 is_perfect = (correct == total)
                 
-                # Visualize
+                # Visualize final result
                 if visualize:
                     visualize_prediction(
                         input_grid.numpy(),
                         target_colors,
-                        pred_colors,
+                        pred_np,
                         inp_h, inp_w,
                         out_h, out_w,
                         puzzle_id
                     )
                 
             else:  # binary mode
-                # For binary, we check if model predicts all pixels as "correct"
-                # But this doesn't make sense with blank candidate...
-                # Binary mode is for error detection, not generation
+                # Binary mode doesn't make sense with recursion in the same way
                 out_t = output_grid.unsqueeze(0).to(device)
                 logits = model(inp_t, out_t)  # (1, H, W)
                 pred_correct = (logits > 0)[0].cpu().numpy()
                 
                 pred_region = pred_correct[:out_h, :out_w]
-                # All should be predicted as correct (True/1)
                 correct = pred_region.sum()
                 total = out_h * out_w
                 is_perfect = (correct == total)
@@ -893,18 +907,35 @@ def evaluate_test_examples(
             })
             
             if verbose and not visualize:
-                status = "✓ PERFECT" if is_perfect else f"✗ {correct}/{total} ({100*correct/total:.1f}%)"
+                status = "âœ“ PERFECT" if is_perfect else f"âœ— {correct}/{total} ({100*correct/total:.1f}%)"
                 print(f"  Example {i+1}: {puzzle_id} - {status}")
     
     overall_accuracy = total_correct / max(total_pixels, 1)
     perfect_rate = perfect_examples / max(total_examples, 1)
+    
+    # Print per-iteration accuracy if recursive
+    if recursive_iters > 1 and verbose:
+        print(f"\n{'─'*60}")
+        print("ACCURACY BY ITERATION:")
+        for iter_idx in range(recursive_iters):
+            iter_correct = iter_stats[iter_idx]["correct"]
+            iter_total = iter_stats[iter_idx]["total"]
+            iter_acc = iter_correct / max(iter_total, 1)
+            delta = ""
+            if iter_idx > 0:
+                prev_acc = iter_stats[iter_idx-1]["correct"] / max(iter_stats[iter_idx-1]["total"], 1)
+                diff = iter_acc - prev_acc
+                delta = f" ({'+' if diff >= 0 else ''}{100*diff:.2f}%)"
+            print(f"  Iteration {iter_idx}: {100*iter_acc:.2f}%{delta}")
+        print(f"{'─'*60}")
     
     return {
         'pixel_accuracy': overall_accuracy,
         'perfect_rate': perfect_rate,
         'total_examples': total_examples,
         'perfect_examples': perfect_examples,
-        'results': results
+        'results': results,
+        'iter_stats': iter_stats if recursive_iters > 1 else None,
     }
 
 
@@ -1208,9 +1239,9 @@ def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: tor
         if count == 0:
             continue
 
-        print(f"\n{'─'*80}")
+        print(f"\n{'â”€'*80}")
         print(f"Sample Type: {sample_type.upper()}")
-        print(f"{'─'*80}")
+        print(f"{'â”€'*80}")
 
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
@@ -1247,11 +1278,11 @@ def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: tor
             num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
             expected = "ALL CORRECT" if is_positive > 0.5 else f"{num_errors} errors"
 
-            print(f"\nInput: {inp_r}×{inp_c} → Output: {out_r}×{out_c}")
+            print(f"\nInput: {inp_r}Ã—{inp_c} â†’ Output: {out_r}Ã—{out_c}")
             print(f"Expected: {expected}")
 
             # Print INPUT separately with its own dimensions
-            print(f"\nINPUT ({inp_r}×{inp_c}):")
+            print(f"\nINPUT ({inp_r}Ã—{inp_c}):")
             for r in range(inp_r):
                 inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
                 print(f"  {inp_row}")
@@ -1260,7 +1291,7 @@ def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: tor
             print(f"\n{'OUTPUT':<30} {'PREDICTED ERRORS':<30}")
             for r in range(out_r):
                 out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
-                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "·" for c in range(out_c))
+                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "Â·" for c in range(out_c))
                 print(f"  {out_row:<28} {err_row:<28}")
 
             # Stats (only count within content area)
@@ -1302,9 +1333,9 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
         if count == 0:
             continue
 
-        print(f"\n{'─'*80}")
+        print(f"\n{'â”€'*80}")
         print(f"Sample Type: {sample_type.upper()}")
-        print(f"{'─'*80}")
+        print(f"{'â”€'*80}")
 
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
@@ -1348,11 +1379,11 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
             num_correct_preds = int((pred_colors[:out_r, :out_c] == target_np[:out_r, :out_c]).sum())
             total_pixels = out_r * out_c
 
-            print(f"\nInput: {inp_r}×{inp_c} → Output: {out_r}×{out_c}")
+            print(f"\nInput: {inp_r}Ã—{inp_c} â†’ Output: {out_r}Ã—{out_c}")
             print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
 
             # Print INPUT separately with its own dimensions
-            print(f"\nINPUT ({inp_r}×{inp_c}):")
+            print(f"\nINPUT ({inp_r}Ã—{inp_c}):")
             for r in range(inp_r):
                 inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
                 print(f"  {inp_row}")
@@ -1453,6 +1484,10 @@ def main():
     # Visualization
     parser.add_argument("--visualize", action="store_true",
                         help="Show visual comparison of predictions vs targets during eval-on-test")
+    
+    # Recursive CNN evaluation
+    parser.add_argument("--recursive-iters", type=int, default=1,
+                        help="Number of recursive iterations for evaluation (1 = no recursion)")
 
     args = parser.parse_args()
 
@@ -1733,34 +1768,36 @@ def main():
         
         test_results = evaluate_test_examples(
             model, test_eval_dataset, DEVICE, 
-            mode=args.mode, verbose=True, visualize=args.visualize
+            mode=args.mode, verbose=True, visualize=args.visualize,
+            recursive_iters=args.recursive_iters
         )
         
-        print(f"\n{'─'*60}")
+        print(f"\n{'â”€'*60}")
         print(f"TEST SET RESULTS:")
         print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
         print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
-        print(f"{'─'*60}")
+        print(f"{'â”€'*60}")
         
         if test_results['perfect_rate'] == 1.0:
-            print("\n🎉 PERFECT GENERALIZATION! The CNN learned the transformation rule!")
+            print("\nðŸŽ‰ PERFECT GENERALIZATION! The CNN learned the transformation rule!")
             print("   This suggests the CNN can solve this puzzle from training examples alone.")
         elif test_results['pixel_accuracy'] > 0.95:
-            print("\n✓ Strong generalization - CNN learned most of the rule.")
+            print("\nâœ“ Strong generalization - CNN learned most of the rule.")
             print("  Minor errors may be edge cases or noise.")
         elif test_results['pixel_accuracy'] > 0.8:
             print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
         else:
-            print("\n✗ Poor generalization - CNN may have memorized training examples.")
+            print("\nâœ— Poor generalization - CNN may have memorized training examples.")
             print("  The transformation rule was not learned.")
         
         # Also show comparison with training examples
-        print("\n" + "─"*60)
+        print("\n" + "â”€"*60)
         print("Comparison - Evaluating on TRAINING examples (sanity check):")
         train_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=False)
         train_results = evaluate_test_examples(
             model, train_eval_dataset, DEVICE,
-            mode=args.mode, verbose=True, visualize=False  # Don't visualize training examples
+            mode=args.mode, verbose=True, visualize=False,  # Don't visualize training examples
+            recursive_iters=args.recursive_iters
         )
         print(f"\nTRAINING SET RESULTS:")
         print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
