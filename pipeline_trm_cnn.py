@@ -103,13 +103,16 @@ def train_trm(
     puzzle_id: str,
     epochs: int,
     checkpoint_dir: str,
-    hidden_size: int = 512,
-    num_heads: int = 8,
+    hidden_size: int = 256,
+    num_heads: int = 4,
     num_layers: int = 2,
-    H_cycles: int = 3,
-    L_cycles: int = 6,
-    batch_size: int = 768,
+    H_cycles: int = 2,
+    L_cycles: int = 3,
+    batch_size: int = 4,
     lr: float = 1e-4,
+    dynamic_iterations: bool = True,
+    dynamic_max_steps: int = 20,
+    use_arc_eval: bool = True,
 ) -> str:
     """Train TRM model using train.py subprocess.
 
@@ -133,7 +136,18 @@ def train_trm(
         "--batch-size", str(batch_size),
         "--lr", str(lr),
         "--eval-interval", str(max(100, epochs // 10)),  # Eval 10 times during training
+        "--no-wandb",  # Disable wandb logging
     ]
+
+    if dynamic_iterations:
+        cmd.extend([
+            "--dynamic-iterations",
+            "--dynamic-error-threshold", "0.0",
+            "--dynamic-max-steps", str(dynamic_max_steps),
+        ])
+
+    if use_arc_eval:
+        cmd.append("--use-arc-eval")
 
     print(f"Running: {' '.join(cmd)}")
     print()
@@ -261,6 +275,7 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
 
     dtype_str = "bfloat16" if DTYPE == torch.bfloat16 else "float32"
 
+    # Use memory-efficient defaults that match training
     config_dict = {
         "batch_size": 1,  # For inference
         "seq_len": SEQ_LEN,
@@ -270,12 +285,12 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
         "num_heads": num_heads,
         "L_layers": num_layers,
         "H_layers": 0,
-        "H_cycles": 3,
-        "L_cycles": 6,
+        "H_cycles": 2,  # Memory-efficient default
+        "L_cycles": 3,  # Memory-efficient default
         "expansion": 4.0,
         "puzzle_emb_ndim": puzzle_emb_ndim,
         "puzzle_emb_len": 16,
-        "halt_max_steps": 16,
+        "halt_max_steps": 20,  # Match dynamic_max_steps
         "halt_exploration_prob": 0.1,
         "pos_encodings": "rope",
         "rms_norm_eps": 1e-5,
@@ -288,9 +303,9 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
         "cnn_freeze_threshold": 0.5,
         "cnn_loss_weight": 0.0,
         "cnn_freeze_warmup_steps": 0,
-        "dynamic_iterations": False,
-        "dynamic_error_threshold": 0.1,
-        "dynamic_max_steps": 8,
+        "dynamic_iterations": False,  # Disable for inference
+        "dynamic_error_threshold": 0.0,
+        "dynamic_max_steps": 20,
         "dynamic_min_steps": 1,
         "force_error_changes": False,
         "force_error_scale": 0.1,
@@ -591,27 +606,37 @@ def main():
     parser.add_argument("--data-root", type=str, default="kaggle/combined",
                         help="Path to ARC dataset")
 
-    # TRM training
+    # TRM training (memory-efficient defaults)
     parser.add_argument("--trm-epochs", type=int, default=1000,
                         help="Number of epochs to train TRM")
     parser.add_argument("--trm-checkpoint", type=str, default=None,
                         help="Path to existing TRM checkpoint (skip training)")
     parser.add_argument("--trm-checkpoint-dir", type=str, default=None,
                         help="Directory to save TRM checkpoints")
-    parser.add_argument("--hidden-size", type=int, default=512,
-                        help="TRM hidden size")
-    parser.add_argument("--num-heads", type=int, default=8,
-                        help="TRM attention heads")
+    parser.add_argument("--hidden-size", type=int, default=256,
+                        help="TRM hidden size (default: 256 for low RAM)")
+    parser.add_argument("--num-heads", type=int, default=4,
+                        help="TRM attention heads (default: 4 for low RAM)")
     parser.add_argument("--num-layers", type=int, default=2,
                         help="TRM transformer layers")
-    parser.add_argument("--H-cycles", type=int, default=3,
-                        help="TRM H cycles")
-    parser.add_argument("--L-cycles", type=int, default=6,
-                        help="TRM L cycles")
-    parser.add_argument("--batch-size", type=int, default=768,
-                        help="TRM batch size")
+    parser.add_argument("--H-cycles", type=int, default=2,
+                        help="TRM H cycles (default: 2 for low RAM)")
+    parser.add_argument("--L-cycles", type=int, default=3,
+                        help="TRM L cycles (default: 3 for low RAM)")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="TRM batch size (default: 4 for low RAM)")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="TRM learning rate")
+    parser.add_argument("--dynamic-iterations", action="store_true", default=True,
+                        help="Use dynamic iterations (CNN-guided stopping)")
+    parser.add_argument("--no-dynamic-iterations", action="store_false", dest="dynamic_iterations",
+                        help="Disable dynamic iterations")
+    parser.add_argument("--dynamic-max-steps", type=int, default=20,
+                        help="Max steps for dynamic iterations")
+    parser.add_argument("--use-arc-eval", action="store_true", default=True,
+                        help="Use ARC evaluation with voting")
+    parser.add_argument("--no-arc-eval", action="store_false", dest="use_arc_eval",
+                        help="Disable ARC evaluation")
 
     # CNN training
     parser.add_argument("--cnn-epochs", type=int, default=25,
@@ -668,6 +693,9 @@ def main():
             L_cycles=args.L_cycles,
             batch_size=args.batch_size,
             lr=args.lr,
+            dynamic_iterations=args.dynamic_iterations,
+            dynamic_max_steps=args.dynamic_max_steps,
+            use_arc_eval=args.use_arc_eval,
         )
 
     # =========================================================================
