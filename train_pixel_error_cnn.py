@@ -400,6 +400,7 @@ class CorrespondenceDataset(Dataset):
         num_color_swap: int = 1,
         augment: bool = True,
         dihedral_only: bool = False,
+        color_only: bool = False,
         mode: str = "binary",  # "binary" or "color"
         include_test: bool = True,  # Whether to include test examples
     ):
@@ -417,6 +418,7 @@ class CorrespondenceDataset(Dataset):
         )
         self.augment = augment
         self.dihedral_only = dihedral_only
+        self.color_only = color_only
         self.mode = mode
         self.include_test = include_test
 
@@ -460,13 +462,18 @@ class CorrespondenceDataset(Dataset):
         return self.examples[idx][0], self.examples[idx][1]
 
     def _get_augmentation(self) -> Tuple[int, np.ndarray]:
-        """Get augmentation params based on augment and dihedral_only settings"""
+        """Get augmentation params based on augment, dihedral_only, and color_only settings"""
         if not self.augment:
             return 0, np.arange(10, dtype=np.uint8)  # Identity transform
         elif self.dihedral_only:
             # Random dihedral transform, but identity color mapping
             trans_id = random.randint(0, 7)
             color_map = np.arange(10, dtype=np.uint8)
+            return trans_id, color_map
+        elif self.color_only:
+            # Identity dihedral transform, but random color mapping
+            trans_id = 0
+            color_map = random_color_permutation()
             return trans_id, color_map
         else:
             return get_random_augmentation()  # Full augmentation
@@ -557,6 +564,14 @@ class CorrespondenceDataset(Dataset):
                 while trans_id_1 == trans_id_2:
                     trans_id_2 = random.randint(0, 7)
                 color_map_1, color_map_2 = identity_colors, identity_colors
+            elif self.color_only:
+                # Only mismatch color permutations, not dihedral transforms
+                trans_id_1, trans_id_2 = 0, 0
+                color_map_1 = random_color_permutation()
+                color_map_2 = random_color_permutation()
+                # Ensure they're actually different
+                while np.array_equal(color_map_1, color_map_2):
+                    color_map_2 = random_color_permutation()
             else:
                 trans_id_1, color_map_1 = get_random_augmentation()
                 trans_id_2, color_map_2 = get_random_augmentation()
@@ -1420,6 +1435,8 @@ def main():
                         help="Train without augmentations (use raw example grids)")
     parser.add_argument("--dihedral-only", action="store_true",
                         help="Only use dihedral transforms (rotations/flips), no color permutations")
+    parser.add_argument("--color-only", action="store_true",
+                        help="Only use color permutations, no dihedral transforms (rotations/flips)")
     
     # Test-time evaluation (for single-puzzle mode)
     parser.add_argument("--eval-on-test", action="store_true",
@@ -1453,8 +1470,13 @@ def main():
     # Determine augmentation mode
     if args.no_augment:
         aug_mode = "none"
+    elif args.dihedral_only and args.color_only:
+        print("Error: Cannot specify both --dihedral-only and --color-only")
+        return
     elif args.dihedral_only:
         aug_mode = "dihedral-only (rotations/flips, no color permutations)"
+    elif args.color_only:
+        aug_mode = "color-only (color permutations, no rotations/flips)"
     else:
         aug_mode = "full (dihedral + color permutations)"
     print(f"Augmentation: {aug_mode}")
@@ -1554,6 +1576,9 @@ def main():
             if not use_augment:
                 print("Warning: --negative-type mismatched_aug requires augmentation. Using corrupted instead.")
                 num_corrupted = num_negatives
+            elif args.color_only:
+                print("Note: --negative-type mismatched_aug with --color-only will mismatch color permutations only.")
+                num_mismatched_aug = num_negatives
             else:
                 num_mismatched_aug = num_negatives
 
@@ -1579,6 +1604,7 @@ def main():
         num_color_swap=num_color_swap,
         augment=use_augment,
         dihedral_only=args.dihedral_only,
+        color_only=args.color_only,
         mode=args.mode,
         include_test=include_test_in_train,
     )
@@ -1594,6 +1620,7 @@ def main():
         num_color_swap=num_color_swap,
         augment=use_augment,
         dihedral_only=args.dihedral_only,
+        color_only=args.color_only,
         mode=args.mode,
         include_test=include_test_in_train,
     )
