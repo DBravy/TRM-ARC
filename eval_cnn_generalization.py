@@ -506,7 +506,98 @@ def train_on_puzzle(
     return model
 
 
-def evaluate_on_test(model: nn.Module, puzzle: Dict, candidate_mode: str = "zeros") -> Dict:
+def visualize_prediction(
+    input_grid: np.ndarray,
+    target_grid: np.ndarray, 
+    pred_grid: np.ndarray,
+    h: int, 
+    w: int,
+    puzzle_id: str
+):
+    """Visualize input, target output, and prediction side by side."""
+    # Color codes for terminal (ANSI)
+    COLORS = [
+        '\033[40m',   # 0: black bg
+        '\033[44m',   # 1: blue
+        '\033[41m',   # 2: red
+        '\033[42m',   # 3: green
+        '\033[43m',   # 4: yellow
+        '\033[47m',   # 5: white/gray
+        '\033[45m',   # 6: magenta
+        '\033[46m',   # 7: cyan
+        '\033[48;5;208m',  # 8: orange
+        '\033[48;5;52m',   # 9: maroon/brown
+    ]
+    RESET = '\033[0m'
+    ERROR_MARK = '\033[4m'  # underline for errors
+    
+    tgt = target_grid[:h, :w]
+    pred = pred_grid[:h, :w]
+    
+    # Find actual input dimensions (may differ from output)
+    inp_nonzero = np.where(input_grid > 0)
+    if len(inp_nonzero[0]) > 0:
+        inp_h = inp_nonzero[0].max() + 1
+        inp_w = inp_nonzero[1].max() + 1
+    else:
+        inp_h, inp_w = h, w
+    
+    inp = input_grid[:inp_h, :inp_w]
+    
+    print(f"\n{'─'*70}")
+    print(f"Puzzle: {puzzle_id} | Input: {inp_h}x{inp_w} | Output: {h}x{w}")
+    print(f"{'─'*70}")
+    
+    max_h = max(h, inp_h)
+    col_width = max(w * 2 + 2, 12)
+    inp_col_width = max(inp_w * 2 + 2, 12)
+    
+    print(f"{'INPUT':<{inp_col_width}}  {'TARGET':<{col_width}}  {'PREDICTION':<{col_width}}  DIFF")
+    
+    for r in range(max_h):
+        inp_row = ""
+        if r < inp_h:
+            for c in range(inp_w):
+                val = inp[r, c]
+                inp_row += f"{COLORS[val]}{val}{RESET} "
+        inp_row = inp_row if inp_row else "  "
+        
+        tgt_row = ""
+        if r < h:
+            for c in range(w):
+                val = tgt[r, c]
+                tgt_row += f"{COLORS[val]}{val}{RESET} "
+        
+        pred_row = ""
+        diff_row = ""
+        if r < h:
+            for c in range(w):
+                p_val = pred[r, c]
+                t_val = tgt[r, c]
+                if p_val == t_val:
+                    pred_row += f"{COLORS[p_val]}{p_val}{RESET} "
+                    diff_row += "· "
+                else:
+                    pred_row += f"{COLORS[p_val]}{ERROR_MARK}{p_val}{RESET} "
+                    diff_row += f"\033[91m✗{RESET} "
+        
+        ansi_overhead = 10
+        inp_padding = inp_col_width + (inp_w * ansi_overhead if r < inp_h else 0)
+        tgt_padding = col_width + (w * ansi_overhead if r < h else 0)
+        pred_padding = col_width + (w * ansi_overhead if r < h else 0)
+        
+        print(f"{inp_row:<{inp_padding}}  {tgt_row:<{tgt_padding}}  {pred_row:<{pred_padding}}  {diff_row}")
+    
+    errors = (pred != tgt).sum()
+    total = h * w
+    if errors == 0:
+        print(f"\n\033[92m✓ PERFECT - All {total} pixels correct\033[0m")
+    else:
+        print(f"\n\033[91m✗ {errors} errors out of {total} pixels ({100*errors/total:.1f}% wrong)\033[0m")
+
+
+def evaluate_on_test(model: nn.Module, puzzle: Dict, puzzle_id: str = "", 
+                     candidate_mode: str = "zeros", visualize: bool = False) -> Dict:
     """
     Evaluate trained model on puzzle's test examples.
     
@@ -564,6 +655,13 @@ def evaluate_on_test(model: nn.Module, puzzle: Dict, candidate_mode: str = "zero
             correct = (pred[:h_out, :w_out] == out).sum()
             total = h_out * w_out
             
+            # Visualize if requested
+            if visualize:
+                # Pad output for visualization
+                out_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+                out_pad[:h_out, :w_out] = out
+                visualize_prediction(inp_pad, out_pad, pred, h_out, w_out, puzzle_id)
+            
             results.append({
                 "correct": int(correct),
                 "total": total,
@@ -603,6 +701,7 @@ def evaluate_puzzle(
     num_negatives: int,
     dihedral_only: bool,
     negative_type: str = "mixed",
+    visualize: bool = False,
     verbose: bool = False
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
@@ -625,7 +724,8 @@ def evaluate_puzzle(
     )
     train_time = time.time() - start
     
-    eval_results = evaluate_on_test(model, puzzle, candidate_mode="zeros")  # Always eval with blank
+    eval_results = evaluate_on_test(model, puzzle, puzzle_id=puzzle_id, 
+                                     candidate_mode="zeros", visualize=visualize)
     
     if "error" in eval_results:
         return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, eval_results["error"])
@@ -693,6 +793,8 @@ def main():
                         help="Type of negatives: mixed=all types (default), or single type for ablation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--visualize", action="store_true", 
+                        help="Show visual comparison of predictions vs targets")
     parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
     args = parser.parse_args()
     
@@ -733,6 +835,7 @@ def main():
             num_negatives=args.num_negatives,
             dihedral_only=args.dihedral_only,
             negative_type=args.negative_type,
+            visualize=args.visualize,
             verbose=args.verbose
         )
         results.append(result)
