@@ -3,15 +3,19 @@
 Evaluate CNN color prediction generalization across many puzzles.
 
 For each puzzle:
-1. Train CNN ONLY on training examples (with augmentation)
-2. Evaluate on held-out test examples
-3. Record whether it generalizes
+1. Detect color semantics (absolute vs relative) from training examples
+2. Train CNN with appropriate augmentation strategy
+3. Evaluate on held-out test examples
+4. Record whether it generalizes
 
-This answers: "How many ARC puzzles can be solved by test-time training a CNN?"
+NEW: Automatic augmentation selection based on palette analysis
+- Identical palettes across examples → absolute color semantics → dihedral only
+- Varying palettes → relative color semantics → full augmentation (incl. color)
 
 Usage:
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100 --max-puzzles 50
+    python eval_cnn_generalization.py --auto-augment  # NEW: automatic detection
 """
 
 import argparse
@@ -19,7 +23,7 @@ import json
 import os
 import random
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -39,6 +43,107 @@ else:
 
 GRID_SIZE = 30
 NUM_COLORS = 10
+
+
+# =============================================================================
+# Palette Analysis - Detect Color Semantics
+# =============================================================================
+
+def get_palette(grid: np.ndarray, include_zero: bool = False) -> Set[int]:
+    """Extract the set of colors used in a grid."""
+    unique = set(np.unique(grid).tolist())
+    if not include_zero:
+        unique.discard(0)
+    return unique
+
+
+def analyze_puzzle_palettes(puzzle: Dict) -> Dict:
+    """
+    Analyze color palettes across all training examples.
+    
+    Returns:
+        dict with:
+            - input_palettes: list of palettes for each input
+            - output_palettes: list of palettes for each output
+            - combined_palettes: list of input∪output for each example
+            - identical_input_palettes: bool - are all input palettes the same?
+            - identical_output_palettes: bool - are all output palettes the same?
+            - identical_combined_palettes: bool - are all combined palettes the same?
+            - colors_preserved: bool - does each output use only colors from its input?
+            - recommendation: "dihedral_only" or "full_augment"
+    """
+    train_examples = puzzle.get("train", [])
+    
+    if len(train_examples) == 0:
+        return {"recommendation": "dihedral_only", "reason": "no_training_examples"}
+    
+    input_palettes = []
+    output_palettes = []
+    combined_palettes = []
+    
+    for ex in train_examples:
+        inp = np.array(ex["input"], dtype=np.uint8)
+        out = np.array(ex["output"], dtype=np.uint8)
+        
+        inp_pal = get_palette(inp)
+        out_pal = get_palette(out)
+        combined = inp_pal | out_pal
+        
+        input_palettes.append(inp_pal)
+        output_palettes.append(out_pal)
+        combined_palettes.append(combined)
+    
+    # Check if palettes are identical across examples
+    identical_input = all(p == input_palettes[0] for p in input_palettes)
+    identical_output = all(p == output_palettes[0] for p in output_palettes)
+    identical_combined = all(p == combined_palettes[0] for p in combined_palettes)
+    
+    # Check if colors are preserved (output colors ⊆ input colors)
+    colors_preserved = all(
+        output_palettes[i] <= (input_palettes[i] | {0})  # output colors subset of input + black
+        for i in range(len(train_examples))
+    )
+    
+    # NEW: Check if outputs introduce new colors not in inputs
+    new_colors_in_output = any(
+        output_palettes[i] - input_palettes[i] - {0}  # colors in output but not input
+        for i in range(len(train_examples))
+    )
+    
+    # Decision logic
+    # If palettes are identical AND outputs introduce specific new colors → absolute semantics
+    # If palettes vary OR colors are just preserved from input → relative semantics
+    
+    if identical_combined:
+        # Same colors across all examples - likely absolute color meanings
+        recommendation = "dihedral_only"
+        reason = "identical_palettes"
+    elif colors_preserved and not new_colors_in_output:
+        # Colors come from input - relative semantics, need color augmentation
+        recommendation = "full_augment"
+        reason = "colors_from_input"
+    elif not identical_combined and new_colors_in_output:
+        # Different palettes AND new colors - could go either way
+        # Default to full augmentation to learn color relationships
+        recommendation = "full_augment"
+        reason = "varying_palettes_new_colors"
+    else:
+        # Varying palettes - likely relative semantics
+        recommendation = "full_augment"
+        reason = "varying_palettes"
+    
+    return {
+        "input_palettes": input_palettes,
+        "output_palettes": output_palettes,
+        "combined_palettes": combined_palettes,
+        "identical_input_palettes": identical_input,
+        "identical_output_palettes": identical_output,
+        "identical_combined_palettes": identical_combined,
+        "colors_preserved": colors_preserved,
+        "new_colors_in_output": new_colors_in_output,
+        "recommendation": recommendation,
+        "reason": reason,
+    }
 
 
 # =============================================================================
@@ -670,6 +775,8 @@ class PuzzleResult:
     perfect_rate: float
     all_perfect: bool
     error: str = None
+    augmentation_used: str = None  # NEW: "dihedral_only" or "full"
+    augmentation_reason: str = None  # NEW: why this augmentation was chosen
 
 
 def evaluate_puzzle(
@@ -681,7 +788,8 @@ def evaluate_puzzle(
     dihedral_only: bool,
     negative_type: str = "mixed",
     visualize: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    auto_augment: bool = False,  # NEW
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
     
@@ -694,10 +802,26 @@ def evaluate_puzzle(
     if num_test == 0:
         return PuzzleResult(puzzle_id, num_train, 0, 0, 0, 0, False, "no_test_outputs")
     
+    # NEW: Auto-detect augmentation strategy
+    if auto_augment:
+        palette_analysis = analyze_puzzle_palettes(puzzle)
+        use_dihedral_only = (palette_analysis["recommendation"] == "dihedral_only")
+        augmentation_reason = palette_analysis["reason"]
+        augmentation_used = "dihedral_only" if use_dihedral_only else "full"
+        
+        if verbose:
+            print(f"  Palette analysis: {augmentation_used} ({augmentation_reason})")
+            print(f"    Identical combined palettes: {palette_analysis['identical_combined_palettes']}")
+            print(f"    Colors preserved: {palette_analysis['colors_preserved']}")
+    else:
+        use_dihedral_only = dihedral_only
+        augmentation_used = "dihedral_only" if dihedral_only else "full"
+        augmentation_reason = "manual"
+    
     start = time.time()
     model = train_on_puzzle(
         puzzle, epochs=epochs, hidden_dim=hidden_dim,
-        num_negatives=num_negatives, dihedral_only=dihedral_only,
+        num_negatives=num_negatives, dihedral_only=use_dihedral_only,
         negative_type=negative_type,
         verbose=verbose
     )
@@ -707,7 +831,8 @@ def evaluate_puzzle(
                                      candidate_mode="zeros", visualize=visualize)
     
     if "error" in eval_results:
-        return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, eval_results["error"])
+        return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, 
+                           eval_results["error"], augmentation_used, augmentation_reason)
     
     return PuzzleResult(
         puzzle_id=puzzle_id,
@@ -717,6 +842,8 @@ def evaluate_puzzle(
         pixel_accuracy=eval_results["pixel_accuracy"],
         perfect_rate=eval_results["perfect_rate"],
         all_perfect=eval_results["all_perfect"],
+        augmentation_used=augmentation_used,
+        augmentation_reason=augmentation_reason,
     )
 
 
@@ -766,6 +893,8 @@ def main():
                         help="Negatives per example (distributed across corruption types)")
     parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
     parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
+    parser.add_argument("--auto-augment", action="store_true", 
+                        help="NEW: Automatically detect color semantics and choose augmentation strategy")
     parser.add_argument("--negative-type", type=str, default="mixed",
                         choices=["mixed", "all_zeros", "corrupted", "random_noise", 
                                  "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
@@ -784,7 +913,12 @@ def main():
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
     print(f"Epochs per puzzle: {args.epochs}")
-    print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
+    
+    if args.auto_augment:
+        print(f"Augmentation: AUTO (palette-based detection)")
+    else:
+        print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
+    
     print(f"Num negatives: {args.num_negatives}")
     print(f"Negative type: {args.negative_type}")
     print(f"Evaluation: Blank candidate (model must generate from scratch)")
@@ -815,13 +949,15 @@ def main():
             dihedral_only=args.dihedral_only,
             negative_type=args.negative_type,
             visualize=args.visualize,
-            verbose=args.verbose
+            verbose=args.verbose,
+            auto_augment=args.auto_augment,  # NEW
         )
         results.append(result)
         
         if args.verbose or result.all_perfect:
             status = "✓ PERFECT" if result.all_perfect else f"✗ {result.pixel_accuracy:.1%}"
-            print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s)")
+            aug_info = f" [{result.augmentation_used}]" if args.auto_augment else ""
+            print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s){aug_info}")
     
     # Summary statistics
     valid_results = [r for r in results if r.error is None]
@@ -842,8 +978,45 @@ def main():
         print(f"Average pixel accuracy: {avg_accuracy:.2%}")
         print(f"Average training time: {avg_time:.1f}s")
     
+    # NEW: Augmentation strategy breakdown (if auto_augment)
+    if args.auto_augment:
+        dihedral_only_results = [r for r in valid_results if r.augmentation_used == "dihedral_only"]
+        full_aug_results = [r for r in valid_results if r.augmentation_used == "full"]
+        
+        print(f"\n{'─'*60}")
+        print("AUGMENTATION STRATEGY BREAKDOWN")
+        print(f"{'─'*60}")
+        print(f"Dihedral-only (identical palettes): {len(dihedral_only_results)} puzzles")
+        if dihedral_only_results:
+            dihedral_perfect = sum(1 for r in dihedral_only_results if r.all_perfect)
+            dihedral_avg_acc = sum(r.pixel_accuracy for r in dihedral_only_results) / len(dihedral_only_results)
+            print(f"  Perfect: {dihedral_perfect} ({100*dihedral_perfect/len(dihedral_only_results):.1f}%)")
+            print(f"  Avg accuracy: {dihedral_avg_acc:.2%}")
+        
+        print(f"\nFull augmentation (varying palettes): {len(full_aug_results)} puzzles")
+        if full_aug_results:
+            full_perfect = sum(1 for r in full_aug_results if r.all_perfect)
+            full_avg_acc = sum(r.pixel_accuracy for r in full_aug_results) / len(full_aug_results)
+            print(f"  Perfect: {full_perfect} ({100*full_perfect/len(full_aug_results):.1f}%)")
+            print(f"  Avg accuracy: {full_avg_acc:.2%}")
+        
+        # Breakdown by reason
+        reasons = {}
+        for r in valid_results:
+            reason = r.augmentation_reason or "unknown"
+            if reason not in reasons:
+                reasons[reason] = []
+            reasons[reason].append(r)
+        
+        print(f"\nBy detection reason:")
+        for reason, rs in sorted(reasons.items(), key=lambda x: -len(x[1])):
+            perfect_count = sum(1 for r in rs if r.all_perfect)
+            avg_acc = sum(r.pixel_accuracy for r in rs) / len(rs)
+            print(f"  {reason}: {len(rs)} puzzles, {perfect_count} perfect ({avg_acc:.1%} avg)")
+    
     # Accuracy distribution
-    print("\nAccuracy distribution:")
+    print(f"\n{'─'*60}")
+    print("Accuracy distribution:")
     bins = [(1.0, 1.0), (0.95, 1.0), (0.9, 0.95), (0.8, 0.9), (0.5, 0.8), (0.0, 0.5)]
     for lo, hi in bins:
         count = sum(1 for r in valid_results if lo <= r.pixel_accuracy < hi or (lo == hi == 1.0 and r.pixel_accuracy == 1.0))
@@ -856,7 +1029,8 @@ def main():
     if perfect_results:
         print(f"\nPerfect generalization puzzles ({len(perfect_results)}):")
         for r in sorted(perfect_results, key=lambda x: x.puzzle_id)[:20]:
-            print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s)")
+            aug_info = f" [{r.augmentation_used}]" if args.auto_augment else ""
+            print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s){aug_info}")
         if len(perfect_results) > 20:
             print(f"  ... and {len(perfect_results) - 20} more")
     
@@ -882,6 +1056,8 @@ def main():
                 "perfect_rate": r.perfect_rate,
                 "all_perfect": r.all_perfect,
                 "error": r.error,
+                "augmentation_used": r.augmentation_used,
+                "augmentation_reason": r.augmentation_reason,
             }
             for r in results
         ]
