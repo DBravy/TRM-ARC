@@ -159,12 +159,29 @@ def random_color_permutation() -> np.ndarray:
 # =============================================================================
 
 class SinglePuzzleDataset(Dataset):
-    """Dataset for a single puzzle's training examples with augmentation."""
+    """Dataset for a single puzzle's training examples with augmentation.
     
-    def __init__(self, puzzle: Dict, num_augments: int = 50, dihedral_only: bool = True):
+    CRITICAL: We train the model to predict correct output given INPUT and a 
+    CORRUPTED/BLANK candidate. This way it learns the actual transformation,
+    not just to pass through the candidate.
+    """
+    
+    def __init__(self, puzzle: Dict, num_augments: int = 50, dihedral_only: bool = True,
+                 candidate_mode: str = "zeros"):
+        """
+        Args:
+            puzzle: Puzzle dict with train examples
+            num_augments: Number of augmented versions per example
+            dihedral_only: Only use rotation/flip augmentation (no color permutation)
+            candidate_mode: What to pass as candidate output during training
+                - "zeros": all zeros (model must generate from scratch)
+                - "corrupted": randomly corrupt some pixels
+                - "random": completely random grid
+        """
         self.examples = []
         self.num_augments = num_augments
         self.dihedral_only = dihedral_only
+        self.candidate_mode = candidate_mode
         
         for example in puzzle.get("train", []):
             inp = np.array(example["input"], dtype=np.uint8)
@@ -180,6 +197,30 @@ class SinglePuzzleDataset(Dataset):
         padded[:h, :w] = grid
         return padded
     
+    def _make_candidate(self, correct_output: np.ndarray) -> np.ndarray:
+        """Create a candidate output that is NOT the correct answer."""
+        h, w = correct_output.shape
+        
+        if self.candidate_mode == "zeros":
+            # Blank - model must generate from scratch
+            return np.zeros_like(correct_output)
+        
+        elif self.candidate_mode == "corrupted":
+            # Corrupt 30-70% of pixels randomly
+            candidate = correct_output.copy()
+            corruption_rate = random.uniform(0.3, 0.7)
+            mask = np.random.random((h, w)) < corruption_rate
+            random_colors = np.random.randint(0, 10, (h, w), dtype=np.uint8)
+            candidate[mask] = random_colors[mask]
+            return candidate
+        
+        elif self.candidate_mode == "random":
+            # Completely random
+            return np.random.randint(0, 10, (h, w), dtype=np.uint8)
+        
+        else:
+            raise ValueError(f"Unknown candidate_mode: {self.candidate_mode}")
+    
     def __getitem__(self, idx):
         example_idx = idx // self.num_augments
         inp, out = self.examples[example_idx]
@@ -194,9 +235,13 @@ class SinglePuzzleDataset(Dataset):
         aug_inp = dihedral_transform(color_map[inp], trans_id)
         aug_out = dihedral_transform(color_map[out], trans_id)
         
+        # Create candidate (NOT the correct output!)
+        candidate = self._make_candidate(aug_out)
+        
         return (
             torch.from_numpy(self._pad_grid(aug_inp)).long(),
-            torch.from_numpy(self._pad_grid(aug_out)).long(),
+            torch.from_numpy(self._pad_grid(candidate)).long(),  # Candidate, not correct!
+            torch.from_numpy(self._pad_grid(aug_out)).long(),    # Target (correct output)
         )
 
 
@@ -212,11 +257,21 @@ def train_on_puzzle(
     batch_size: int = 32,
     num_augments: int = 50,
     dihedral_only: bool = True,
+    candidate_mode: str = "zeros",
     verbose: bool = False,
 ) -> nn.Module:
-    """Train a CNN on a single puzzle's training examples."""
+    """Train a CNN on a single puzzle's training examples.
     
-    dataset = SinglePuzzleDataset(puzzle, num_augments=num_augments, dihedral_only=dihedral_only)
+    The model learns: (input, candidate) -> correct_output
+    Where candidate is NOT the correct output (it's blank/corrupted/random).
+    """
+    
+    dataset = SinglePuzzleDataset(
+        puzzle, 
+        num_augments=num_augments, 
+        dihedral_only=dihedral_only,
+        candidate_mode=candidate_mode
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
     model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
@@ -226,12 +281,14 @@ def train_on_puzzle(
     model.train()
     for epoch in range(epochs):
         total_loss = 0
-        for inp, out in loader:
-            inp, out = inp.to(DEVICE), out.to(DEVICE)
+        for inp, candidate, target in loader:
+            inp = inp.to(DEVICE)
+            candidate = candidate.to(DEVICE)  # NOT the correct output!
+            target = target.to(DEVICE)        # The correct output (supervision)
             
             optimizer.zero_grad()
-            logits = model(inp, out)
-            loss = F.cross_entropy(logits, out)
+            logits = model(inp, candidate)    # Model sees input + blank/corrupted candidate
+            loss = F.cross_entropy(logits, target)  # Must predict correct output
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -244,8 +301,19 @@ def train_on_puzzle(
     return model
 
 
-def evaluate_on_test(model: nn.Module, puzzle: Dict) -> Dict:
-    """Evaluate trained model on puzzle's test examples."""
+def evaluate_on_test(model: nn.Module, puzzle: Dict, candidate_mode: str = "zeros") -> Dict:
+    """
+    Evaluate trained model on puzzle's test examples.
+    
+    CRITICAL: We must NOT give the model the correct output as input!
+    The model was designed for error correction (input, candidate) -> corrected
+    But for actual puzzle solving, we need to give it a blank/garbage candidate.
+    
+    candidate_mode:
+        - "zeros": All zeros (blank grid)
+        - "random": Random colors 0-9
+        - "input_copy": Copy of the input (tests if it learns input->output transform)
+    """
     model.eval()
     
     test_examples = puzzle.get("test", [])
@@ -263,21 +331,33 @@ def evaluate_on_test(model: nn.Module, puzzle: Dict) -> Dict:
             
             inp = np.array(ex["input"], dtype=np.uint8)
             out = np.array(ex["output"], dtype=np.uint8)
-            h, w = out.shape
+            h_out, w_out = out.shape
+            h_inp, w_inp = inp.shape
             
-            # Pad
+            # Pad input
             inp_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
-            out_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
-            inp_pad[:inp.shape[0], :inp.shape[1]] = inp
-            out_pad[:h, :w] = out
+            inp_pad[:h_inp, :w_inp] = inp
+            
+            # Create candidate output - NOT the correct answer!
+            if candidate_mode == "zeros":
+                candidate_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+            elif candidate_mode == "random":
+                candidate_pad = np.random.randint(0, 10, (GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+            elif candidate_mode == "input_copy":
+                candidate_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+                candidate_pad[:h_inp, :w_inp] = inp
+            else:
+                raise ValueError(f"Unknown candidate_mode: {candidate_mode}")
             
             inp_t = torch.from_numpy(inp_pad).long().unsqueeze(0).to(DEVICE)
-            out_t = torch.from_numpy(out_pad).long().unsqueeze(0).to(DEVICE)
+            candidate_t = torch.from_numpy(candidate_pad).long().unsqueeze(0).to(DEVICE)
             
-            pred = model.predict_colors(inp_t, out_t)[0].cpu().numpy()
+            # Model predicts what the output SHOULD be
+            pred = model.predict_colors(inp_t, candidate_t)[0].cpu().numpy()
             
-            correct = (pred[:h, :w] == out).sum()
-            total = h * w
+            # Compare to actual correct output
+            correct = (pred[:h_out, :w_out] == out).sum()
+            total = h_out * w_out
             
             results.append({
                 "correct": int(correct),
@@ -317,6 +397,7 @@ def evaluate_puzzle(
     hidden_dim: int,
     num_augments: int,
     dihedral_only: bool,
+    candidate_mode: str = "zeros",
     verbose: bool = False
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
@@ -334,11 +415,12 @@ def evaluate_puzzle(
     model = train_on_puzzle(
         puzzle, epochs=epochs, hidden_dim=hidden_dim,
         num_augments=num_augments, dihedral_only=dihedral_only,
+        candidate_mode=candidate_mode,
         verbose=verbose
     )
     train_time = time.time() - start
     
-    eval_results = evaluate_on_test(model, puzzle)
+    eval_results = evaluate_on_test(model, puzzle, candidate_mode="zeros")  # Always eval with blank
     
     if "error" in eval_results:
         return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, eval_results["error"])
@@ -399,6 +481,10 @@ def main():
     parser.add_argument("--num-augments", type=int, default=50, help="Augmented samples per training example")
     parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
     parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
+    parser.add_argument("--candidate-mode", type=str, default="zeros", 
+                        choices=["zeros", "corrupted", "random"],
+                        help="What to pass as candidate during training: "
+                             "zeros=blank grid (hardest), corrupted=partially wrong, random=noise")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
@@ -413,6 +499,9 @@ def main():
     print(f"Epochs per puzzle: {args.epochs}")
     print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
     print(f"Augments per example: {args.num_augments}")
+    print(f"Candidate mode: {args.candidate_mode}")
+    print(f"  (During training, model sees INPUT + {args.candidate_mode.upper()} candidate)")
+    print(f"  (During eval, model sees INPUT + BLANK candidate)")
     
     # Load puzzles
     puzzles = load_puzzles(args.dataset, args.data_root)
@@ -438,6 +527,7 @@ def main():
             hidden_dim=args.hidden_dim,
             num_augments=args.num_augments,
             dihedral_only=args.dihedral_only,
+            candidate_mode=args.candidate_mode,
             verbose=args.verbose
         )
         results.append(result)
