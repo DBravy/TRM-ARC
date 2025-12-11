@@ -155,41 +155,132 @@ def random_color_permutation() -> np.ndarray:
 
 
 # =============================================================================
-# Dataset
+# Corruption utilities (matching train_pixel_error_cnn.py)
+# =============================================================================
+
+def corrupt_single_pixel(grid: np.ndarray) -> np.ndarray:
+    result = grid.copy()
+    h, w = grid.shape
+    r, c = random.randint(0, h-1), random.randint(0, w-1)
+    current = result[r, c]
+    new_color = random.choice([x for x in range(10) if x != current])
+    result[r, c] = new_color
+    return result
+
+
+def corrupt_few_pixels(grid: np.ndarray, num_pixels: int = None) -> np.ndarray:
+    result = grid.copy()
+    if num_pixels is None:
+        num_pixels = random.randint(2, 5)
+    h, w = grid.shape
+    for _ in range(num_pixels):
+        r, c = random.randint(0, h-1), random.randint(0, w-1)
+        current = result[r, c]
+        new_color = random.choice([x for x in range(10) if x != current])
+        result[r, c] = new_color
+    return result
+
+
+def corrupt_output(grid: np.ndarray) -> np.ndarray:
+    if random.random() < 0.7:
+        return corrupt_single_pixel(grid)
+    else:
+        return corrupt_few_pixels(grid)
+
+
+def generate_all_zeros(grid: np.ndarray) -> np.ndarray:
+    return np.zeros_like(grid)
+
+
+def generate_constant_fill(grid: np.ndarray) -> np.ndarray:
+    color = random.randint(1, 9)
+    return np.full_like(grid, color)
+
+
+def generate_random_noise(grid: np.ndarray) -> np.ndarray:
+    return np.random.randint(0, 10, size=grid.shape, dtype=np.uint8)
+
+
+def generate_color_swap(grid: np.ndarray) -> np.ndarray:
+    result = grid.copy()
+    unique_colors = np.unique(grid)
+    non_zero_colors = unique_colors[unique_colors > 0]
+    
+    if len(non_zero_colors) == 0:
+        color_from = 0
+        color_to = random.randint(1, 9)
+    else:
+        color_from = random.choice(non_zero_colors)
+        available_colors = [c for c in range(10) if c != color_from]
+        color_to = random.choice(available_colors)
+    
+    if random.random() < 0.5:
+        result[grid == color_from] = color_to
+    else:
+        swap_locations = np.argwhere(grid == color_from)
+        if len(swap_locations) > 0:
+            ratio = random.choice([0.25, 0.33, 0.5, 0.67, 0.75])
+            num_to_swap = max(1, int(len(swap_locations) * ratio))
+            indices_to_swap = random.sample(range(len(swap_locations)), num_to_swap)
+            for idx in indices_to_swap:
+                r, c = swap_locations[idx]
+                result[r, c] = color_to
+    return result
+
+
+# =============================================================================
+# Dataset (matching train_pixel_error_cnn.py CorrespondenceDataset)
 # =============================================================================
 
 class SinglePuzzleDataset(Dataset):
-    """Dataset for a single puzzle's training examples with augmentation.
+    """
+    Dataset for a single puzzle's training examples.
+    Matches CorrespondenceDataset from train_pixel_error_cnn.py
     
-    CRITICAL: We train the model to predict correct output given INPUT and a 
-    CORRUPTED/BLANK candidate. This way it learns the actual transformation,
-    not just to pass through the candidate.
+    Includes all sample types:
+    - positive: correct candidate
+    - corrupted: some pixels wrong
+    - wrong_input: mismatched input
+    - mismatched_aug: different augmentations
+    - all_zeros, constant_fill, random_noise, color_swap
     """
     
-    def __init__(self, puzzle: Dict, num_augments: int = 50, dihedral_only: bool = True,
-                 candidate_mode: str = "zeros"):
-        """
-        Args:
-            puzzle: Puzzle dict with train examples
-            num_augments: Number of augmented versions per example
-            dihedral_only: Only use rotation/flip augmentation (no color permutation)
-            candidate_mode: What to pass as candidate output during training
-                - "zeros": all zeros (model must generate from scratch)
-                - "corrupted": randomly corrupt some pixels
-                - "random": completely random grid
-        """
-        self.examples = []
-        self.num_augments = num_augments
+    def __init__(
+        self, 
+        puzzle: Dict, 
+        num_positives: int = 2,
+        num_corrupted: int = 3,
+        num_wrong_input: int = 1,
+        num_mismatched_aug: int = 1,
+        num_all_zeros: int = 1,
+        num_constant_fill: int = 1,
+        num_random_noise: int = 1,
+        num_color_swap: int = 1,
+        dihedral_only: bool = True,
+    ):
+        self.num_positives = num_positives
+        self.num_corrupted = num_corrupted
+        self.num_wrong_input = num_wrong_input
+        self.num_mismatched_aug = num_mismatched_aug
+        self.num_all_zeros = num_all_zeros
+        self.num_constant_fill = num_constant_fill
+        self.num_random_noise = num_random_noise
+        self.num_color_swap = num_color_swap
         self.dihedral_only = dihedral_only
-        self.candidate_mode = candidate_mode
         
+        self.samples_per_example = (
+            num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
+            num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
+        )
+        
+        self.examples = []
         for example in puzzle.get("train", []):
             inp = np.array(example["input"], dtype=np.uint8)
             out = np.array(example["output"], dtype=np.uint8)
             self.examples.append((inp, out))
     
     def __len__(self):
-        return len(self.examples) * self.num_augments
+        return len(self.examples) * self.samples_per_example
     
     def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
         h, w = grid.shape
@@ -197,51 +288,118 @@ class SinglePuzzleDataset(Dataset):
         padded[:h, :w] = grid
         return padded
     
-    def _make_candidate(self, correct_output: np.ndarray) -> np.ndarray:
-        """Create a candidate output that is NOT the correct answer."""
-        h, w = correct_output.shape
-        
-        if self.candidate_mode == "zeros":
-            # Blank - model must generate from scratch
-            return np.zeros_like(correct_output)
-        
-        elif self.candidate_mode == "corrupted":
-            # Corrupt 30-70% of pixels randomly
-            candidate = correct_output.copy()
-            corruption_rate = random.uniform(0.3, 0.7)
-            mask = np.random.random((h, w)) < corruption_rate
-            random_colors = np.random.randint(0, 10, (h, w), dtype=np.uint8)
-            candidate[mask] = random_colors[mask]
-            return candidate
-        
-        elif self.candidate_mode == "random":
-            # Completely random
-            return np.random.randint(0, 10, (h, w), dtype=np.uint8)
-        
-        else:
-            raise ValueError(f"Unknown candidate_mode: {self.candidate_mode}")
-    
-    def __getitem__(self, idx):
-        example_idx = idx // self.num_augments
-        inp, out = self.examples[example_idx]
-        
-        # Random augmentation
+    def _get_augmentation(self):
         trans_id = random.randint(0, 7)
         if self.dihedral_only:
             color_map = np.arange(10, dtype=np.uint8)
         else:
             color_map = random_color_permutation()
+        return trans_id, color_map
+    
+    def _get_different_example(self, exclude_idx: int):
+        idx = random.randint(0, len(self.examples) - 1)
+        while idx == exclude_idx and len(self.examples) > 1:
+            idx = random.randint(0, len(self.examples) - 1)
+        return self.examples[idx]
+    
+    def __getitem__(self, idx):
+        example_idx = idx // self.samples_per_example
+        sample_type_idx = idx % self.samples_per_example
         
-        aug_inp = dihedral_transform(color_map[inp], trans_id)
-        aug_out = dihedral_transform(color_map[out], trans_id)
+        input_grid, correct_output = self.examples[example_idx]
         
-        # Create candidate (NOT the correct output!)
-        candidate = self._make_candidate(aug_out)
+        # Determine sample type
+        pos_end = self.num_positives
+        corrupt_end = pos_end + self.num_corrupted
+        wrong_input_end = corrupt_end + self.num_wrong_input
+        mismatch_end = wrong_input_end + self.num_mismatched_aug
+        all_zeros_end = mismatch_end + self.num_all_zeros
+        const_fill_end = all_zeros_end + self.num_constant_fill
+        noise_end = const_fill_end + self.num_random_noise
+        
+        if sample_type_idx < pos_end:
+            sample_type = "positive"
+        elif sample_type_idx < corrupt_end:
+            sample_type = "corrupted"
+        elif sample_type_idx < wrong_input_end:
+            sample_type = "wrong_input"
+        elif sample_type_idx < mismatch_end:
+            sample_type = "mismatched_aug"
+        elif sample_type_idx < all_zeros_end:
+            sample_type = "all_zeros"
+        elif sample_type_idx < const_fill_end:
+            sample_type = "constant_fill"
+        elif sample_type_idx < noise_end:
+            sample_type = "random_noise"
+        else:
+            sample_type = "color_swap"
+        
+        # Generate sample based on type
+        if sample_type == "positive":
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = aug_output  # Correct!
+            target = aug_output
+            
+        elif sample_type == "corrupted":
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = corrupt_output(aug_output)
+            target = aug_output
+            
+        elif sample_type == "wrong_input":
+            wrong_inp, _ = self._get_different_example(example_idx)
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[wrong_inp], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = aug_output
+            target = aug_output
+            
+        elif sample_type == "mismatched_aug":
+            trans_id_1, color_map_1 = self._get_augmentation()
+            trans_id_2, color_map_2 = self._get_augmentation()
+            while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
+                trans_id_2, color_map_2 = self._get_augmentation()
+            aug_input = dihedral_transform(color_map_1[input_grid], trans_id_1)
+            aug_output = dihedral_transform(color_map_2[correct_output], trans_id_2)
+            candidate = aug_output
+            # Target should match input's augmentation
+            target = dihedral_transform(color_map_1[correct_output], trans_id_1)
+            
+        elif sample_type == "all_zeros":
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_all_zeros(aug_output)
+            target = aug_output
+            
+        elif sample_type == "constant_fill":
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_constant_fill(aug_output)
+            target = aug_output
+            
+        elif sample_type == "random_noise":
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_random_noise(aug_output)
+            target = aug_output
+            
+        else:  # color_swap
+            trans_id, color_map = self._get_augmentation()
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_color_swap(aug_output)
+            target = aug_output
         
         return (
-            torch.from_numpy(self._pad_grid(aug_inp)).long(),
-            torch.from_numpy(self._pad_grid(candidate)).long(),  # Candidate, not correct!
-            torch.from_numpy(self._pad_grid(aug_out)).long(),    # Target (correct output)
+            torch.from_numpy(self._pad_grid(aug_input)).long(),
+            torch.from_numpy(self._pad_grid(candidate)).long(),
+            torch.from_numpy(self._pad_grid(target)).long(),
         )
 
 
@@ -255,22 +413,42 @@ def train_on_puzzle(
     hidden_dim: int = 64,
     lr: float = 1e-3,
     batch_size: int = 32,
-    num_augments: int = 50,
+    num_negatives: int = 8,
     dihedral_only: bool = True,
-    candidate_mode: str = "zeros",
     verbose: bool = False,
 ) -> nn.Module:
     """Train a CNN on a single puzzle's training examples.
     
-    The model learns: (input, candidate) -> correct_output
-    Where candidate is NOT the correct output (it's blank/corrupted/random).
+    Uses full augmentation strategy matching train_pixel_error_cnn.py:
+    - Positive samples (correct candidate)
+    - Corrupted samples
+    - Wrong input samples
+    - Mismatched augmentation samples
+    - Degenerate outputs (zeros, constant, noise, color_swap)
     """
     
+    # Distribute negatives like train_pixel_error_cnn.py
+    num_positives = max(1, num_negatives // 4)
+    num_corrupted = max(1, int(num_negatives * 0.35))
+    num_wrong_input = max(1, int(num_negatives * 0.15))
+    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    num_color_swap = max(1, int(num_negatives * 0.15))
+    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
+    num_all_zeros = max(1, remaining // 3)
+    num_constant_fill = max(1, remaining // 3)
+    num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+    
     dataset = SinglePuzzleDataset(
-        puzzle, 
-        num_augments=num_augments, 
+        puzzle,
+        num_positives=num_positives,
+        num_corrupted=num_corrupted,
+        num_wrong_input=num_wrong_input,
+        num_mismatched_aug=num_mismatched_aug,
+        num_all_zeros=num_all_zeros,
+        num_constant_fill=num_constant_fill,
+        num_random_noise=num_random_noise,
+        num_color_swap=num_color_swap,
         dihedral_only=dihedral_only,
-        candidate_mode=candidate_mode
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
@@ -283,12 +461,12 @@ def train_on_puzzle(
         total_loss = 0
         for inp, candidate, target in loader:
             inp = inp.to(DEVICE)
-            candidate = candidate.to(DEVICE)  # NOT the correct output!
-            target = target.to(DEVICE)        # The correct output (supervision)
+            candidate = candidate.to(DEVICE)
+            target = target.to(DEVICE)
             
             optimizer.zero_grad()
-            logits = model(inp, candidate)    # Model sees input + blank/corrupted candidate
-            loss = F.cross_entropy(logits, target)  # Must predict correct output
+            logits = model(inp, candidate)
+            loss = F.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -395,9 +573,8 @@ def evaluate_puzzle(
     puzzle: Dict,
     epochs: int,
     hidden_dim: int,
-    num_augments: int,
+    num_negatives: int,
     dihedral_only: bool,
-    candidate_mode: str = "zeros",
     verbose: bool = False
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
@@ -414,8 +591,7 @@ def evaluate_puzzle(
     start = time.time()
     model = train_on_puzzle(
         puzzle, epochs=epochs, hidden_dim=hidden_dim,
-        num_augments=num_augments, dihedral_only=dihedral_only,
-        candidate_mode=candidate_mode,
+        num_negatives=num_negatives, dihedral_only=dihedral_only,
         verbose=verbose
     )
     train_time = time.time() - start
@@ -478,13 +654,10 @@ def main():
     parser.add_argument("--data-root", type=str, default="kaggle/combined")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--num-augments", type=int, default=50, help="Augmented samples per training example")
+    parser.add_argument("--num-negatives", type=int, default=8, 
+                        help="Negatives per example (distributed across corruption types)")
     parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
     parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
-    parser.add_argument("--candidate-mode", type=str, default="zeros", 
-                        choices=["zeros", "corrupted", "random"],
-                        help="What to pass as candidate during training: "
-                             "zeros=blank grid (hardest), corrupted=partially wrong, random=noise")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
@@ -498,10 +671,9 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Epochs per puzzle: {args.epochs}")
     print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
-    print(f"Augments per example: {args.num_augments}")
-    print(f"Candidate mode: {args.candidate_mode}")
-    print(f"  (During training, model sees INPUT + {args.candidate_mode.upper()} candidate)")
-    print(f"  (During eval, model sees INPUT + BLANK candidate)")
+    print(f"Num negatives: {args.num_negatives}")
+    print(f"Training: Full augmentation (positives + corrupted + zeros + noise + etc)")
+    print(f"Evaluation: Blank candidate (model must generate from scratch)")
     
     # Load puzzles
     puzzles = load_puzzles(args.dataset, args.data_root)
@@ -525,9 +697,8 @@ def main():
             puzzle_id, puzzles[puzzle_id],
             epochs=args.epochs,
             hidden_dim=args.hidden_dim,
-            num_augments=args.num_augments,
+            num_negatives=args.num_negatives,
             dihedral_only=args.dihedral_only,
-            candidate_mode=args.candidate_mode,
             verbose=args.verbose
         )
         results.append(result)
