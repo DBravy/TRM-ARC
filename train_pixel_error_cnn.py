@@ -716,13 +716,14 @@ class TestEvalDataset(Dataset):
         input_padded = self._pad_grid(input_grid)
         output_padded = self._pad_grid(output_grid)
         
-        # Store original dimensions for accurate evaluation
-        h, w = output_grid.shape
+        # Store original dimensions for accurate evaluation and display
+        inp_h, inp_w = input_grid.shape
+        out_h, out_w = output_grid.shape
         
         return (
             torch.from_numpy(input_padded).long(),
             torch.from_numpy(output_padded).long(),
-            torch.tensor([h, w], dtype=torch.long),  # Original dimensions
+            torch.tensor([inp_h, inp_w, out_h, out_w], dtype=torch.long),  # Both input and output dims
             puzzle_id
         )
 
@@ -731,8 +732,10 @@ def visualize_prediction(
     input_grid: np.ndarray,
     target_grid: np.ndarray, 
     pred_grid: np.ndarray,
-    h: int, 
-    w: int,
+    inp_h: int,
+    inp_w: int,
+    out_h: int, 
+    out_w: int,
     puzzle_id: str
 ):
     """Visualize input, target output, and prediction stacked vertically."""
@@ -751,28 +754,21 @@ def visualize_prediction(
     ]
     RESET = '\033[0m'
     
-    tgt = target_grid[:h, :w]
-    pred = pred_grid[:h, :w]
-    
-    # Find actual input dimensions
-    inp_nonzero = np.where(input_grid > 0)
-    if len(inp_nonzero[0]) > 0:
-        inp_h = inp_nonzero[0].max() + 1
-        inp_w = inp_nonzero[1].max() + 1
-    else:
-        inp_h, inp_w = h, w
+    # Extract actual regions using provided dimensions
     inp = input_grid[:inp_h, :inp_w]
+    tgt = target_grid[:out_h, :out_w]
+    pred = pred_grid[:out_h, :out_w]
     
     # Calculate errors
     errors = (pred != tgt).sum()
-    total = h * w
+    total = out_h * out_w
     
     print(f"\n{'═'*50}")
     if errors == 0:
         print(f"\033[92m✓ PERFECT: {puzzle_id}\033[0m")
     else:
         print(f"\033[91m✗ {puzzle_id}: {errors}/{total} errors ({100*errors/total:.1f}% wrong)\033[0m")
-    print(f"  Input: {inp_h}×{inp_w} → Output: {h}×{w}")
+    print(f"  Input: {inp_h}×{inp_w} → Output: {out_h}×{out_w}")
     print(f"{'═'*50}")
     
     def print_grid(grid, label, rows, cols, highlight_errors=False, target=None):
@@ -790,8 +786,8 @@ def visualize_prediction(
     
     # Print grids stacked
     print_grid(inp, "INPUT", inp_h, inp_w)
-    print_grid(tgt, "TARGET", h, w)
-    print_grid(pred, "PREDICTION (errors in red)", h, w, highlight_errors=True, target=tgt)
+    print_grid(tgt, "TARGET", out_h, out_w)
+    print_grid(pred, "PREDICTION (errors in red)", out_h, out_w, highlight_errors=True, target=tgt)
     
     print()
 
@@ -820,7 +816,7 @@ def evaluate_test_examples(
     with torch.no_grad():
         for i in range(len(dataset)):
             input_grid, output_grid, dims, puzzle_id = dataset[i]
-            h, w = dims[0].item(), dims[1].item()
+            inp_h, inp_w, out_h, out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
             
             inp_t = input_grid.unsqueeze(0).to(device)
             
@@ -834,12 +830,12 @@ def evaluate_test_examples(
                 pred_colors = logits.argmax(dim=1)[0].cpu().numpy()  # (H, W)
                 target_colors = output_grid.numpy()
                 
-                # Only evaluate within original dimensions (not padding)
-                pred_region = pred_colors[:h, :w]
-                target_region = target_colors[:h, :w]
+                # Only evaluate within original output dimensions (not padding)
+                pred_region = pred_colors[:out_h, :out_w]
+                target_region = target_colors[:out_h, :out_w]
                 
                 correct = (pred_region == target_region).sum()
-                total = h * w
+                total = out_h * out_w
                 is_perfect = (correct == total)
                 
                 # Visualize
@@ -848,7 +844,8 @@ def evaluate_test_examples(
                         input_grid.numpy(),
                         target_colors,
                         pred_colors,
-                        h, w,
+                        inp_h, inp_w,
+                        out_h, out_w,
                         puzzle_id
                     )
                 
@@ -860,10 +857,10 @@ def evaluate_test_examples(
                 logits = model(inp_t, out_t)  # (1, H, W)
                 pred_correct = (logits > 0)[0].cpu().numpy()
                 
-                pred_region = pred_correct[:h, :w]
+                pred_region = pred_correct[:out_h, :out_w]
                 # All should be predicted as correct (True/1)
                 correct = pred_region.sum()
-                total = h * w
+                total = out_h * out_w
                 is_perfect = (correct == total)
             
             total_correct += correct
