@@ -1148,6 +1148,19 @@ def evaluate_color(
     }
 
 
+def _find_grid_bounds(grid: np.ndarray, max_size: int = 30) -> Tuple[int, int]:
+    """Find the bounds of non-zero content in a grid."""
+    nonzero = np.where(grid > 0)
+    if len(nonzero[0]) > 0:
+        r_max = min(nonzero[0].max() + 1, max_size)
+        c_max = min(nonzero[1].max() + 1, max_size)
+    else:
+        # If all zeros, check for any non-padding content by looking at the mask pattern
+        # Default to a small size
+        r_max, c_max = 1, 1
+    return r_max, c_max
+
+
 def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
     """Visualize predictions for binary mode"""
     model.eval()
@@ -1175,24 +1188,24 @@ def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: tor
     type_info.append(("random_noise", base, dataset.num_random_noise))
     base += dataset.num_random_noise
     type_info.append(("color_swap", base, dataset.num_color_swap))
-    
+
     for sample_type, offset, count in type_info:
         if count == 0:
             continue
-            
+
         print(f"\n{'─'*80}")
         print(f"Sample Type: {sample_type.upper()}")
         print(f"{'─'*80}")
-        
+
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
             # Calculate index for this sample type
             example_idx = random.randint(0, len(dataset.examples) - 1)
             sample_idx = example_idx * dataset.samples_per_example + offset + i
-            
+
             if sample_idx >= len(dataset):
                 continue
-                
+
             input_grid, output_grid, pixel_mask, is_positive = dataset[sample_idx]
 
             inp_t = input_grid.unsqueeze(0).to(device)
@@ -1205,28 +1218,38 @@ def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: tor
             output_np = output_grid.numpy()
             mask_np = pixel_mask.numpy()
 
-            # Find content bounds
-            nonzero = np.where(output_np > 0)
-            if len(nonzero[0]) > 0:
-                r_max = min(nonzero[0].max() + 1, 8)
-                c_max = min(nonzero[1].max() + 1, 8)
-            else:
-                r_max, c_max = 6, 6
+            # Find content bounds SEPARATELY for input and output
+            inp_r, inp_c = _find_grid_bounds(input_np)
+            out_r, out_c = _find_grid_bounds(output_np)
 
-            num_errors = int((mask_np[:r_max, :c_max] == 0).sum())
+            # For all-zeros output, use mask to find content region
+            if out_r == 1 and out_c == 1:
+                error_positions = np.where(mask_np == 0)
+                if len(error_positions[0]) > 0:
+                    out_r = min(error_positions[0].max() + 1, 30)
+                    out_c = min(error_positions[1].max() + 1, 30)
+
+            num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
             expected = "ALL CORRECT" if is_positive > 0.5 else f"{num_errors} errors"
-            
-            print(f"\nExpected: {expected}")
-            print(f"{'INPUT':<20} {'OUTPUT':<20} {'PREDICTED ERRORS':<20}")
 
-            for r in range(r_max):
-                inp_row = " ".join(f"{input_np[r, c]}" for c in range(c_max))
-                out_row = " ".join(f"{output_np[r, c]}" for c in range(c_max))
-                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "·" for c in range(c_max))
-                print(f"{inp_row:<20} {out_row:<20} {err_row:<20}")
+            print(f"\nInput: {inp_r}×{inp_c} → Output: {out_r}×{out_c}")
+            print(f"Expected: {expected}")
+
+            # Print INPUT separately with its own dimensions
+            print(f"\nINPUT ({inp_r}×{inp_c}):")
+            for r in range(inp_r):
+                inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
+                print(f"  {inp_row}")
+
+            # Print OUTPUT and PREDICTED ERRORS with output dimensions
+            print(f"\n{'OUTPUT':<30} {'PREDICTED ERRORS':<30}")
+            for r in range(out_r):
+                out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
+                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "·" for c in range(out_c))
+                print(f"  {out_row:<28} {err_row:<28}")
 
             # Stats (only count within content area)
-            num_predicted_errors = (pred_proba[:r_max, :c_max] < 0.5).sum()
+            num_predicted_errors = (pred_proba[:out_r, :out_c] < 0.5).sum()
             print(f"Predicted errors: {num_predicted_errors}")
 
     print("="*80 + "\n")
@@ -1259,24 +1282,24 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
     type_info.append(("random_noise", base, dataset.num_random_noise))
     base += dataset.num_random_noise
     type_info.append(("color_swap", base, dataset.num_color_swap))
-    
+
     for sample_type, offset, count in type_info:
         if count == 0:
             continue
-            
+
         print(f"\n{'─'*80}")
         print(f"Sample Type: {sample_type.upper()}")
         print(f"{'─'*80}")
-        
+
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
             # Calculate index for this sample type
             example_idx = random.randint(0, len(dataset.examples) - 1)
             sample_idx = example_idx * dataset.samples_per_example + offset + i
-            
+
             if sample_idx >= len(dataset):
                 continue
-                
+
             input_grid, output_grid, target_colors, pixel_mask = dataset[sample_idx]
 
             inp_t = input_grid.unsqueeze(0).to(device)
@@ -1290,27 +1313,42 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
             target_np = target_colors.numpy()
             mask_np = pixel_mask.numpy()
 
-            # Find content bounds
-            nonzero = np.where(output_np > 0)
-            if len(nonzero[0]) > 0:
-                r_max = min(nonzero[0].max() + 1, 8)
-                c_max = min(nonzero[1].max() + 1, 8)
-            else:
-                r_max, c_max = 6, 6
+            # Find content bounds SEPARATELY for input and output
+            inp_r, inp_c = _find_grid_bounds(input_np)
+            out_r, out_c = _find_grid_bounds(output_np)
 
-            num_errors = int((mask_np[:r_max, :c_max] == 0).sum())
-            num_correct_preds = int((pred_colors[:r_max, :c_max] == target_np[:r_max, :c_max]).sum())
-            total_pixels = r_max * c_max
-            
-            print(f"\nActual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
-            print(f"{'INPUT':<20} {'OUTPUT':<20} {'TARGET':<20} {'PREDICTED':<20}")
+            # Also check target bounds (may differ from output for corrupted samples)
+            tgt_r, tgt_c = _find_grid_bounds(target_np)
+            out_r = max(out_r, tgt_r)
+            out_c = max(out_c, tgt_c)
 
-            for r in range(r_max):
-                inp_row = " ".join(f"{input_np[r, c]}" for c in range(c_max))
-                out_row = " ".join(f"{output_np[r, c]}" for c in range(c_max))
-                tgt_row = " ".join(f"{target_np[r, c]}" for c in range(c_max))
-                pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(c_max))
-                print(f"{inp_row:<20} {out_row:<20} {tgt_row:<20} {pred_row:<20}")
+            # For all-zeros output, use mask to find content region
+            if out_r == 1 and out_c == 1:
+                error_positions = np.where(mask_np == 0)
+                if len(error_positions[0]) > 0:
+                    out_r = min(error_positions[0].max() + 1, 30)
+                    out_c = min(error_positions[1].max() + 1, 30)
+
+            num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
+            num_correct_preds = int((pred_colors[:out_r, :out_c] == target_np[:out_r, :out_c]).sum())
+            total_pixels = out_r * out_c
+
+            print(f"\nInput: {inp_r}×{inp_c} → Output: {out_r}×{out_c}")
+            print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
+
+            # Print INPUT separately with its own dimensions
+            print(f"\nINPUT ({inp_r}×{inp_c}):")
+            for r in range(inp_r):
+                inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
+                print(f"  {inp_row}")
+
+            # Print OUTPUT, TARGET, PREDICTED with output dimensions
+            print(f"\n{'OUTPUT':<25} {'TARGET':<25} {'PREDICTED':<25}")
+            for r in range(out_r):
+                out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
+                tgt_row = " ".join(f"{target_np[r, c]}" for c in range(out_c))
+                pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(out_c))
+                print(f"  {out_row:<23} {tgt_row:<23} {pred_row:<23}")
 
     print("="*80 + "\n")
 
