@@ -63,7 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Import pixel error CNN components for intermittent testing
 from train_pixel_error_cnn import (
     CorrespondenceDataset,
-    evaluate as evaluate_pixel_error_cnn,
+    evaluate_binary as evaluate_pixel_error_cnn,
     visualize_predictions as visualize_pixel_error_cnn,
     load_puzzles as load_raw_puzzles,
 )
