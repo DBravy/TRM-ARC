@@ -653,7 +653,7 @@ def create_model(args, metadata, device):
             # CNN-guided pixel freezing (uses pretrained CNN)
             "cnn_checkpoint_path": cnn_path,
             "cnn_freeze_threshold": 0.5,
-            "cnn_loss_weight": 0.0,
+            "cnn_loss_weight": 0.5,
             "cnn_freeze_warmup_steps": 0,
             # Dynamic iteration mode (CNN-guided stopping)
             "dynamic_iterations": args.dynamic_iterations,
