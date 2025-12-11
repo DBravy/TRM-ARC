@@ -135,8 +135,7 @@ def train_trm(
         "--L-cycles", str(L_cycles),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
-        "--eval-interval", str(max(100, epochs // 10)),  # Eval 10 times during training
-        "--no-wandb",  # Disable wandb logging
+        "--eval-interval", str(max(500, epochs // 2)),  # Eval 10 times during training  # Disable wandb logging
     ]
 
     if dynamic_iterations:
