@@ -352,6 +352,7 @@ def evaluate_iterative(
     iterations: int = 5,
     use_train: bool = False,
     visualize: bool = False,
+    puzzle_id: str = "",
 ) -> Dict:
     """Evaluate with iterative refinement."""
     model.eval()
@@ -362,7 +363,7 @@ def evaluate_iterative(
     iteration_accuracies = [[] for _ in range(iterations)]
     
     with torch.no_grad():
-        for ex in examples:
+        for ex_idx, ex in enumerate(examples):
             if "output" not in ex:
                 continue
             
@@ -380,20 +381,25 @@ def evaluate_iterative(
             # Start with blank candidate
             candidate = torch.zeros(1, GRID_SIZE, GRID_SIZE, dtype=torch.long, device=DEVICE)
             
+            # Collect predictions at each iteration
+            iteration_preds = []
+            
             # Iterate
             for it in range(iterations):
                 pred = model.predict_colors(inp_t, candidate)
                 candidate = pred
                 
-                # Calculate accuracy at this iteration
                 pred_np = pred[0].cpu().numpy()
+                iteration_preds.append(pred_np.copy())
+                
+                # Calculate accuracy at this iteration
                 correct = (pred_np[:h_out, :w_out] == out).sum()
                 total = h_out * w_out
                 acc = correct / total
                 iteration_accuracies[it].append(acc)
             
             # Final result
-            final_pred = candidate[0].cpu().numpy()
+            final_pred = iteration_preds[-1]
             correct = (final_pred[:h_out, :w_out] == out).sum()
             total = h_out * w_out
             
@@ -405,7 +411,12 @@ def evaluate_iterative(
             })
             
             if visualize:
-                visualize_result(inp_pad, out, final_pred, h_out, w_out)
+                visualize_iteration_progress(
+                    inp_pad, out, iteration_preds,
+                    h_inp=h_inp, w_inp=w_inp,
+                    h_out=h_out, w_out=w_out,
+                    puzzle_id=f"{puzzle_id} - {'train' if use_train else 'test'} example {ex_idx+1}"
+                )
     
     model.train()
     
@@ -421,34 +432,148 @@ def evaluate_iterative(
     }
 
 
-def visualize_result(inp, target, pred, h, w):
-    """Simple text visualization."""
-    COLORS = ['⬛', '🔵', '🔴', '🟢', '🟡', '⬜', '🟣', '🟠', '🔷', '🟤']
+def visualize_iteration_progress(inp, target, iteration_preds, h_inp, w_inp, h_out, w_out, puzzle_id=""):
+    """
+    Visualize the progression through iterations.
+    Shows input, target, and each iteration's prediction side by side.
+    """
+    # ANSI 256 color codes for ARC colors
+    COLORS = [
+        '\033[48;5;0m',    # 0: black
+        '\033[48;5;21m',   # 1: blue
+        '\033[48;5;196m',  # 2: red
+        '\033[48;5;46m',   # 3: green
+        '\033[48;5;226m',  # 4: yellow
+        '\033[48;5;250m',  # 5: gray
+        '\033[48;5;201m',  # 6: magenta
+        '\033[48;5;208m',  # 7: orange
+        '\033[48;5;51m',   # 8: cyan
+        '\033[48;5;88m',   # 9: maroon
+    ]
+    RESET = '\033[0m'
+    ERROR_BG = '\033[48;5;9m'  # Bright red background for errors
     
-    print("\nInput:")
-    for row in inp[:h, :w]:
-        print("".join(COLORS[c] for c in row))
-    
-    print("\nTarget:")
-    for row in target[:h, :w]:
-        print("".join(COLORS[c] for c in row))
-    
-    print("\nPrediction:")
-    for row in pred[:h, :w]:
-        print("".join(COLORS[c] for c in row))
-    
-    # Show errors
-    errors = (pred[:h, :w] != target[:h, :w])
-    if errors.any():
-        print("\nErrors (X = wrong):")
+    def render_grid(grid, h, w, error_mask=None):
+        """Render a grid as colored string rows."""
+        rows = []
         for i in range(h):
             row_str = ""
             for j in range(w):
-                if errors[i, j]:
-                    row_str += "❌"
+                val = grid[i, j]
+                if error_mask is not None and error_mask[i, j]:
+                    # Show error with red background and X
+                    row_str += f"{ERROR_BG} X{RESET}"
                 else:
-                    row_str += "✅"
-            print(row_str)
+                    row_str += f"{COLORS[val]}  {RESET}"
+            rows.append(row_str)
+        return rows
+    
+    def render_grid_compact(grid, h, w):
+        """Render grid with single-char cells for compact view."""
+        rows = []
+        for i in range(h):
+            row_str = ""
+            for j in range(w):
+                val = grid[i, j]
+                row_str += f"{COLORS[val]} {RESET}"
+            rows.append(row_str)
+        return rows
+    
+    num_iterations = len(iteration_preds)
+    
+    # Calculate max height for alignment
+    max_h = max(h_inp, h_out)
+    
+    # Render all grids
+    input_rows = render_grid_compact(inp, h_inp, w_inp)
+    target_rows = render_grid_compact(target, h_out, w_out)
+    
+    iteration_rows = []
+    iteration_accuracies = []
+    for pred in iteration_preds:
+        pred_cropped = pred[:h_out, :w_out]
+        target_cropped = target[:h_out, :w_out]
+        errors = (pred_cropped != target_cropped)
+        acc = 1 - errors.sum() / (h_out * w_out)
+        iteration_accuracies.append(acc)
+        iteration_rows.append(render_grid_compact(pred_cropped, h_out, w_out))
+    
+    # Print header
+    print(f"\n{'─'*80}")
+    if puzzle_id:
+        print(f"Puzzle: {puzzle_id}")
+    
+    # Column headers
+    header = f"{'Input':<{w_inp+2}}  {'Target':<{w_out+2}}"
+    for i in range(num_iterations):
+        header += f"  {'Iter '+str(i):<{w_out+2}}"
+    print(header)
+    
+    # Accuracy row
+    acc_row = f"{'':<{w_inp+2}}  {'':<{w_out+2}}"
+    for i, acc in enumerate(iteration_accuracies):
+        acc_str = f"{acc:.0%}"
+        acc_row += f"  {acc_str:<{w_out+2}}"
+    print(acc_row)
+    
+    print()
+    
+    # Print grids side by side
+    for row_idx in range(max_h):
+        line = ""
+        
+        # Input column
+        if row_idx < h_inp:
+            line += input_rows[row_idx]
+        else:
+            line += " " * w_inp
+        line += "  "
+        
+        # Target column
+        if row_idx < h_out:
+            line += target_rows[row_idx]
+        else:
+            line += " " * w_out
+        
+        # Iteration columns
+        for it_rows in iteration_rows:
+            line += "  "
+            if row_idx < h_out:
+                line += it_rows[row_idx]
+            else:
+                line += " " * w_out
+        
+        print(line)
+    
+    # Print accuracy progression
+    print()
+    print("Accuracy: ", end="")
+    for i, acc in enumerate(iteration_accuracies):
+        if i > 0:
+            diff = acc - iteration_accuracies[i-1]
+            sign = "+" if diff >= 0 else ""
+            print(f" → {acc:.1%}({sign}{diff:.1%})", end="")
+        else:
+            print(f"{acc:.1%}", end="")
+    print()
+    
+    # Show final error count
+    final_errors = (iteration_preds[-1][:h_out, :w_out] != target[:h_out, :w_out]).sum()
+    total_pixels = h_out * w_out
+    if final_errors == 0:
+        print(f"✓ PERFECT - all {total_pixels} pixels correct")
+    else:
+        print(f"✗ {final_errors}/{total_pixels} pixels wrong")
+    
+    print(f"{'─'*80}")
+
+
+def visualize_result(inp, target, pred, h, w):
+    """Simple single-prediction visualization (legacy)."""
+    visualize_iteration_progress(
+        inp, target, [pred], 
+        h_inp=h, w_inp=w, h_out=h, w_out=w
+    )
 
 
 # =============================================================================
@@ -556,6 +681,7 @@ def main():
         iterations=args.iterations,
         use_train=False,
         visualize=args.visualize,
+        puzzle_id=args.puzzle,
     )
     
     print(f"\nAccuracy by iteration:")
@@ -580,7 +706,8 @@ def main():
         model, puzzle,
         iterations=args.iterations, 
         use_train=True,
-        visualize=False,
+        visualize=args.visualize,
+        puzzle_id=args.puzzle,
     )
     
     print(f"\nAccuracy by iteration:")
