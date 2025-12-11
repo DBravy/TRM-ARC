@@ -1310,6 +1310,13 @@ def main():
     parser.add_argument("--eval-on-test", action="store_true",
                         help="Train only on puzzle's train examples, evaluate on held-out test examples. "
                              "This tests true generalization - did CNN learn the rule or just memorize?")
+    
+    # Negative type selection (for ablation studies)
+    parser.add_argument("--negative-type", type=str, default="mixed",
+                        choices=["mixed", "all_zeros", "corrupted", "random_noise", 
+                                 "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
+                        help="Type of negatives to use: "
+                             "mixed=all types (default), or single type for ablation")
 
     args = parser.parse_args()
 
@@ -1391,20 +1398,48 @@ def main():
     num_positives = max(1, num_negatives // 4)
     use_augment = not args.no_augment
 
-    # Split negatives across 7 types
-    num_corrupted = max(1, int(num_negatives * 0.35))
-    num_wrong_input = max(1, int(num_negatives * 0.15))
-    # mismatched_aug only makes sense when augmentation is enabled
-    num_mismatched_aug = max(1, int(num_negatives * 0.15)) if use_augment else 0
-    num_color_swap = max(1, int(num_negatives * 0.15))
-    # Degenerate outputs (all_zeros, constant_fill, random_noise) get remaining ~20%
-    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
-    num_all_zeros = max(1, remaining // 3)
-    num_constant_fill = max(1, remaining // 3)
-    num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+    # Handle --negative-type for ablation studies
+    if args.negative_type == "mixed":
+        # Default: distribute across all types
+        num_corrupted = max(1, int(num_negatives * 0.35))
+        num_wrong_input = max(1, int(num_negatives * 0.15))
+        num_mismatched_aug = max(1, int(num_negatives * 0.15)) if use_augment else 0
+        num_color_swap = max(1, int(num_negatives * 0.15))
+        remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
+        num_all_zeros = max(1, remaining // 3)
+        num_constant_fill = max(1, remaining // 3)
+        num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+    else:
+        # Single negative type for ablation
+        num_corrupted = 0
+        num_wrong_input = 0
+        num_mismatched_aug = 0
+        num_color_swap = 0
+        num_all_zeros = 0
+        num_constant_fill = 0
+        num_random_noise = 0
+        
+        if args.negative_type == "all_zeros":
+            num_all_zeros = num_negatives
+        elif args.negative_type == "corrupted":
+            num_corrupted = num_negatives
+        elif args.negative_type == "random_noise":
+            num_random_noise = num_negatives
+        elif args.negative_type == "constant_fill":
+            num_constant_fill = num_negatives
+        elif args.negative_type == "color_swap":
+            num_color_swap = num_negatives
+        elif args.negative_type == "wrong_input":
+            num_wrong_input = num_negatives
+        elif args.negative_type == "mismatched_aug":
+            if not use_augment:
+                print("Warning: --negative-type mismatched_aug requires augmentation. Using corrupted instead.")
+                num_corrupted = num_negatives
+            else:
+                num_mismatched_aug = num_negatives
 
-    print(f"Auto-distributed {num_negatives} negatives: "
-          f"{num_corrupted} corrupted, {num_wrong_input} wrong_input, {num_mismatched_aug} mismatched_aug, "
+    print(f"Negative type: {args.negative_type}")
+    print(f"Distribution: {num_corrupted} corrupted, {num_wrong_input} wrong_input, {num_mismatched_aug} mismatched_aug, "
           f"{num_color_swap} color_swap, {num_all_zeros} all_zeros, {num_constant_fill} const_fill, {num_random_noise} noise")
     print(f"Plus {num_positives} positives per example")
 

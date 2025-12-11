@@ -415,6 +415,7 @@ def train_on_puzzle(
     batch_size: int = 32,
     num_negatives: int = 8,
     dihedral_only: bool = True,
+    negative_type: str = "mixed",
     verbose: bool = False,
 ) -> nn.Module:
     """Train a CNN on a single puzzle's training examples.
@@ -427,16 +428,42 @@ def train_on_puzzle(
     - Degenerate outputs (zeros, constant, noise, color_swap)
     """
     
-    # Distribute negatives like train_pixel_error_cnn.py
+    # Distribute negatives based on negative_type
     num_positives = max(1, num_negatives // 4)
-    num_corrupted = max(1, int(num_negatives * 0.35))
-    num_wrong_input = max(1, int(num_negatives * 0.15))
-    num_mismatched_aug = max(1, int(num_negatives * 0.15))
-    num_color_swap = max(1, int(num_negatives * 0.15))
-    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
-    num_all_zeros = max(1, remaining // 3)
-    num_constant_fill = max(1, remaining // 3)
-    num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+    
+    if negative_type == "mixed":
+        num_corrupted = max(1, int(num_negatives * 0.35))
+        num_wrong_input = max(1, int(num_negatives * 0.15))
+        num_mismatched_aug = max(1, int(num_negatives * 0.15))
+        num_color_swap = max(1, int(num_negatives * 0.15))
+        remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
+        num_all_zeros = max(1, remaining // 3)
+        num_constant_fill = max(1, remaining // 3)
+        num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+    else:
+        # Single negative type for ablation
+        num_corrupted = 0
+        num_wrong_input = 0
+        num_mismatched_aug = 0
+        num_color_swap = 0
+        num_all_zeros = 0
+        num_constant_fill = 0
+        num_random_noise = 0
+        
+        if negative_type == "all_zeros":
+            num_all_zeros = num_negatives
+        elif negative_type == "corrupted":
+            num_corrupted = num_negatives
+        elif negative_type == "random_noise":
+            num_random_noise = num_negatives
+        elif negative_type == "constant_fill":
+            num_constant_fill = num_negatives
+        elif negative_type == "color_swap":
+            num_color_swap = num_negatives
+        elif negative_type == "wrong_input":
+            num_wrong_input = num_negatives
+        elif negative_type == "mismatched_aug":
+            num_mismatched_aug = num_negatives
     
     dataset = SinglePuzzleDataset(
         puzzle,
@@ -575,6 +602,7 @@ def evaluate_puzzle(
     hidden_dim: int,
     num_negatives: int,
     dihedral_only: bool,
+    negative_type: str = "mixed",
     verbose: bool = False
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
@@ -592,6 +620,7 @@ def evaluate_puzzle(
     model = train_on_puzzle(
         puzzle, epochs=epochs, hidden_dim=hidden_dim,
         num_negatives=num_negatives, dihedral_only=dihedral_only,
+        negative_type=negative_type,
         verbose=verbose
     )
     train_time = time.time() - start
@@ -658,6 +687,10 @@ def main():
                         help="Negatives per example (distributed across corruption types)")
     parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
     parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
+    parser.add_argument("--negative-type", type=str, default="mixed",
+                        choices=["mixed", "all_zeros", "corrupted", "random_noise", 
+                                 "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
+                        help="Type of negatives: mixed=all types (default), or single type for ablation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
@@ -672,7 +705,7 @@ def main():
     print(f"Epochs per puzzle: {args.epochs}")
     print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
     print(f"Num negatives: {args.num_negatives}")
-    print(f"Training: Full augmentation (positives + corrupted + zeros + noise + etc)")
+    print(f"Negative type: {args.negative_type}")
     print(f"Evaluation: Blank candidate (model must generate from scratch)")
     
     # Load puzzles
@@ -699,6 +732,7 @@ def main():
             hidden_dim=args.hidden_dim,
             num_negatives=args.num_negatives,
             dihedral_only=args.dihedral_only,
+            negative_type=args.negative_type,
             verbose=args.verbose
         )
         results.append(result)
