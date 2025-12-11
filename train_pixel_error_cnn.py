@@ -727,12 +727,113 @@ class TestEvalDataset(Dataset):
         )
 
 
+def visualize_prediction(
+    input_grid: np.ndarray,
+    target_grid: np.ndarray, 
+    pred_grid: np.ndarray,
+    h: int, 
+    w: int,
+    puzzle_id: str
+):
+    """Visualize input, target output, and prediction side by side."""
+    # Color codes for terminal (ANSI)
+    COLORS = [
+        '\033[40m',   # 0: black bg
+        '\033[44m',   # 1: blue
+        '\033[41m',   # 2: red
+        '\033[42m',   # 3: green
+        '\033[43m',   # 4: yellow
+        '\033[47m',   # 5: white/gray
+        '\033[45m',   # 6: magenta
+        '\033[46m',   # 7: cyan
+        '\033[48;5;208m',  # 8: orange
+        '\033[48;5;52m',   # 9: maroon/brown
+    ]
+    RESET = '\033[0m'
+    ERROR_MARK = '\033[4m'  # underline for errors
+    
+    tgt = target_grid[:h, :w]
+    pred = pred_grid[:h, :w]
+    
+    # Find actual input dimensions (may differ from output)
+    # Look for the bounding box of non-padding content
+    inp_nonzero = np.where(input_grid > 0)
+    if len(inp_nonzero[0]) > 0:
+        inp_h = inp_nonzero[0].max() + 1
+        inp_w = inp_nonzero[1].max() + 1
+    else:
+        # All zeros input - use output dimensions as fallback
+        inp_h, inp_w = h, w
+    
+    inp = input_grid[:inp_h, :inp_w]
+    
+    print(f"\n{'─'*70}")
+    print(f"Puzzle: {puzzle_id} | Input: {inp_h}x{inp_w} | Output: {h}x{w}")
+    print(f"{'─'*70}")
+    
+    # Determine max height for display
+    max_h = max(h, inp_h)
+    col_width = max(w * 2 + 2, 12)
+    inp_col_width = max(inp_w * 2 + 2, 12)
+    
+    # Header
+    print(f"{'INPUT':<{inp_col_width}}  {'TARGET':<{col_width}}  {'PREDICTION':<{col_width}}  DIFF")
+    
+    for r in range(max_h):
+        # Input row
+        inp_row = ""
+        if r < inp_h:
+            for c in range(inp_w):
+                val = inp[r, c]
+                inp_row += f"{COLORS[val]}{val}{RESET} "
+        inp_row = inp_row if inp_row else "  "
+        
+        # Target row
+        tgt_row = ""
+        if r < h:
+            for c in range(w):
+                val = tgt[r, c]
+                tgt_row += f"{COLORS[val]}{val}{RESET} "
+        
+        # Prediction row (highlight errors)
+        pred_row = ""
+        diff_row = ""
+        if r < h:
+            for c in range(w):
+                p_val = pred[r, c]
+                t_val = tgt[r, c]
+                if p_val == t_val:
+                    pred_row += f"{COLORS[p_val]}{p_val}{RESET} "
+                    diff_row += "· "
+                else:
+                    # Error: show with underline and mark
+                    pred_row += f"{COLORS[p_val]}{ERROR_MARK}{p_val}{RESET} "
+                    diff_row += f"\033[91m✗{RESET} "  # red X
+        
+        # Account for ANSI codes in padding calculation
+        ansi_overhead = 10  # rough estimate per colored cell
+        inp_padding = inp_col_width + (inp_w * ansi_overhead if r < inp_h else 0)
+        tgt_padding = col_width + (w * ansi_overhead if r < h else 0)
+        pred_padding = col_width + (w * ansi_overhead if r < h else 0)
+        
+        print(f"{inp_row:<{inp_padding}}  {tgt_row:<{tgt_padding}}  {pred_row:<{pred_padding}}  {diff_row}")
+    
+    # Summary
+    errors = (pred != tgt).sum()
+    total = h * w
+    if errors == 0:
+        print(f"\n\033[92m✓ PERFECT - All {total} pixels correct\033[0m")
+    else:
+        print(f"\n\033[91m✗ {errors} errors out of {total} pixels ({100*errors/total:.1f}% wrong)\033[0m")
+
+
 def evaluate_test_examples(
     model: nn.Module,
     dataset: TestEvalDataset,
     device: torch.device,
     mode: str = "color",
-    verbose: bool = True
+    verbose: bool = True,
+    visualize: bool = True
 ) -> Dict[str, float]:
     """
     Evaluate model on held-out test examples.
@@ -772,6 +873,16 @@ def evaluate_test_examples(
                 total = h * w
                 is_perfect = (correct == total)
                 
+                # Visualize
+                if visualize:
+                    visualize_prediction(
+                        input_grid.numpy(),
+                        target_colors,
+                        pred_colors,
+                        h, w,
+                        puzzle_id
+                    )
+                
             else:  # binary mode
                 # For binary, we check if model predicts all pixels as "correct"
                 # But this doesn't make sense with blank candidate...
@@ -800,7 +911,7 @@ def evaluate_test_examples(
                 'perfect': is_perfect
             })
             
-            if verbose:
+            if verbose and not visualize:
                 status = "✓ PERFECT" if is_perfect else f"✗ {correct}/{total} ({100*correct/total:.1f}%)"
                 print(f"  Example {i+1}: {puzzle_id} - {status}")
     
@@ -1317,6 +1428,10 @@ def main():
                                  "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
                         help="Type of negatives to use: "
                              "mixed=all types (default), or single type for ablation")
+    
+    # Visualization
+    parser.add_argument("--visualize", action="store_true",
+                        help="Show visual comparison of predictions vs targets during eval-on-test")
 
     args = parser.parse_args()
 
@@ -1587,7 +1702,7 @@ def main():
         
         test_results = evaluate_test_examples(
             model, test_eval_dataset, DEVICE, 
-            mode=args.mode, verbose=True
+            mode=args.mode, verbose=True, visualize=args.visualize
         )
         
         print(f"\n{'─'*60}")
@@ -1614,7 +1729,7 @@ def main():
         train_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=False)
         train_results = evaluate_test_examples(
             model, train_eval_dataset, DEVICE,
-            mode=args.mode, verbose=True
+            mode=args.mode, verbose=True, visualize=False  # Don't visualize training examples
         )
         print(f"\nTRAINING SET RESULTS:")
         print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
