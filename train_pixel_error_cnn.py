@@ -753,11 +753,14 @@ def evaluate_test_examples(
             h, w = dims[0].item(), dims[1].item()
             
             inp_t = input_grid.unsqueeze(0).to(device)
-            out_t = output_grid.unsqueeze(0).to(device)
+            
+            # CRITICAL: Pass BLANK candidate, not the correct output!
+            # The model must generate the output from scratch.
+            blank_candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
             
             if mode == "color":
-                # Predict colors
-                logits = model(inp_t, out_t)  # (1, 10, H, W)
+                # Predict colors from INPUT + BLANK candidate
+                logits = model(inp_t, blank_candidate)  # (1, 10, H, W)
                 pred_colors = logits.argmax(dim=1)[0].cpu().numpy()  # (H, W)
                 target_colors = output_grid.numpy()
                 
@@ -771,7 +774,9 @@ def evaluate_test_examples(
                 
             else:  # binary mode
                 # For binary, we check if model predicts all pixels as "correct"
-                # since these are actual correct outputs
+                # But this doesn't make sense with blank candidate...
+                # Binary mode is for error detection, not generation
+                out_t = output_grid.unsqueeze(0).to(device)
                 logits = model(inp_t, out_t)  # (1, H, W)
                 pred_correct = (logits > 0)[0].cpu().numpy()
                 
