@@ -64,7 +64,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_pixel_error_cnn import (
     CorrespondenceDataset,
     evaluate_binary as evaluate_pixel_error_cnn,
-    visualize_predictions as visualize_pixel_error_cnn,
+    visualize_predictions_binary as visualize_pixel_error_cnn,
     load_puzzles as load_raw_puzzles,
 )
 
