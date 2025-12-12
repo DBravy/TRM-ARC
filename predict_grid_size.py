@@ -153,7 +153,7 @@ class GridSizePredictor(nn.Module):
         """
         # Embed colors
         x = self.embed(x)  # (B, H, W, 16)
-        x = x.permute(0, 3, 1, 2)  # (B, 16, H, W)
+        x = x.permute(0, 3, 1, 2).contiguous()  # (B, 16, H, W)
         
         # CNN forward
         x = self.conv1(x)
@@ -161,7 +161,7 @@ class GridSizePredictor(nn.Module):
         x = self.conv3(x)
         
         # Flatten
-        x = x.view(x.size(0), -1)  # (B, hidden_dim * 4)
+        x = x.reshape(x.size(0), -1)  # (B, hidden_dim * 4)
         
         # Predict dimensions
         height_logits = self.height_head(x)
@@ -310,12 +310,33 @@ def evaluate(model, examples, device):
 
 def load_puzzle(puzzle_id: str, data_root: str = "kaggle/combined") -> Dict:
     """Load a puzzle by ID from combined dataset."""
-    for dataset in ["arc-agi-1", "arc-agi-2", "arc-agi-3"]:
-        for split in ["training", "evaluation"]:
-            path = os.path.join(data_root, dataset, split, f"{puzzle_id}.json")
-            if os.path.exists(path):
-                with open(path) as f:
-                    return json.load(f)
+    # Load from the combined JSON files (same format as train_pixel_error_cnn.py)
+    subsets = ["training", "evaluation", "training2", "evaluation2"]
+    
+    for subset in subsets:
+        challenges_path = os.path.join(data_root, f"arc-agi_{subset}_challenges.json")
+        solutions_path = os.path.join(data_root, f"arc-agi_{subset}_solutions.json")
+        
+        if not os.path.exists(challenges_path):
+            continue
+        
+        with open(challenges_path) as f:
+            puzzles = json.load(f)
+        
+        if puzzle_id in puzzles:
+            puzzle = puzzles[puzzle_id]
+            
+            # Load solutions if available
+            if os.path.exists(solutions_path):
+                with open(solutions_path) as f:
+                    solutions = json.load(f)
+                if puzzle_id in solutions:
+                    for i, sol in enumerate(solutions[puzzle_id]):
+                        if i < len(puzzle["test"]):
+                            puzzle["test"][i]["output"] = sol
+            
+            return puzzle
+    
     raise FileNotFoundError(f"Puzzle {puzzle_id} not found in {data_root}")
 
 
@@ -343,8 +364,14 @@ def main():
     train_examples = puzzle['train']
     test_examples = puzzle['test']
     
+    # Check if test examples have outputs
+    test_has_outputs = all('output' in ex for ex in test_examples)
+    if not test_has_outputs:
+        print("Warning: Test examples don't have outputs (solutions not available)")
+        print("Will only evaluate on training examples\n")
+    
     print(f"\nTraining examples: {len(train_examples)}")
-    print(f"Test examples: {len(test_examples)}")
+    print(f"Test examples: {len(test_examples)} {'(with outputs)' if test_has_outputs else '(no outputs)'}")
     
     # Show ground truth sizes
     print("\nGround truth output sizes:")
@@ -353,11 +380,12 @@ def main():
         out = np.array(ex['output'])
         inp = np.array(ex['input'])
         print(f"    Example {i}: input {inp.shape} -> output {out.shape}")
-    print("  Test:")
-    for i, ex in enumerate(test_examples):
-        out = np.array(ex['output'])
-        inp = np.array(ex['input'])
-        print(f"    Example {i}: input {inp.shape} -> output {out.shape}")
+    if test_has_outputs:
+        print("  Test:")
+        for i, ex in enumerate(test_examples):
+            out = np.array(ex['output'])
+            inp = np.array(ex['input'])
+            print(f"    Example {i}: input {inp.shape} -> output {out.shape}")
     
     # Create dataset and loader
     train_dataset = GridSizeDataset(train_examples, augment=True, num_augments=args.num_augments)
@@ -407,34 +435,44 @@ def main():
     print(f"\nTraining accuracy: {train_correct}/{len(train_results)}")
     
     # Evaluate on test examples
-    print("\n" + "=" * 60)
-    print("Evaluation on TEST Examples (generalization)")
-    print("=" * 60)
-    
-    test_results = evaluate(model, test_examples, DEVICE)
-    for i, r in enumerate(test_results):
-        status = "✓" if r['both_correct'] else "✗"
-        print(f"  Example {i}: true=({r['true_h']}, {r['true_w']}), "
-              f"pred=({r['pred_h']}, {r['pred_w']}) {status}")
-    
-    test_correct = sum(r['both_correct'] for r in test_results)
-    print(f"\nTest accuracy: {test_correct}/{len(test_results)}")
+    if test_has_outputs:
+        print("\n" + "=" * 60)
+        print("Evaluation on TEST Examples (generalization)")
+        print("=" * 60)
+        
+        test_results = evaluate(model, test_examples, DEVICE)
+        for i, r in enumerate(test_results):
+            status = "✓" if r['both_correct'] else "✗"
+            print(f"  Example {i}: true=({r['true_h']}, {r['true_w']}), "
+                  f"pred=({r['pred_h']}, {r['pred_w']}) {status}")
+        
+        test_correct = sum(r['both_correct'] for r in test_results)
+        print(f"\nTest accuracy: {test_correct}/{len(test_results)}")
+    else:
+        test_correct = 0
+        test_results = []
     
     # Summary
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
     print(f"Training: {train_correct}/{len(train_results)} correct")
-    print(f"Test:     {test_correct}/{len(test_results)} correct")
-    
-    if test_correct == len(test_results):
-        print("\n✓ Perfect generalization! The network learned the size rule.")
-    elif train_correct == len(train_results) and test_correct == 0:
-        print("\n✗ Memorized training but failed to generalize.")
-    elif train_correct < len(train_results):
-        print("\n✗ Couldn't even fit training data.")
+    if test_has_outputs:
+        print(f"Test:     {test_correct}/{len(test_results)} correct")
+        
+        if test_correct == len(test_results):
+            print("\n✓ Perfect generalization! The network learned the size rule.")
+        elif train_correct == len(train_results) and test_correct == 0:
+            print("\n✗ Memorized training but failed to generalize.")
+        elif train_correct < len(train_results):
+            print("\n✗ Couldn't even fit training data.")
+        else:
+            print("\n~ Partial generalization.")
     else:
-        print("\n~ Partial generalization.")
+        if train_correct == len(train_results):
+            print("\n✓ Fit training data. (No test outputs to verify generalization)")
+        else:
+            print("\n✗ Couldn't fit training data.")
 
 
 if __name__ == "__main__":
