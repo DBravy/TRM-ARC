@@ -303,6 +303,76 @@ class BottleneckAttention(nn.Module):
         return x_flat.transpose(1, 2).reshape(B, C, H, W)
 
 
+class FiLMModulation(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM) for injecting global context into skip connections.
+    
+    Takes a global context vector from the bottleneck and produces scale (γ) and shift (β)
+    parameters for each skip connection level. This allows global reasoning (e.g., "the blue
+    object is smallest") to directly influence all spatial locations in the decoder.
+    """
+    
+    def __init__(self, bottleneck_dim: int, skip_dims: list):
+        """
+        Args:
+            bottleneck_dim: Channel dimension of bottleneck (e.g., 512)
+            skip_dims: List of channel dimensions for skip connections [x3_ch, x2_ch, x1_ch]
+                       e.g., [256, 128, 64]
+        """
+        super().__init__()
+        
+        self.skip_dims = skip_dims
+        
+        # MLP to process global vector before generating modulation params
+        self.global_mlp = nn.Sequential(
+            nn.Linear(bottleneck_dim, bottleneck_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Separate heads for each skip level, each producing scale and shift
+        self.film_generators = nn.ModuleList([
+            nn.Linear(bottleneck_dim, dim * 2)  # *2 for both γ and β
+            for dim in skip_dims
+        ])
+        
+    def forward(self, bottleneck: torch.Tensor) -> list:
+        """
+        Args:
+            bottleneck: (B, C, H, W) bottleneck features (after attention)
+            
+        Returns:
+            List of (gamma, beta) tuples for each skip level
+        """
+        # Global average pool: (B, C, H, W) -> (B, C)
+        global_vec = bottleneck.mean(dim=(2, 3))
+        
+        # Process through MLP
+        global_vec = self.global_mlp(global_vec)
+        
+        # Generate modulation params for each skip level
+        modulation_params = []
+        for i, generator in enumerate(self.film_generators):
+            params = generator(global_vec)  # (B, dim*2)
+            gamma, beta = params.chunk(2, dim=-1)  # Each (B, dim)
+            
+            # Reshape for broadcasting: (B, dim) -> (B, dim, 1, 1)
+            gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+            beta = beta.unsqueeze(-1).unsqueeze(-1)
+            
+            # Initialize gamma around 1 (multiplicative identity)
+            # The linear layer will learn deviations from this
+            gamma = gamma + 1.0
+            
+            modulation_params.append((gamma, beta))
+            
+        return modulation_params
+    
+    @staticmethod
+    def apply_film(features: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        """Apply FiLM modulation: out = gamma * features + beta"""
+        return gamma * features + beta
+
+
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN with EXPLICIT comparison between input and output.
@@ -359,6 +429,12 @@ class PixelErrorCNN(nn.Module):
                 num_heads=attention_heads,
                 num_layers=attention_layers
             )
+            # FiLM modulation to inject global context into skip connections
+            # skip_dims: [x3 channels, x2 channels, x1 channels]
+            self.film = FiLMModulation(
+                bottleneck_dim=base_ch * 8,
+                skip_dims=[base_ch * 4, base_ch * 2, base_ch]
+            )
 
         # Output: 1 channel for binary, 10 channels for color prediction
         self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
@@ -387,6 +463,14 @@ class PixelErrorCNN(nn.Module):
         # Apply bottleneck attention for global reasoning (if enabled)
         if self.use_attention:
             x4 = self.bottleneck_attn(x4)
+            
+            # Generate FiLM modulation parameters from global context
+            film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
+            
+            # Modulate skip connections with global context
+            x3 = FiLMModulation.apply_film(x3, *film_params[0])
+            x2 = FiLMModulation.apply_film(x2, *film_params[1])
+            x1 = FiLMModulation.apply_film(x1, *film_params[2])
 
         x = self.up1(x4, x3)
         x = self.up2(x, x2)
