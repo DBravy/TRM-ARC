@@ -437,7 +437,8 @@ def initialize_trm_with_cnn(
     from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1InnerCarry
 
     # Access inner model: ACTLossHead -> ACTV1 -> Inner
-    inner = trm_model.model.model.inner
+    # ACTLossHead.model -> TinyRecursiveReasoningModel_ACTV1.inner
+    inner = trm_model.model.inner
 
     hidden_size = config_dict["hidden_size"]
     seq_len = config_dict["seq_len"]
@@ -505,7 +506,8 @@ def run_trm_forward(
         TRM predictions [30, 30] as colors (0-9)
     """
     # Access inner model
-    inner = trm_model.model.model.inner
+    # ACTLossHead.model -> TinyRecursiveReasoningModel_ACTV1.inner
+    inner = trm_model.model.inner
 
     # Create input batch
     h, w = input_grid.shape
