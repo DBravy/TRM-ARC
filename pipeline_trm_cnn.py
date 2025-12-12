@@ -135,7 +135,7 @@ def train_trm(
         "--L-cycles", str(L_cycles),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
-        "--eval-interval", str(max(1000, epochs)),  # Eval 10 times during training  # Disable wandb logging
+        "--eval-interval", str(max(1000, epochs)),  # Eval ~10 times during training
     ]
 
     if dynamic_iterations:
@@ -156,18 +156,45 @@ def train_trm(
     if result.returncode != 0:
         raise RuntimeError(f"TRM training failed with return code {result.returncode}")
 
-    # Find best checkpoint
-    best_path = os.path.join(checkpoint_dir, "best.pt")
-    if os.path.exists(best_path):
-        return best_path
+    # Find checkpoint using checkpoint_history.json (preferred)
+    history_path = os.path.join(checkpoint_dir, "checkpoint_history.json")
+    if os.path.exists(history_path):
+        with open(history_path) as f:
+            history = json.load(f)
 
-    # Fall back to most recent checkpoint
-    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(".pt")]
-    if not checkpoints:
-        raise RuntimeError(f"No checkpoints found in {checkpoint_dir}")
+        # Try best checkpoint first
+        if history.get("best"):
+            best_entry = history["best"][0]  # First is best (sorted by metric)
+            if os.path.exists(best_entry["path"]):
+                print(f"Found best checkpoint: {best_entry['path']}")
+                return best_entry["path"]
 
-    checkpoints.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
-    return os.path.join(checkpoint_dir, checkpoints[-1])
+        # Fall back to most recent
+        if history.get("recent"):
+            recent_entry = history["recent"][0]  # First is most recent
+            if os.path.exists(recent_entry["path"]):
+                print(f"Found recent checkpoint: {recent_entry['path']}")
+                return recent_entry["path"]
+
+    # Fall back to scanning directory for step_* files
+    if os.path.exists(checkpoint_dir):
+        all_files = os.listdir(checkpoint_dir)
+        print(f"Files in {checkpoint_dir}: {all_files}")
+
+        checkpoints = [f for f in all_files
+                      if f.startswith("step_") and not f.endswith(".json")]
+        if checkpoints:
+            # Sort by step number
+            checkpoints.sort(key=lambda x: int(x.split("_")[1]) if x.split("_")[1].isdigit() else 0, reverse=True)
+            checkpoint_path = os.path.join(checkpoint_dir, checkpoints[0])
+            print(f"Found checkpoint by scanning: {checkpoint_path}")
+            return checkpoint_path
+
+    raise RuntimeError(
+        f"No checkpoints found in {checkpoint_dir}. "
+        f"This can happen if training was interrupted before the first eval. "
+        f"Try reducing --eval-interval or increasing --trm-epochs."
+    )
 
 
 # =============================================================================
