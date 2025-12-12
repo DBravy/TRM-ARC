@@ -245,6 +245,23 @@ class Up(nn.Module):
         return self.conv(x)
 
 
+class UpNoSkip(nn.Module):
+    """Decoder block without skip connections - forces all info through bottleneck."""
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = DoubleConv(out_ch, out_ch)
+
+    def forward(self, x, target_size=None):
+        x = self.up(x)
+        if target_size is not None:
+            diff_h = target_size[0] - x.size(2)
+            diff_w = target_size[1] - x.size(3)
+            x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2,
+                         diff_h // 2, diff_h - diff_h // 2])
+        return self.conv(x)
+
+
 class BottleneckAttention(nn.Module):
     """
     Self-attention over spatial positions at the U-Net bottleneck.
@@ -373,6 +390,166 @@ class FiLMModulation(nn.Module):
         return gamma * features + beta
 
 
+class DilatedConvBlock(nn.Module):
+    """Convolutional block with configurable dilation for growing receptive field without downsampling."""
+    
+    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
+        super().__init__()
+        # Padding must equal dilation for 3x3 kernel to maintain spatial size
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Residual connection if dimensions match
+        self.residual = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    
+    def forward(self, x):
+        return self.conv(x) + self.residual(x)
+
+
+class FullResolutionCNN(nn.Module):
+    """
+    CNN that maintains full 30x30 resolution throughout, using dilated convolutions
+    to grow receptive field without spatial downsampling.
+    
+    This allows attention to operate over 900 pixel positions rather than 9 spatial
+    regions, potentially enabling better object-level reasoning.
+    
+    Architecture:
+    - Dilated conv blocks grow receptive field: 1 -> 2 -> 4 -> 8
+    - After sufficient RF, apply self-attention at full resolution
+    - Final conv layers to produce output
+    
+    Receptive field growth with dilation:
+    - dilation=1: 3x3 kernel sees 3x3 (RF grows by 2 per layer)
+    - dilation=2: 3x3 kernel sees 5x5 effective spacing
+    - dilation=4: 3x3 kernel sees 9x9 effective spacing
+    - etc.
+    """
+    
+    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 10,
+                 attention_heads: int = 8, attention_layers: int = 2):
+        super().__init__()
+        
+        self.force_comparison = force_comparison
+        self.num_classes = num_classes
+        
+        # Color embeddings for both grids
+        self.input_embed = nn.Embedding(NUM_COLORS, 16)
+        self.output_embed = nn.Embedding(NUM_COLORS, 16)
+        
+        # Input channels: 64 if force_comparison, else 32
+        if force_comparison:
+            in_channels = 64
+        else:
+            in_channels = 32
+        
+        # Dilated conv blocks - no downsampling, grow receptive field via dilation
+        # RF after each block (cumulative):
+        # Block 1 (d=1): ~5x5
+        # Block 2 (d=2): ~13x13  
+        # Block 3 (d=4): ~29x29 (covers full 30x30 grid)
+        # Block 4 (d=8): ~61x61 (redundant but adds depth)
+        self.conv1 = DilatedConvBlock(in_channels, hidden_dim, dilation=1)
+        self.conv2 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2)
+        self.conv3 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
+        self.conv4 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=8)
+        
+        # Self-attention at full resolution (30x30 = 900 tokens)
+        self.attention = BottleneckAttention(
+            dim=hidden_dim,
+            num_heads=attention_heads,
+            num_layers=attention_layers
+        )
+        
+        # Post-attention conv blocks
+        self.conv5 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
+        self.conv6 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2)
+        self.conv7 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=1)
+        
+        # Output head
+        self.outc = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+    
+    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        # Embed both grids
+        inp_emb = self.input_embed(input_grid)   # (B, H, W, 16)
+        out_emb = self.output_embed(output_grid) # (B, H, W, 16)
+        
+        if self.force_comparison:
+            diff = inp_emb - out_emb
+            prod = inp_emb * out_emb
+            x = torch.cat([inp_emb, out_emb, diff, prod], dim=-1)  # (B, H, W, 64)
+        else:
+            x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, H, W, 32)
+        
+        x = x.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        
+        # Dilated convolutions - grow receptive field while maintaining resolution
+        x = self.conv1(x)  # (B, hidden_dim, 30, 30)
+        x = self.conv2(x)  # (B, hidden_dim, 30, 30)
+        x = self.conv3(x)  # (B, hidden_dim, 30, 30)
+        x = self.conv4(x)  # (B, hidden_dim, 30, 30)
+        
+        # Full-resolution attention (900 tokens)
+        x = self.attention(x)  # (B, hidden_dim, 30, 30)
+        
+        # Post-attention processing
+        x = self.conv5(x)
+        x = self.conv6(x)
+        x = self.conv7(x)
+        
+        # Output
+        logits = self.outc(x)  # (B, num_classes, 30, 30)
+        
+        if self.num_classes == 1:
+            return logits.squeeze(1)  # (B, H, W) for binary
+        else:
+            return logits  # (B, 10, H, W) for color prediction
+    
+    def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        logits = self.forward(input_grid, output_grid)
+        if self.num_classes == 1:
+            return torch.sigmoid(logits)
+        else:
+            return F.softmax(logits, dim=1)
+    
+    def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
+        logits = self.forward(input_grid, output_grid)
+        if self.num_classes == 1:
+            raise ValueError("predict_colors only valid for color mode (num_classes=10)")
+        return logits.argmax(dim=1)
+    
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
+        checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
+        args = checkpoint.get('args', {})
+        hidden_dim = args.get('hidden_dim', 64)
+        force_comparison = args.get('force_comparison', True)
+        mode = args.get('mode', 'color')
+        num_classes = 10 if mode == 'color' else 1
+        attention_heads = args.get('attention_heads', 8)
+        attention_layers = args.get('attention_layers', 2)
+        
+        model = cls(
+            hidden_dim=hidden_dim,
+            force_comparison=force_comparison,
+            num_classes=num_classes,
+            attention_heads=attention_heads,
+            attention_layers=attention_layers
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        if device:
+            model = model.to(device)
+        return model
+
+
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN with EXPLICIT comparison between input and output.
@@ -391,12 +568,14 @@ class PixelErrorCNN(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
-                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1):
+                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1,
+                 no_skip: bool = False):
         super().__init__()
         
         self.force_comparison = force_comparison
         self.num_classes = num_classes
         self.use_attention = use_attention
+        self.no_skip = no_skip
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -418,9 +597,16 @@ class PixelErrorCNN(nn.Module):
         self.down3 = Down(base_ch * 4, base_ch * 8)
 
         # Decoder
-        self.up1 = Up(base_ch * 8, base_ch * 4)
-        self.up2 = Up(base_ch * 4, base_ch * 2)
-        self.up3 = Up(base_ch * 2, base_ch)
+        if no_skip:
+            # No skip connections - all info must flow through bottleneck
+            self.up1 = UpNoSkip(base_ch * 8, base_ch * 4)
+            self.up2 = UpNoSkip(base_ch * 4, base_ch * 2)
+            self.up3 = UpNoSkip(base_ch * 2, base_ch)
+        else:
+            # Standard U-Net with skip connections
+            self.up1 = Up(base_ch * 8, base_ch * 4)
+            self.up2 = Up(base_ch * 4, base_ch * 2)
+            self.up3 = Up(base_ch * 2, base_ch)
 
         # Optional bottleneck attention for global reasoning
         if use_attention:
@@ -429,12 +615,12 @@ class PixelErrorCNN(nn.Module):
                 num_heads=attention_heads,
                 num_layers=attention_layers
             )
-            # FiLM modulation to inject global context into skip connections
-            # skip_dims: [x3 channels, x2 channels, x1 channels]
-            self.film = FiLMModulation(
-                bottleneck_dim=base_ch * 8,
-                skip_dims=[base_ch * 4, base_ch * 2, base_ch]
-            )
+            # FiLM modulation to inject global context into skip connections (only if using skips)
+            if not no_skip:
+                self.film = FiLMModulation(
+                    bottleneck_dim=base_ch * 8,
+                    skip_dims=[base_ch * 4, base_ch * 2, base_ch]
+                )
 
         # Output: 1 channel for binary, 10 channels for color prediction
         self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
@@ -464,17 +650,26 @@ class PixelErrorCNN(nn.Module):
         if self.use_attention:
             x4 = self.bottleneck_attn(x4)
             
-            # Generate FiLM modulation parameters from global context
-            film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
-            
-            # Modulate skip connections with global context
-            x3 = FiLMModulation.apply_film(x3, *film_params[0])
-            x2 = FiLMModulation.apply_film(x2, *film_params[1])
-            x1 = FiLMModulation.apply_film(x1, *film_params[2])
+            # Generate FiLM modulation parameters from global context (only if using skip connections)
+            if not self.no_skip:
+                film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
+                
+                # Modulate skip connections with global context
+                x3 = FiLMModulation.apply_film(x3, *film_params[0])
+                x2 = FiLMModulation.apply_film(x2, *film_params[1])
+                x1 = FiLMModulation.apply_film(x1, *film_params[2])
 
-        x = self.up1(x4, x3)
-        x = self.up2(x, x2)
-        x = self.up3(x, x1)
+        # Decoder
+        if self.no_skip:
+            # No skip connections - pass target sizes for proper upsampling
+            x = self.up1(x4, target_size=(x3.size(2), x3.size(3)))
+            x = self.up2(x, target_size=(x2.size(2), x2.size(3)))
+            x = self.up3(x, target_size=(x1.size(2), x1.size(3)))
+        else:
+            # Standard U-Net with skip connections
+            x = self.up1(x4, x3)
+            x = self.up2(x, x2)
+            x = self.up3(x, x1)
 
         logits = self.outc(x)
         
@@ -512,6 +707,8 @@ class PixelErrorCNN(nn.Module):
         use_attention = args.get('use_attention', False)
         attention_heads = args.get('attention_heads', 8)
         attention_layers = args.get('attention_layers', 1)
+        # Skip connection parameter
+        no_skip = args.get('no_skip', False)
         
         model = cls(
             hidden_dim=hidden_dim,
@@ -519,7 +716,8 @@ class PixelErrorCNN(nn.Module):
             num_classes=num_classes,
             use_attention=use_attention,
             attention_heads=attention_heads,
-            attention_layers=attention_layers
+            attention_layers=attention_layers,
+            no_skip=no_skip
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1663,6 +1861,12 @@ def main():
                         help="Number of attention heads (default: 8)")
     parser.add_argument("--attention-layers", type=int, default=1,
                         help="Number of attention layers at bottleneck (default: 1)")
+    parser.add_argument("--no-skip", action="store_true",
+                        help="Remove skip connections - forces all info through bottleneck")
+    
+    # Full resolution architecture (no downsampling)
+    parser.add_argument("--full-resolution", action="store_true",
+                        help="Use FullResolutionCNN instead of U-Net (no downsampling, dilated convs, attention at 30x30)")
 
     args = parser.parse_args()
 
@@ -1847,21 +2051,40 @@ def main():
     print("\nCreating model...")
     force_comparison = not args.no_force_comparison
     num_classes = 10 if args.mode == "color" else 1
-    model = PixelErrorCNN(
-        hidden_dim=args.hidden_dim,
-        force_comparison=force_comparison,
-        num_classes=num_classes,
-        use_attention=args.use_attention,
-        attention_heads=args.attention_heads,
-        attention_layers=args.attention_layers
-    )
+    
+    if args.full_resolution:
+        # Full resolution architecture - no downsampling, dilated convs, attention at 30x30
+        print("Architecture: FullResolutionCNN (no downsampling)")
+        model = FullResolutionCNN(
+            hidden_dim=args.hidden_dim,
+            force_comparison=force_comparison,
+            num_classes=num_classes,
+            attention_heads=args.attention_heads,
+            attention_layers=args.attention_layers
+        )
+    else:
+        # Standard U-Net architecture
+        print("Architecture: U-Net")
+        model = PixelErrorCNN(
+            hidden_dim=args.hidden_dim,
+            force_comparison=force_comparison,
+            num_classes=num_classes,
+            use_attention=args.use_attention,
+            attention_heads=args.attention_heads,
+            attention_layers=args.attention_layers,
+            no_skip=args.no_skip
+        )
     model = model.to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
     print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
-    if args.use_attention:
+    if args.full_resolution:
+        print(f"Full-resolution attention: {args.attention_layers} layer(s), {args.attention_heads} heads over 900 tokens")
+    elif args.use_attention:
         print(f"Bottleneck attention: {args.attention_layers} layer(s), {args.attention_heads} heads")
+    if args.no_skip and not args.full_resolution:
+        print("Skip connections: DISABLED (all info flows through bottleneck)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
