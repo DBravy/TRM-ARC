@@ -245,6 +245,64 @@ class Up(nn.Module):
         return self.conv(x)
 
 
+class BottleneckAttention(nn.Module):
+    """
+    Self-attention over spatial positions at the U-Net bottleneck.
+    
+    This allows global reasoning: each spatial position can query all others,
+    enabling comparisons like "am I the smallest object?" or "am I symmetric?"
+    that require global context rather than local convolutions.
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.num_layers = num_layers
+        
+        # Stack multiple attention layers if requested
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'norm': nn.LayerNorm(dim),
+                'qkv': nn.Linear(dim, dim * 3),
+                'proj': nn.Linear(dim, dim),
+            })
+            for _ in range(num_layers)
+        ])
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        
+        # Flatten spatial dims: (B, C, H*W) -> (B, H*W, C)
+        x_flat = x.flatten(2).transpose(1, 2)
+        
+        for layer in self.layers:
+            # Self-attention with residual
+            residual = x_flat
+            x_norm = layer['norm'](x_flat)
+            
+            # Compute Q, K, V
+            qkv = layer['qkv'](x_norm).reshape(B, H*W, 3, self.num_heads, self.head_dim)
+            qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            
+            # Attention
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            
+            # Apply attention to values
+            out = (attn @ v).transpose(1, 2).reshape(B, H*W, C)
+            out = layer['proj'](out)
+            
+            # Residual connection
+            x_flat = residual + out
+        
+        # Reshape back to spatial
+        return x_flat.transpose(1, 2).reshape(B, C, H, W)
+
+
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN with EXPLICIT comparison between input and output.
@@ -262,11 +320,13 @@ class PixelErrorCNN(nn.Module):
     - color (num_classes=10): Predict what color each pixel SHOULD be
     """
 
-    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1):
+    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
+                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1):
         super().__init__()
         
         self.force_comparison = force_comparison
         self.num_classes = num_classes
+        self.use_attention = use_attention
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -292,6 +352,14 @@ class PixelErrorCNN(nn.Module):
         self.up2 = Up(base_ch * 4, base_ch * 2)
         self.up3 = Up(base_ch * 2, base_ch)
 
+        # Optional bottleneck attention for global reasoning
+        if use_attention:
+            self.bottleneck_attn = BottleneckAttention(
+                dim=base_ch * 8,
+                num_heads=attention_heads,
+                num_layers=attention_layers
+            )
+
         # Output: 1 channel for binary, 10 channels for color prediction
         self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
 
@@ -315,6 +383,10 @@ class PixelErrorCNN(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
+
+        # Apply bottleneck attention for global reasoning (if enabled)
+        if self.use_attention:
+            x4 = self.bottleneck_attn(x4)
 
         x = self.up1(x4, x3)
         x = self.up2(x, x2)
@@ -352,8 +424,19 @@ class PixelErrorCNN(nn.Module):
         # Support both old checkpoints (binary only) and new ones
         mode = args.get('mode', 'binary')
         num_classes = 10 if mode == 'color' else 1
+        # Attention parameters
+        use_attention = args.get('use_attention', False)
+        attention_heads = args.get('attention_heads', 8)
+        attention_layers = args.get('attention_layers', 1)
         
-        model = cls(hidden_dim=hidden_dim, force_comparison=force_comparison, num_classes=num_classes)
+        model = cls(
+            hidden_dim=hidden_dim,
+            force_comparison=force_comparison,
+            num_classes=num_classes,
+            use_attention=use_attention,
+            attention_heads=attention_heads,
+            attention_layers=attention_layers
+        )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         
@@ -1489,6 +1572,14 @@ def main():
     parser.add_argument("--recursive-iters", type=int, default=1,
                         help="Number of recursive iterations for evaluation (1 = no recursion)")
 
+    # Bottleneck attention for global reasoning
+    parser.add_argument("--use-attention", action="store_true",
+                        help="Add self-attention at U-Net bottleneck for global reasoning")
+    parser.add_argument("--attention-heads", type=int, default=8,
+                        help="Number of attention heads (default: 8)")
+    parser.add_argument("--attention-layers", type=int, default=1,
+                        help="Number of attention layers at bottleneck (default: 1)")
+
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -1672,12 +1763,21 @@ def main():
     print("\nCreating model...")
     force_comparison = not args.no_force_comparison
     num_classes = 10 if args.mode == "color" else 1
-    model = PixelErrorCNN(hidden_dim=args.hidden_dim, force_comparison=force_comparison, num_classes=num_classes)
+    model = PixelErrorCNN(
+        hidden_dim=args.hidden_dim,
+        force_comparison=force_comparison,
+        num_classes=num_classes,
+        use_attention=args.use_attention,
+        attention_heads=args.attention_heads,
+        attention_layers=args.attention_layers
+    )
     model = model.to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
     print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
+    if args.use_attention:
+        print(f"Bottleneck attention: {args.attention_layers} layer(s), {args.attention_heads} heads")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
