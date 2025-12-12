@@ -245,6 +245,23 @@ class Up(nn.Module):
         return self.conv(x)
 
 
+class UpNoSkip(nn.Module):
+    """Decoder block without skip connections - forces all info through bottleneck."""
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = DoubleConv(out_ch, out_ch)
+
+    def forward(self, x, target_size=None):
+        x = self.up(x)
+        if target_size is not None:
+            diff_h = target_size[0] - x.size(2)
+            diff_w = target_size[1] - x.size(3)
+            x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2,
+                         diff_h // 2, diff_h - diff_h // 2])
+        return self.conv(x)
+
+
 class BottleneckAttention(nn.Module):
     """
     Self-attention over spatial positions at the U-Net bottleneck.
@@ -391,12 +408,14 @@ class PixelErrorCNN(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
-                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1):
+                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1,
+                 no_skip: bool = False):
         super().__init__()
         
         self.force_comparison = force_comparison
         self.num_classes = num_classes
         self.use_attention = use_attention
+        self.no_skip = no_skip
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -418,9 +437,16 @@ class PixelErrorCNN(nn.Module):
         self.down3 = Down(base_ch * 4, base_ch * 8)
 
         # Decoder
-        self.up1 = Up(base_ch * 8, base_ch * 4)
-        self.up2 = Up(base_ch * 4, base_ch * 2)
-        self.up3 = Up(base_ch * 2, base_ch)
+        if no_skip:
+            # No skip connections - all info must flow through bottleneck
+            self.up1 = UpNoSkip(base_ch * 8, base_ch * 4)
+            self.up2 = UpNoSkip(base_ch * 4, base_ch * 2)
+            self.up3 = UpNoSkip(base_ch * 2, base_ch)
+        else:
+            # Standard U-Net with skip connections
+            self.up1 = Up(base_ch * 8, base_ch * 4)
+            self.up2 = Up(base_ch * 4, base_ch * 2)
+            self.up3 = Up(base_ch * 2, base_ch)
 
         # Optional bottleneck attention for global reasoning
         if use_attention:
@@ -429,12 +455,12 @@ class PixelErrorCNN(nn.Module):
                 num_heads=attention_heads,
                 num_layers=attention_layers
             )
-            # FiLM modulation to inject global context into skip connections
-            # skip_dims: [x3 channels, x2 channels, x1 channels]
-            self.film = FiLMModulation(
-                bottleneck_dim=base_ch * 8,
-                skip_dims=[base_ch * 4, base_ch * 2, base_ch]
-            )
+            # FiLM modulation to inject global context into skip connections (only if using skips)
+            if not no_skip:
+                self.film = FiLMModulation(
+                    bottleneck_dim=base_ch * 8,
+                    skip_dims=[base_ch * 4, base_ch * 2, base_ch]
+                )
 
         # Output: 1 channel for binary, 10 channels for color prediction
         self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
@@ -464,17 +490,26 @@ class PixelErrorCNN(nn.Module):
         if self.use_attention:
             x4 = self.bottleneck_attn(x4)
             
-            # Generate FiLM modulation parameters from global context
-            film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
-            
-            # Modulate skip connections with global context
-            x3 = FiLMModulation.apply_film(x3, *film_params[0])
-            x2 = FiLMModulation.apply_film(x2, *film_params[1])
-            x1 = FiLMModulation.apply_film(x1, *film_params[2])
+            # Generate FiLM modulation parameters from global context (only if using skip connections)
+            if not self.no_skip:
+                film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
+                
+                # Modulate skip connections with global context
+                x3 = FiLMModulation.apply_film(x3, *film_params[0])
+                x2 = FiLMModulation.apply_film(x2, *film_params[1])
+                x1 = FiLMModulation.apply_film(x1, *film_params[2])
 
-        x = self.up1(x4, x3)
-        x = self.up2(x, x2)
-        x = self.up3(x, x1)
+        # Decoder
+        if self.no_skip:
+            # No skip connections - pass target sizes for proper upsampling
+            x = self.up1(x4, target_size=(x3.size(2), x3.size(3)))
+            x = self.up2(x, target_size=(x2.size(2), x2.size(3)))
+            x = self.up3(x, target_size=(x1.size(2), x1.size(3)))
+        else:
+            # Standard U-Net with skip connections
+            x = self.up1(x4, x3)
+            x = self.up2(x, x2)
+            x = self.up3(x, x1)
 
         logits = self.outc(x)
         
@@ -512,6 +547,8 @@ class PixelErrorCNN(nn.Module):
         use_attention = args.get('use_attention', False)
         attention_heads = args.get('attention_heads', 8)
         attention_layers = args.get('attention_layers', 1)
+        # Skip connection parameter
+        no_skip = args.get('no_skip', False)
         
         model = cls(
             hidden_dim=hidden_dim,
@@ -519,7 +556,8 @@ class PixelErrorCNN(nn.Module):
             num_classes=num_classes,
             use_attention=use_attention,
             attention_heads=attention_heads,
-            attention_layers=attention_layers
+            attention_layers=attention_layers,
+            no_skip=no_skip
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1663,6 +1701,8 @@ def main():
                         help="Number of attention heads (default: 8)")
     parser.add_argument("--attention-layers", type=int, default=1,
                         help="Number of attention layers at bottleneck (default: 1)")
+    parser.add_argument("--no-skip", action="store_true",
+                        help="Remove skip connections - forces all info through bottleneck")
 
     args = parser.parse_args()
 
@@ -1853,7 +1893,8 @@ def main():
         num_classes=num_classes,
         use_attention=args.use_attention,
         attention_heads=args.attention_heads,
-        attention_layers=args.attention_layers
+        attention_layers=args.attention_layers,
+        no_skip=args.no_skip
     )
     model = model.to(DEVICE)
 
@@ -1862,6 +1903,8 @@ def main():
     print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
     if args.use_attention:
         print(f"Bottleneck attention: {args.attention_layers} layer(s), {args.attention_heads} heads")
+    if args.no_skip:
+        print("Skip connections: DISABLED (all info flows through bottleneck)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
