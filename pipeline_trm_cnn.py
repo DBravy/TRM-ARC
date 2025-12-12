@@ -135,7 +135,7 @@ def train_trm(
         "--L-cycles", str(L_cycles),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
-        "--eval-interval", str(max(1000, epochs)),  # Eval ~10 times during training
+        "--eval-interval", str(max(1000, epochs)),
     ]
 
     if dynamic_iterations:
@@ -292,12 +292,19 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
             puzzle_emb_ndim = state_dict[key].shape[-1]
             break
 
-    # Get num_puzzle_identifiers
-    num_puzzle_identifiers = 1  # Single puzzle
+    # Get num_puzzle_identifiers from puzzle_emb weights
+    # Note: key could be "puzzle_emb.weights" or "puzzle_emb.embedding_weight"
+    num_puzzle_identifiers = 1  # Default
     for key in state_dict.keys():
-        if "puzzle_emb" in key and "embedding_weight" in key:
+        if "puzzle_emb" in key and ("weights" in key or "embedding_weight" in key):
             num_puzzle_identifiers = state_dict[key].shape[0]
+            print(f"  Detected num_puzzle_identifiers={num_puzzle_identifiers} from {key}")
             break
+
+    # Check if checkpoint has embedded CNN (from dynamic_iterations training)
+    has_embedded_cnn = any("correctness_cnn" in key for key in state_dict.keys())
+    if has_embedded_cnn:
+        print(f"  Checkpoint has embedded correctness_cnn, will initialize with 'init'")
 
     dtype_str = "bfloat16" if DTYPE == torch.bfloat16 else "float32"
 
@@ -325,7 +332,8 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
         "mlp_t": False,
         "no_ACT_continue": True,
         "causal": False,
-        "cnn_checkpoint_path": None,
+        # If checkpoint has CNN, we need to create one to load the weights
+        "cnn_checkpoint_path": "init" if has_embedded_cnn else None,
         "cnn_freeze_threshold": 0.5,
         "cnn_loss_weight": 0.0,
         "cnn_freeze_warmup_steps": 0,
