@@ -508,6 +508,196 @@ class SinglePuzzleDataset(Dataset):
         )
 
 
+class MultiPuzzleDataset(Dataset):
+    """
+    Dataset for training on ALL puzzles' training examples together.
+    Each puzzle uses its own augmentation strategy (auto-detected or manual).
+
+    Matches the negative sampling strategy of SinglePuzzleDataset.
+    """
+
+    def __init__(
+        self,
+        puzzles: Dict[str, Dict],
+        num_positives: int = 2,
+        num_corrupted: int = 3,
+        num_wrong_input: int = 1,
+        num_mismatched_aug: int = 1,
+        num_all_zeros: int = 1,
+        num_constant_fill: int = 1,
+        num_random_noise: int = 1,
+        num_color_swap: int = 1,
+        auto_augment: bool = True,
+        dihedral_only: bool = True,  # fallback if auto_augment=False
+    ):
+        self.num_positives = num_positives
+        self.num_corrupted = num_corrupted
+        self.num_wrong_input = num_wrong_input
+        self.num_mismatched_aug = num_mismatched_aug
+        self.num_all_zeros = num_all_zeros
+        self.num_constant_fill = num_constant_fill
+        self.num_random_noise = num_random_noise
+        self.num_color_swap = num_color_swap
+
+        self.samples_per_example = (
+            num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
+            num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
+        )
+
+        # Collect all training examples with their augmentation strategies
+        # Each entry: (puzzle_id, example_idx, input_grid, output_grid, dihedral_only)
+        self.examples = []
+        self.puzzle_examples = {}  # puzzle_id -> list of (input, output) for wrong_input sampling
+
+        for puzzle_id, puzzle in puzzles.items():
+            train_examples = puzzle.get("train", [])
+            if not train_examples:
+                continue
+
+            # Determine augmentation strategy for this puzzle
+            if auto_augment:
+                palette_analysis = analyze_puzzle_palettes(puzzle)
+                use_dihedral_only = (palette_analysis["recommendation"] == "dihedral_only")
+            else:
+                use_dihedral_only = dihedral_only
+
+            puzzle_exs = []
+            for ex_idx, example in enumerate(train_examples):
+                inp = np.array(example["input"], dtype=np.uint8)
+                out = np.array(example["output"], dtype=np.uint8)
+                self.examples.append((puzzle_id, ex_idx, inp, out, use_dihedral_only))
+                puzzle_exs.append((inp, out))
+
+            self.puzzle_examples[puzzle_id] = puzzle_exs
+
+    def __len__(self):
+        return len(self.examples) * self.samples_per_example
+
+    def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
+        h, w = grid.shape
+        padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        padded[:h, :w] = grid
+        return padded
+
+    def _get_augmentation(self, dihedral_only: bool):
+        trans_id = random.randint(0, 7)
+        if dihedral_only:
+            color_map = np.arange(10, dtype=np.uint8)
+        else:
+            color_map = random_color_permutation()
+        return trans_id, color_map
+
+    def _get_different_example(self, puzzle_id: str, exclude_idx: int):
+        """Get a different example from the same puzzle for wrong_input samples."""
+        puzzle_exs = self.puzzle_examples[puzzle_id]
+        if len(puzzle_exs) <= 1:
+            # Only one example, just return it (will be same but that's ok)
+            return puzzle_exs[0]
+        idx = random.randint(0, len(puzzle_exs) - 1)
+        while idx == exclude_idx:
+            idx = random.randint(0, len(puzzle_exs) - 1)
+        return puzzle_exs[idx]
+
+    def __getitem__(self, idx):
+        example_idx = idx // self.samples_per_example
+        sample_type_idx = idx % self.samples_per_example
+
+        puzzle_id, ex_idx, input_grid, correct_output, dihedral_only = self.examples[example_idx]
+
+        # Determine sample type (same logic as SinglePuzzleDataset)
+        pos_end = self.num_positives
+        corrupt_end = pos_end + self.num_corrupted
+        wrong_input_end = corrupt_end + self.num_wrong_input
+        mismatch_end = wrong_input_end + self.num_mismatched_aug
+        all_zeros_end = mismatch_end + self.num_all_zeros
+        const_fill_end = all_zeros_end + self.num_constant_fill
+        noise_end = const_fill_end + self.num_random_noise
+
+        if sample_type_idx < pos_end:
+            sample_type = "positive"
+        elif sample_type_idx < corrupt_end:
+            sample_type = "corrupted"
+        elif sample_type_idx < wrong_input_end:
+            sample_type = "wrong_input"
+        elif sample_type_idx < mismatch_end:
+            sample_type = "mismatched_aug"
+        elif sample_type_idx < all_zeros_end:
+            sample_type = "all_zeros"
+        elif sample_type_idx < const_fill_end:
+            sample_type = "constant_fill"
+        elif sample_type_idx < noise_end:
+            sample_type = "random_noise"
+        else:
+            sample_type = "color_swap"
+
+        # Generate sample based on type
+        if sample_type == "positive":
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = aug_output
+            target = aug_output
+
+        elif sample_type == "corrupted":
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = corrupt_output(aug_output)
+            target = aug_output
+
+        elif sample_type == "wrong_input":
+            wrong_inp, _ = self._get_different_example(puzzle_id, ex_idx)
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[wrong_inp], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = aug_output
+            target = aug_output
+
+        elif sample_type == "mismatched_aug":
+            trans_id_1, color_map_1 = self._get_augmentation(dihedral_only)
+            trans_id_2, color_map_2 = self._get_augmentation(dihedral_only)
+            while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
+                trans_id_2, color_map_2 = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map_1[input_grid], trans_id_1)
+            aug_output = dihedral_transform(color_map_2[correct_output], trans_id_2)
+            candidate = aug_output
+            target = dihedral_transform(color_map_1[correct_output], trans_id_1)
+
+        elif sample_type == "all_zeros":
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_all_zeros(aug_output)
+            target = aug_output
+
+        elif sample_type == "constant_fill":
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_constant_fill(aug_output)
+            target = aug_output
+
+        elif sample_type == "random_noise":
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_random_noise(aug_output)
+            target = aug_output
+
+        else:  # color_swap
+            trans_id, color_map = self._get_augmentation(dihedral_only)
+            aug_input = dihedral_transform(color_map[input_grid], trans_id)
+            aug_output = dihedral_transform(color_map[correct_output], trans_id)
+            candidate = generate_color_swap(aug_output)
+            target = aug_output
+
+        return (
+            torch.from_numpy(self._pad_grid(aug_input)).long(),
+            torch.from_numpy(self._pad_grid(candidate)).long(),
+            torch.from_numpy(self._pad_grid(target)).long(),
+        )
+
+
 # =============================================================================
 # Training and Evaluation
 # =============================================================================
@@ -607,7 +797,83 @@ def train_on_puzzle(
         
         if verbose and (epoch + 1) % 20 == 0:
             print(f"    Epoch {epoch+1}: loss={total_loss/len(loader):.4f}")
-    
+
+    return model
+
+
+def train_on_all_puzzles(
+    puzzles: Dict[str, Dict],
+    epochs: int = 100,
+    hidden_dim: int = 64,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    num_negatives: int = 8,
+    auto_augment: bool = True,
+    dihedral_only: bool = True,
+    verbose: bool = False,
+) -> nn.Module:
+    """Train a single CNN on ALL puzzles' training examples together.
+
+    Uses the same augmentation and negative sampling strategy as train_on_puzzle,
+    but combines all puzzles into one dataset.
+    """
+    # Distribute negatives (same logic as train_on_puzzle)
+    num_positives = max(1, num_negatives // 4)
+    num_corrupted = max(1, int(num_negatives * 0.35))
+    num_wrong_input = max(1, int(num_negatives * 0.15))
+    num_mismatched_aug = max(1, int(num_negatives * 0.15))
+    num_color_swap = max(1, int(num_negatives * 0.15))
+    remaining = num_negatives - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
+    num_all_zeros = max(1, remaining // 3)
+    num_constant_fill = max(1, remaining // 3)
+    num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+
+    dataset = MultiPuzzleDataset(
+        puzzles,
+        num_positives=num_positives,
+        num_corrupted=num_corrupted,
+        num_wrong_input=num_wrong_input,
+        num_mismatched_aug=num_mismatched_aug,
+        num_all_zeros=num_all_zeros,
+        num_constant_fill=num_constant_fill,
+        num_random_noise=num_random_noise,
+        num_color_swap=num_color_swap,
+        auto_augment=auto_augment,
+        dihedral_only=dihedral_only,
+    )
+
+    print(f"Multi-puzzle dataset: {len(dataset.examples)} training examples from {len(dataset.puzzle_examples)} puzzles")
+    print(f"Total samples per epoch: {len(dataset)}")
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        num_batches = 0
+        for inp, candidate, target in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+            inp = inp.to(DEVICE)
+            candidate = candidate.to(DEVICE)
+            target = target.to(DEVICE)
+
+            optimizer.zero_grad()
+            logits = model(inp, candidate)
+            loss = F.cross_entropy(logits, target)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            num_batches += 1
+
+        scheduler.step()
+        avg_loss = total_loss / max(num_batches, 1)
+
+        if verbose or (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}")
+
     return model
 
 
@@ -765,6 +1031,77 @@ def evaluate_on_test(model: nn.Module, puzzle: Dict, puzzle_id: str = "",
     }
 
 
+def evaluate_all_tests(
+    model: nn.Module,
+    puzzles: Dict[str, Dict],
+    visualize: bool = False,
+    verbose: bool = False,
+) -> Dict:
+    """
+    Evaluate a trained model on ALL puzzles' test examples.
+
+    Returns aggregate metrics and per-puzzle breakdown.
+    """
+    model.eval()
+
+    all_results = []
+    per_puzzle_results = {}
+
+    total_correct = 0
+    total_pixels = 0
+    total_perfect = 0
+    total_test_examples = 0
+
+    puzzle_ids = [pid for pid in puzzles.keys()
+                  if any("output" in ex for ex in puzzles[pid].get("test", []))]
+
+    for puzzle_id in tqdm(puzzle_ids, desc="Evaluating tests"):
+        puzzle = puzzles[puzzle_id]
+        eval_result = evaluate_on_test(
+            model, puzzle, puzzle_id=puzzle_id,
+            candidate_mode="zeros", visualize=visualize
+        )
+
+        if "error" in eval_result:
+            per_puzzle_results[puzzle_id] = {"error": eval_result["error"]}
+            continue
+
+        per_puzzle_results[puzzle_id] = {
+            "pixel_accuracy": eval_result["pixel_accuracy"],
+            "perfect_rate": eval_result["perfect_rate"],
+            "all_perfect": eval_result["all_perfect"],
+            "num_test_examples": eval_result["num_test_examples"],
+        }
+
+        # Aggregate stats
+        for r in eval_result["results"]:
+            total_correct += r["correct"]
+            total_pixels += r["total"]
+            if r["perfect"]:
+                total_perfect += 1
+            total_test_examples += 1
+
+        all_results.append(eval_result)
+
+        if verbose and eval_result["all_perfect"]:
+            print(f"  {puzzle_id}: PERFECT")
+
+    # Compute aggregate metrics
+    aggregate = {
+        "pixel_accuracy": total_correct / max(total_pixels, 1),
+        "perfect_example_rate": total_perfect / max(total_test_examples, 1),
+        "total_test_examples": total_test_examples,
+        "total_perfect_examples": total_perfect,
+        "num_puzzles_evaluated": len(all_results),
+        "num_puzzles_all_perfect": sum(1 for r in all_results if r["all_perfect"]),
+    }
+
+    return {
+        "aggregate": aggregate,
+        "per_puzzle": per_puzzle_results,
+    }
+
+
 @dataclass
 class PuzzleResult:
     puzzle_id: str
@@ -893,8 +1230,10 @@ def main():
                         help="Negatives per example (distributed across corruption types)")
     parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
     parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
-    parser.add_argument("--auto-augment", action="store_true", 
+    parser.add_argument("--auto-augment", action="store_true",
                         help="NEW: Automatically detect color semantics and choose augmentation strategy")
+    parser.add_argument("--multi-puzzle", action="store_true",
+                        help="Train single CNN on all puzzles together (vs per-puzzle training)")
     parser.add_argument("--negative-type", type=str, default="mixed",
                         choices=["mixed", "all_zeros", "corrupted", "random_noise", 
                                  "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
@@ -912,13 +1251,14 @@ def main():
     
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
-    print(f"Epochs per puzzle: {args.epochs}")
-    
+    print(f"Training mode: {'MULTI-PUZZLE (single CNN for all)' if args.multi_puzzle else 'PER-PUZZLE (one CNN each)'}")
+    print(f"Epochs: {args.epochs}")
+
     if args.auto_augment:
         print(f"Augmentation: AUTO (palette-based detection)")
     else:
         print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
-    
+
     print(f"Num negatives: {args.num_negatives}")
     print(f"Negative type: {args.negative_type}")
     print(f"Evaluation: Blank candidate (model must generate from scratch)")
@@ -926,146 +1266,243 @@ def main():
     # Load puzzles
     puzzles = load_puzzles(args.dataset, args.data_root)
     puzzle_ids = list(puzzles.keys())
-    
+
     # Filter to puzzles with test outputs
-    puzzle_ids = [pid for pid in puzzle_ids 
+    puzzle_ids = [pid for pid in puzzle_ids
                   if any("output" in ex for ex in puzzles[pid].get("test", []))]
-    
+
     if args.max_puzzles:
         random.shuffle(puzzle_ids)
         puzzle_ids = puzzle_ids[:args.max_puzzles]
-    
-    print(f"\nEvaluating {len(puzzle_ids)} puzzles...")
+        # Also filter the puzzles dict for multi-puzzle mode
+        puzzles = {pid: puzzles[pid] for pid in puzzle_ids}
+
+    print(f"\nTotal puzzles: {len(puzzle_ids)}")
     print("="*60)
-    
-    results: List[PuzzleResult] = []
-    
-    for puzzle_id in tqdm(puzzle_ids, desc="Puzzles"):
-        result = evaluate_puzzle(
-            puzzle_id, puzzles[puzzle_id],
+
+    # =========================================================================
+    # MULTI-PUZZLE MODE: Train single CNN on all puzzles, evaluate on all tests
+    # =========================================================================
+    if args.multi_puzzle:
+        print("\n[MULTI-PUZZLE MODE]")
+        print("Training single CNN on all puzzles together...")
+
+        start_time = time.time()
+        model = train_on_all_puzzles(
+            puzzles,
             epochs=args.epochs,
             hidden_dim=args.hidden_dim,
             num_negatives=args.num_negatives,
+            auto_augment=args.auto_augment,
             dihedral_only=args.dihedral_only,
-            negative_type=args.negative_type,
+            verbose=args.verbose,
+        )
+        train_time = time.time() - start_time
+
+        print(f"\nTraining completed in {train_time:.1f}s")
+        print("\nEvaluating on all test examples...")
+
+        eval_results = evaluate_all_tests(
+            model, puzzles,
             visualize=args.visualize,
             verbose=args.verbose,
-            auto_augment=args.auto_augment,  # NEW
         )
-        results.append(result)
-        
-        if args.verbose or result.all_perfect:
-            status = "✓ PERFECT" if result.all_perfect else f"✗ {result.pixel_accuracy:.1%}"
-            aug_info = f" [{result.augmentation_used}]" if args.auto_augment else ""
-            print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s){aug_info}")
-    
-    # Summary statistics
-    valid_results = [r for r in results if r.error is None]
-    perfect_results = [r for r in valid_results if r.all_perfect]
-    high_acc_results = [r for r in valid_results if r.pixel_accuracy >= 0.95]
-    
-    print("\n" + "="*60)
-    print("RESULTS SUMMARY")
-    print("="*60)
-    print(f"Total puzzles evaluated: {len(puzzle_ids)}")
-    print(f"Valid evaluations: {len(valid_results)}")
-    print(f"Perfect generalization (100%): {len(perfect_results)} ({100*len(perfect_results)/max(len(valid_results),1):.1f}%)")
-    print(f"High accuracy (≥95%): {len(high_acc_results)} ({100*len(high_acc_results)/max(len(valid_results),1):.1f}%)")
-    
-    if valid_results:
-        avg_accuracy = sum(r.pixel_accuracy for r in valid_results) / len(valid_results)
-        avg_time = sum(r.train_time for r in valid_results) / len(valid_results)
-        print(f"Average pixel accuracy: {avg_accuracy:.2%}")
-        print(f"Average training time: {avg_time:.1f}s")
-    
-    # NEW: Augmentation strategy breakdown (if auto_augment)
-    if args.auto_augment:
-        dihedral_only_results = [r for r in valid_results if r.augmentation_used == "dihedral_only"]
-        full_aug_results = [r for r in valid_results if r.augmentation_used == "full"]
-        
+
+        # Print summary
+        agg = eval_results["aggregate"]
+        print("\n" + "="*60)
+        print("MULTI-PUZZLE RESULTS SUMMARY")
+        print("="*60)
+        print(f"Training time: {train_time:.1f}s")
+        print(f"Puzzles evaluated: {agg['num_puzzles_evaluated']}")
+        print(f"Total test examples: {agg['total_test_examples']}")
+        print(f"Perfect test examples: {agg['total_perfect_examples']} ({100*agg['perfect_example_rate']:.1f}%)")
+        print(f"Puzzles with all tests perfect: {agg['num_puzzles_all_perfect']} ({100*agg['num_puzzles_all_perfect']/max(agg['num_puzzles_evaluated'],1):.1f}%)")
+        print(f"Overall pixel accuracy: {agg['pixel_accuracy']:.2%}")
+
+        # Per-puzzle accuracy distribution
+        per_puzzle = eval_results["per_puzzle"]
+        valid_puzzle_accs = [p["pixel_accuracy"] for p in per_puzzle.values() if "pixel_accuracy" in p]
+
+        if valid_puzzle_accs:
+            print(f"\n{'─'*60}")
+            print("Per-puzzle accuracy distribution:")
+            bins = [(1.0, 1.0), (0.95, 1.0), (0.9, 0.95), (0.8, 0.9), (0.5, 0.8), (0.0, 0.5)]
+            for lo, hi in bins:
+                count = sum(1 for acc in valid_puzzle_accs if lo <= acc < hi or (lo == hi == 1.0 and acc == 1.0))
+                pct = 100 * count / len(valid_puzzle_accs)
+                label = f"{100*lo:.0f}%" if lo == hi else f"{100*lo:.0f}-{100*hi:.0f}%"
+                bar = "█" * int(pct / 2)
+                print(f"  {label:>10}: {count:>4} ({pct:>5.1f}%) {bar}")
+
+        # List perfect puzzles
+        perfect_puzzles = [pid for pid, p in per_puzzle.items()
+                          if p.get("all_perfect", False)]
+        if perfect_puzzles:
+            print(f"\nPerfect puzzles ({len(perfect_puzzles)}):")
+            for pid in sorted(perfect_puzzles)[:20]:
+                print(f"  {pid}")
+            if len(perfect_puzzles) > 20:
+                print(f"  ... and {len(perfect_puzzles) - 20} more")
+
+        # Save results
+        output_data = {
+            "config": vars(args),
+            "mode": "multi-puzzle",
+            "summary": {
+                "train_time": train_time,
+                "num_puzzles": agg["num_puzzles_evaluated"],
+                "total_test_examples": agg["total_test_examples"],
+                "perfect_examples": agg["total_perfect_examples"],
+                "perfect_example_rate": agg["perfect_example_rate"],
+                "puzzles_all_perfect": agg["num_puzzles_all_perfect"],
+                "pixel_accuracy": agg["pixel_accuracy"],
+            },
+            "per_puzzle": eval_results["per_puzzle"],
+        }
+
+        with open(args.output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults saved to: {args.output}")
+
+    # =========================================================================
+    # PER-PUZZLE MODE: Train separate CNN for each puzzle (original behavior)
+    # =========================================================================
+    else:
+        print("\n[PER-PUZZLE MODE]")
+        print(f"Training separate CNN for each of {len(puzzle_ids)} puzzles...")
+
+        results: List[PuzzleResult] = []
+
+        for puzzle_id in tqdm(puzzle_ids, desc="Puzzles"):
+            result = evaluate_puzzle(
+                puzzle_id, puzzles[puzzle_id],
+                epochs=args.epochs,
+                hidden_dim=args.hidden_dim,
+                num_negatives=args.num_negatives,
+                dihedral_only=args.dihedral_only,
+                negative_type=args.negative_type,
+                visualize=args.visualize,
+                verbose=args.verbose,
+                auto_augment=args.auto_augment,
+            )
+            results.append(result)
+
+            if args.verbose or result.all_perfect:
+                status = "✓ PERFECT" if result.all_perfect else f"✗ {result.pixel_accuracy:.1%}"
+                aug_info = f" [{result.augmentation_used}]" if args.auto_augment else ""
+                print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s){aug_info}")
+
+        # Summary statistics
+        valid_results = [r for r in results if r.error is None]
+        perfect_results = [r for r in valid_results if r.all_perfect]
+        high_acc_results = [r for r in valid_results if r.pixel_accuracy >= 0.95]
+
+        print("\n" + "="*60)
+        print("PER-PUZZLE RESULTS SUMMARY")
+        print("="*60)
+        print(f"Total puzzles evaluated: {len(puzzle_ids)}")
+        print(f"Valid evaluations: {len(valid_results)}")
+        print(f"Perfect generalization (100%): {len(perfect_results)} ({100*len(perfect_results)/max(len(valid_results),1):.1f}%)")
+        print(f"High accuracy (≥95%): {len(high_acc_results)} ({100*len(high_acc_results)/max(len(valid_results),1):.1f}%)")
+
+        avg_accuracy = 0
+        avg_time = 0
+        if valid_results:
+            avg_accuracy = sum(r.pixel_accuracy for r in valid_results) / len(valid_results)
+            avg_time = sum(r.train_time for r in valid_results) / len(valid_results)
+            print(f"Average pixel accuracy: {avg_accuracy:.2%}")
+            print(f"Average training time: {avg_time:.1f}s")
+
+        # Augmentation strategy breakdown (if auto_augment)
+        if args.auto_augment:
+            dihedral_only_results = [r for r in valid_results if r.augmentation_used == "dihedral_only"]
+            full_aug_results = [r for r in valid_results if r.augmentation_used == "full"]
+
+            print(f"\n{'─'*60}")
+            print("AUGMENTATION STRATEGY BREAKDOWN")
+            print(f"{'─'*60}")
+            print(f"Dihedral-only (identical palettes): {len(dihedral_only_results)} puzzles")
+            if dihedral_only_results:
+                dihedral_perfect = sum(1 for r in dihedral_only_results if r.all_perfect)
+                dihedral_avg_acc = sum(r.pixel_accuracy for r in dihedral_only_results) / len(dihedral_only_results)
+                print(f"  Perfect: {dihedral_perfect} ({100*dihedral_perfect/len(dihedral_only_results):.1f}%)")
+                print(f"  Avg accuracy: {dihedral_avg_acc:.2%}")
+
+            print(f"\nFull augmentation (varying palettes): {len(full_aug_results)} puzzles")
+            if full_aug_results:
+                full_perfect = sum(1 for r in full_aug_results if r.all_perfect)
+                full_avg_acc = sum(r.pixel_accuracy for r in full_aug_results) / len(full_aug_results)
+                print(f"  Perfect: {full_perfect} ({100*full_perfect/len(full_aug_results):.1f}%)")
+                print(f"  Avg accuracy: {full_avg_acc:.2%}")
+
+            # Breakdown by reason
+            reasons = {}
+            for r in valid_results:
+                reason = r.augmentation_reason or "unknown"
+                if reason not in reasons:
+                    reasons[reason] = []
+                reasons[reason].append(r)
+
+            print(f"\nBy detection reason:")
+            for reason, rs in sorted(reasons.items(), key=lambda x: -len(x[1])):
+                perfect_count = sum(1 for r in rs if r.all_perfect)
+                avg_acc = sum(r.pixel_accuracy for r in rs) / len(rs)
+                print(f"  {reason}: {len(rs)} puzzles, {perfect_count} perfect ({avg_acc:.1%} avg)")
+
+        # Accuracy distribution
         print(f"\n{'─'*60}")
-        print("AUGMENTATION STRATEGY BREAKDOWN")
-        print(f"{'─'*60}")
-        print(f"Dihedral-only (identical palettes): {len(dihedral_only_results)} puzzles")
-        if dihedral_only_results:
-            dihedral_perfect = sum(1 for r in dihedral_only_results if r.all_perfect)
-            dihedral_avg_acc = sum(r.pixel_accuracy for r in dihedral_only_results) / len(dihedral_only_results)
-            print(f"  Perfect: {dihedral_perfect} ({100*dihedral_perfect/len(dihedral_only_results):.1f}%)")
-            print(f"  Avg accuracy: {dihedral_avg_acc:.2%}")
-        
-        print(f"\nFull augmentation (varying palettes): {len(full_aug_results)} puzzles")
-        if full_aug_results:
-            full_perfect = sum(1 for r in full_aug_results if r.all_perfect)
-            full_avg_acc = sum(r.pixel_accuracy for r in full_aug_results) / len(full_aug_results)
-            print(f"  Perfect: {full_perfect} ({100*full_perfect/len(full_aug_results):.1f}%)")
-            print(f"  Avg accuracy: {full_avg_acc:.2%}")
-        
-        # Breakdown by reason
-        reasons = {}
-        for r in valid_results:
-            reason = r.augmentation_reason or "unknown"
-            if reason not in reasons:
-                reasons[reason] = []
-            reasons[reason].append(r)
-        
-        print(f"\nBy detection reason:")
-        for reason, rs in sorted(reasons.items(), key=lambda x: -len(x[1])):
-            perfect_count = sum(1 for r in rs if r.all_perfect)
-            avg_acc = sum(r.pixel_accuracy for r in rs) / len(rs)
-            print(f"  {reason}: {len(rs)} puzzles, {perfect_count} perfect ({avg_acc:.1%} avg)")
-    
-    # Accuracy distribution
-    print(f"\n{'─'*60}")
-    print("Accuracy distribution:")
-    bins = [(1.0, 1.0), (0.95, 1.0), (0.9, 0.95), (0.8, 0.9), (0.5, 0.8), (0.0, 0.5)]
-    for lo, hi in bins:
-        count = sum(1 for r in valid_results if lo <= r.pixel_accuracy < hi or (lo == hi == 1.0 and r.pixel_accuracy == 1.0))
-        pct = 100 * count / max(len(valid_results), 1)
-        label = f"{100*lo:.0f}%" if lo == hi else f"{100*lo:.0f}-{100*hi:.0f}%"
-        bar = "█" * int(pct / 2)
-        print(f"  {label:>10}: {count:>4} ({pct:>5.1f}%) {bar}")
-    
-    # List perfect puzzles
-    if perfect_results:
-        print(f"\nPerfect generalization puzzles ({len(perfect_results)}):")
-        for r in sorted(perfect_results, key=lambda x: x.puzzle_id)[:20]:
-            aug_info = f" [{r.augmentation_used}]" if args.auto_augment else ""
-            print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s){aug_info}")
-        if len(perfect_results) > 20:
-            print(f"  ... and {len(perfect_results) - 20} more")
-    
-    # Save results
-    output_data = {
-        "config": vars(args),
-        "summary": {
-            "total_puzzles": len(puzzle_ids),
-            "valid_evaluations": len(valid_results),
-            "perfect_count": len(perfect_results),
-            "perfect_rate": len(perfect_results) / max(len(valid_results), 1),
-            "high_acc_count": len(high_acc_results),
-            "avg_pixel_accuracy": avg_accuracy if valid_results else 0,
-            "avg_train_time": avg_time if valid_results else 0,
-        },
-        "results": [
-            {
-                "puzzle_id": r.puzzle_id,
-                "num_train": r.num_train,
-                "num_test": r.num_test,
-                "train_time": r.train_time,
-                "pixel_accuracy": r.pixel_accuracy,
-                "perfect_rate": r.perfect_rate,
-                "all_perfect": r.all_perfect,
-                "error": r.error,
-                "augmentation_used": r.augmentation_used,
-                "augmentation_reason": r.augmentation_reason,
-            }
-            for r in results
-        ]
-    }
-    
-    with open(args.output, "w") as f:
-        json.dump(output_data, f, indent=2)
-    print(f"\nResults saved to: {args.output}")
+        print("Accuracy distribution:")
+        bins = [(1.0, 1.0), (0.95, 1.0), (0.9, 0.95), (0.8, 0.9), (0.5, 0.8), (0.0, 0.5)]
+        for lo, hi in bins:
+            count = sum(1 for r in valid_results if lo <= r.pixel_accuracy < hi or (lo == hi == 1.0 and r.pixel_accuracy == 1.0))
+            pct = 100 * count / max(len(valid_results), 1)
+            label = f"{100*lo:.0f}%" if lo == hi else f"{100*lo:.0f}-{100*hi:.0f}%"
+            bar = "█" * int(pct / 2)
+            print(f"  {label:>10}: {count:>4} ({pct:>5.1f}%) {bar}")
+
+        # List perfect puzzles
+        if perfect_results:
+            print(f"\nPerfect generalization puzzles ({len(perfect_results)}):")
+            for r in sorted(perfect_results, key=lambda x: x.puzzle_id)[:20]:
+                aug_info = f" [{r.augmentation_used}]" if args.auto_augment else ""
+                print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s){aug_info}")
+            if len(perfect_results) > 20:
+                print(f"  ... and {len(perfect_results) - 20} more")
+
+        # Save results
+        output_data = {
+            "config": vars(args),
+            "mode": "per-puzzle",
+            "summary": {
+                "total_puzzles": len(puzzle_ids),
+                "valid_evaluations": len(valid_results),
+                "perfect_count": len(perfect_results),
+                "perfect_rate": len(perfect_results) / max(len(valid_results), 1),
+                "high_acc_count": len(high_acc_results),
+                "avg_pixel_accuracy": avg_accuracy,
+                "avg_train_time": avg_time,
+            },
+            "results": [
+                {
+                    "puzzle_id": r.puzzle_id,
+                    "num_train": r.num_train,
+                    "num_test": r.num_test,
+                    "train_time": r.train_time,
+                    "pixel_accuracy": r.pixel_accuracy,
+                    "perfect_rate": r.perfect_rate,
+                    "all_perfect": r.all_perfect,
+                    "error": r.error,
+                    "augmentation_used": r.augmentation_used,
+                    "augmentation_reason": r.augmentation_reason,
+                }
+                for r in results
+            ]
+        }
+
+        with open(args.output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults saved to: {args.output}")
 
 
 if __name__ == "__main__":
