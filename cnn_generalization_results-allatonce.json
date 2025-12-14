@@ -1,0 +1,4830 @@
+{
+  "config": {
+    "dataset": "arc-agi-1",
+    "data_root": "kaggle/combined",
+    "epochs": 100,
+    "hidden_dim": 64,
+    "num_negatives": 8,
+    "max_puzzles": null,
+    "dihedral_only": false,
+    "auto_augment": true,
+    "multi_puzzle": true,
+    "negative_type": "mixed",
+    "seed": 42,
+    "verbose": false,
+    "visualize": false,
+    "output": "cnn_generalization_results-allatonce.json"
+  },
+  "mode": "multi-puzzle",
+  "summary": {
+    "train_time": 2664.691091775894,
+    "num_puzzles": 800,
+    "total_test_examples": 835,
+    "perfect_examples": 4,
+    "perfect_example_rate": 0.004790419161676647,
+    "puzzles_all_perfect": 2,
+    "pixel_accuracy": 0.7349455817819791
+  },
+  "per_puzzle": {
+    "007bbfb7": {
+      "pixel_accuracy": 0.6296296296296297,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "00d62c1b": {
+      "pixel_accuracy": 0.9125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "017c7c7b": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "025d127b": {
+      "pixel_accuracy": 0.88,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "045e512c": {
+      "pixel_accuracy": 0.9024943310657596,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0520fde7": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "05269061": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "05f2a901": {
+      "pixel_accuracy": 0.8909090909090909,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "06df4c85": {
+      "pixel_accuracy": 0.886094674556213,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "08ed6ac7": {
+      "pixel_accuracy": 0.7160493827160493,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "09629e4f": {
+      "pixel_accuracy": 0.628099173553719,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0962bcdd": {
+      "pixel_accuracy": 0.8333333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0a938d79": {
+      "pixel_accuracy": 0.8215488215488216,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0b148d64": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0ca9ddb6": {
+      "pixel_accuracy": 0.8518518518518519,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0d3d703e": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0dfd9992": {
+      "pixel_accuracy": 0.8888888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0e206a2e": {
+      "pixel_accuracy": 0.9429824561403509,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "10fcaaa3": {
+      "pixel_accuracy": 0.625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "11852cab": {
+      "pixel_accuracy": 0.97,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1190e5a7": {
+      "pixel_accuracy": 0.6,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "137eaa0f": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "150deff5": {
+      "pixel_accuracy": 0.7272727272727273,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "178fcbfb": {
+      "pixel_accuracy": 0.5909090909090909,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1a07d186": {
+      "pixel_accuracy": 0.9574898785425101,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1b2d62fb": {
+      "pixel_accuracy": 0.7333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1b60fb0c": {
+      "pixel_accuracy": 0.91,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1bfc4729": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1c786137": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1caeab9d": {
+      "pixel_accuracy": 0.81,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1cf80156": {
+      "pixel_accuracy": 0.5416666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1e0a9b12": {
+      "pixel_accuracy": 0.64,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1e32b0e9": {
+      "pixel_accuracy": 0.8096885813148789,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1f0c79e5": {
+      "pixel_accuracy": 0.7160493827160493,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1f642eb9": {
+      "pixel_accuracy": 0.89,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1f85a75f": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1f876c06": {
+      "pixel_accuracy": 0.85,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1fad071e": {
+      "pixel_accuracy": 0.4,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2013d3e2": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2204b7a8": {
+      "pixel_accuracy": 0.91,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "22168020": {
+      "pixel_accuracy": 0.85,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "22233c11": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2281f1f4": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "228f6490": {
+      "pixel_accuracy": 0.81,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "22eb0ac0": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "234bbc79": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "23581191": {
+      "pixel_accuracy": 0.6296296296296297,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "239be575": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.5,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "23b5c85d": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "253bf280": {
+      "pixel_accuracy": 0.9102564102564102,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "25d487eb": {
+      "pixel_accuracy": 0.9034090909090909,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "25d8a9c8": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "25ff71a9": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "264363fd": {
+      "pixel_accuracy": 0.85,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "272f95fa": {
+      "pixel_accuracy": 0.5529411764705883,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "27a28665": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.3333333333333333,
+      "all_perfect": false,
+      "num_test_examples": 3
+    },
+    "28bf18c6": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "28e73c20": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "29623171": {
+      "pixel_accuracy": 0.8677685950413223,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "29c11459": {
+      "pixel_accuracy": 0.6727272727272727,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "29ec7d0e": {
+      "pixel_accuracy": 0.8611111111111112,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2bcee788": {
+      "pixel_accuracy": 0.04,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2bee17df": {
+      "pixel_accuracy": 0.576530612244898,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2c608aff": {
+      "pixel_accuracy": 0.9548872180451128,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2dc579da": {
+      "pixel_accuracy": 0.9722222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2dd70a9a": {
+      "pixel_accuracy": 0.9112426035502958,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2dee498d": {
+      "pixel_accuracy": 0.52,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "31aa019c": {
+      "pixel_accuracy": 0.91,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "321b1fc6": {
+      "pixel_accuracy": 0.79,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "32597951": {
+      "pixel_accuracy": 0.972318339100346,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3345333e": {
+      "pixel_accuracy": 0.875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3428a4f5": {
+      "pixel_accuracy": 0.5333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "3618c87e": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3631a71a": {
+      "pixel_accuracy": 0.57,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "363442ee": {
+      "pixel_accuracy": 0.4358974358974359,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "36d67576": {
+      "pixel_accuracy": 0.8571428571428571,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "36fdfd69": {
+      "pixel_accuracy": 0.9509803921568627,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3906de3d": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "39a8645d": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "39e1d7f9": {
+      "pixel_accuracy": 0.31866825208085614,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3aa6fb7a": {
+      "pixel_accuracy": 0.673469387755102,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3ac3eb23": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3af2c5a8": {
+      "pixel_accuracy": 0.6875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3bd67248": {
+      "pixel_accuracy": 0.82,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3bdb4ada": {
+      "pixel_accuracy": 0.95,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3befdf3e": {
+      "pixel_accuracy": 0.5208333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3c9b0459": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3de23699": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3e980e27": {
+      "pixel_accuracy": 0.893491124260355,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3eda0437": {
+      "pixel_accuracy": 0.90625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3f7978a0": {
+      "pixel_accuracy": 0.65,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "40853293": {
+      "pixel_accuracy": 0.8925,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4093f84a": {
+      "pixel_accuracy": 0.8775510204081632,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "41e4d17e": {
+      "pixel_accuracy": 0.7733333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4258a5f9": {
+      "pixel_accuracy": 0.5061728395061729,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4290ef0e": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "42a50994": {
+      "pixel_accuracy": 0.9495798319327731,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4347f46a": {
+      "pixel_accuracy": 0.8575851393188855,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "444801d8": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "445eab21": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "447fd412": {
+      "pixel_accuracy": 0.803921568627451,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "44d8ac46": {
+      "pixel_accuracy": 0.8263888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "44f52bb0": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "4522001f": {
+      "pixel_accuracy": 0.5802469135802469,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4612dd53": {
+      "pixel_accuracy": 0.9053254437869822,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "46442a0e": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "469497ad": {
+      "pixel_accuracy": 0.4544,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "46f33fce": {
+      "pixel_accuracy": 0.7925,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "47c1f68c": {
+      "pixel_accuracy": 0.8055555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "484b58aa": {
+      "pixel_accuracy": 0.9429250891795482,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "48d8fb45": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4938f0c2": {
+      "pixel_accuracy": 0.9047619047619048,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "496994bd": {
+      "pixel_accuracy": 0.4166666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "49d1d64f": {
+      "pixel_accuracy": 0.15,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4be741c5": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4c4377d9": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4c5c2cf0": {
+      "pixel_accuracy": 0.88,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "50846271": {
+      "pixel_accuracy": 0.9593301435406698,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "508bd3b6": {
+      "pixel_accuracy": 0.9305555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "50cb2852": {
+      "pixel_accuracy": 0.6703296703296703,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5117e062": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5168d44c": {
+      "pixel_accuracy": 0.9159663865546218,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "539a4f51": {
+      "pixel_accuracy": 0.13,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "53b68214": {
+      "pixel_accuracy": 0.915,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "543a7ed5": {
+      "pixel_accuracy": 0.6755555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "54d82841": {
+      "pixel_accuracy": 0.8311688311688312,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "54d9e175": {
+      "pixel_accuracy": 0.2857142857142857,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5521c0d9": {
+      "pixel_accuracy": 0.7111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5582e5ca": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5614dbcf": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "56dc2b01": {
+      "pixel_accuracy": 0.7222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "56ff96f3": {
+      "pixel_accuracy": 0.6944444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "57aa92db": {
+      "pixel_accuracy": 0.7403508771929824,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5ad4f10b": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5bd6f4ac": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5c0a986e": {
+      "pixel_accuracy": 0.94,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5c2c9af4": {
+      "pixel_accuracy": 0.8201530612244898,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5daaa586": {
+      "pixel_accuracy": 0.38333333333333336,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "60b61512": {
+      "pixel_accuracy": 0.8888888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6150a2bd": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "623ea044": {
+      "pixel_accuracy": 0.916955017301038,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "62c24649": {
+      "pixel_accuracy": 0.3888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "63613498": {
+      "pixel_accuracy": 0.7,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6430c8c4": {
+      "pixel_accuracy": 0.8125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6455b5f5": {
+      "pixel_accuracy": 0.6682692307692307,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "662c240a": {
+      "pixel_accuracy": 0.8888888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67385a82": {
+      "pixel_accuracy": 0.56,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "673ef223": {
+      "pixel_accuracy": 0.7936507936507936,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6773b310": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67a3c6ac": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67a423a3": {
+      "pixel_accuracy": 0.9444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67e8384a": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "681b3aeb": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6855a6e4": {
+      "pixel_accuracy": 0.8933333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "68b16354": {
+      "pixel_accuracy": 0.16326530612244897,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "694f12f3": {
+      "pixel_accuracy": 0.8,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6a1e5592": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6aa20dc0": {
+      "pixel_accuracy": 0.10950413223140495,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6b9890af": {
+      "pixel_accuracy": 0.27040816326530615,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6c434453": {
+      "pixel_accuracy": 0.82,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6cdd2623": {
+      "pixel_accuracy": 0.7861842105263158,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6cf79266": {
+      "pixel_accuracy": 0.735,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6d0160f0": {
+      "pixel_accuracy": 0.8760330578512396,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6d0aefbc": {
+      "pixel_accuracy": 0.3888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6d58a25d": {
+      "pixel_accuracy": 0.9025,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6d75e8bb": {
+      "pixel_accuracy": 0.8181818181818182,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6e02f1e3": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6e19193c": {
+      "pixel_accuracy": 0.95,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6e82a1ae": {
+      "pixel_accuracy": 0.82,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6ecd11f4": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6f8cd79b": {
+      "pixel_accuracy": 0.47619047619047616,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6fa7a44f": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "72322fa7": {
+      "pixel_accuracy": 0.9556786703601108,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "72ca375d": {
+      "pixel_accuracy": 0.4166666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "73251a56": {
+      "pixel_accuracy": 0.9410430839002267,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7447852a": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7468f01a": {
+      "pixel_accuracy": 0.10714285714285714,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "746b3537": {
+      "pixel_accuracy": 0.2,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "74dd1130": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "75b8110e": {
+      "pixel_accuracy": 0.125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "760b3cac": {
+      "pixel_accuracy": 0.8518518518518519,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "776ffc46": {
+      "pixel_accuracy": 0.9675,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "77fdfe62": {
+      "pixel_accuracy": 0.2777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "780d0b14": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7837ac64": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "794b24be": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "7b6016b9": {
+      "pixel_accuracy": 0.22727272727272727,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7b7f7511": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7c008303": {
+      "pixel_accuracy": 0.6111111111111112,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7ddcd7ec": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7df24a62": {
+      "pixel_accuracy": 0.9224952741020794,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7e0986d6": {
+      "pixel_accuracy": 0.5833333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7f4411dc": {
+      "pixel_accuracy": 0.9,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7fe24cdd": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "80af3007": {
+      "pixel_accuracy": 0.49382716049382713,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "810b9b61": {
+      "pixel_accuracy": 0.8333333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "82819916": {
+      "pixel_accuracy": 0.7285714285714285,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "83302e8f": {
+      "pixel_accuracy": 0.34705075445816186,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "834ec97d": {
+      "pixel_accuracy": 0.8263888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8403a5d5": {
+      "pixel_accuracy": 0.57,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "846bdb03": {
+      "pixel_accuracy": 0.4375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "855e0971": {
+      "pixel_accuracy": 0.11372549019607843,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "85c4e7cd": {
+      "pixel_accuracy": 0.14285714285714285,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "868de0fa": {
+      "pixel_accuracy": 0.73,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8731374e": {
+      "pixel_accuracy": 0.15,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "88a10436": {
+      "pixel_accuracy": 0.9363636363636364,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "88a62173": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "890034e9": {
+      "pixel_accuracy": 0.9591836734693877,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8a004b2b": {
+      "pixel_accuracy": 0.746031746031746,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8be77c9e": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8d5021e8": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8d510a79": {
+      "pixel_accuracy": 0.7,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8e1813be": {
+      "pixel_accuracy": 0.14285714285714285,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8e5a5113": {
+      "pixel_accuracy": 0.21212121212121213,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8eb1be9a": {
+      "pixel_accuracy": 0.5659340659340659,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8efcae92": {
+      "pixel_accuracy": 0.18888888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8f2ea7aa": {
+      "pixel_accuracy": 0.7530864197530864,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "90c28cc7": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "90f3ed37": {
+      "pixel_accuracy": 0.9333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "913fb3ed": {
+      "pixel_accuracy": 0.90625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "91413438": {
+      "pixel_accuracy": 0.9909297052154195,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "91714a58": {
+      "pixel_accuracy": 0.69140625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9172f3a0": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "928ad970": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "93b581b8": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "941d9a10": {
+      "pixel_accuracy": 0.94,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "94f9d214": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "952a094c": {
+      "pixel_accuracy": 0.95,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9565186b": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "95990924": {
+      "pixel_accuracy": 0.8933333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "963e52fc": {
+      "pixel_accuracy": 0.7888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "97999447": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "97a05b5b": {
+      "pixel_accuracy": 0.4375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "98cf29f8": {
+      "pixel_accuracy": 0.9019607843137255,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "995c5fa3": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "99b1bc43": {
+      "pixel_accuracy": 0.4375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "99fa7670": {
+      "pixel_accuracy": 0.7321428571428571,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9aec4887": {
+      "pixel_accuracy": 0.1836734693877551,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9af7a82c": {
+      "pixel_accuracy": 0.6,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9d9215db": {
+      "pixel_accuracy": 0.8753462603878116,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9dfd6313": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9ecd008a": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9edfc990": {
+      "pixel_accuracy": 0.19921875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9f236235": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a1570a43": {
+      "pixel_accuracy": 0.8625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a2fd1cf0": {
+      "pixel_accuracy": 0.8988095238095238,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a3325580": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a3df8b1e": {
+      "pixel_accuracy": 0.82,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a416b8f3": {
+      "pixel_accuracy": 0.625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a48eeaf7": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a5313dff": {
+      "pixel_accuracy": 0.8024691358024691,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a5f85a15": {
+      "pixel_accuracy": 0.9027777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a61ba2ce": {
+      "pixel_accuracy": 0.4375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a61f2674": {
+      "pixel_accuracy": 0.7407407407407407,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a64e4611": {
+      "pixel_accuracy": 0.7644444444444445,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a65b410d": {
+      "pixel_accuracy": 0.7160493827160493,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a68b268e": {
+      "pixel_accuracy": 0.0625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a699fb00": {
+      "pixel_accuracy": 0.93,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a740d043": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a78176bb": {
+      "pixel_accuracy": 0.88,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a79310a0": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a85d4709": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a87f7484": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a8c38be5": {
+      "pixel_accuracy": 0.12345679012345678,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a8d7556c": {
+      "pixel_accuracy": 0.9320987654320988,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a9f96cdd": {
+      "pixel_accuracy": 0.8,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aabf363d": {
+      "pixel_accuracy": 0.673469387755102,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aba27056": {
+      "pixel_accuracy": 0.47,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ac0a08a4": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ae3edfdc": {
+      "pixel_accuracy": 0.9555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ae4f1146": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aedd82e4": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "af902bf9": {
+      "pixel_accuracy": 0.87,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b0c4d837": {
+      "pixel_accuracy": 0.8888888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b190f7f5": {
+      "pixel_accuracy": 0.63671875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b1948b0a": {
+      "pixel_accuracy": 0.5625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b230c067": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b27ca6d3": {
+      "pixel_accuracy": 0.8235294117647058,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b2862040": {
+      "pixel_accuracy": 0.6333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b527c5c6": {
+      "pixel_accuracy": 0.565,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b548a754": {
+      "pixel_accuracy": 0.727810650887574,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b60334d2": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b6afb2da": {
+      "pixel_accuracy": 0.58,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b7249182": {
+      "pixel_accuracy": 0.8596491228070176,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b775ac94": {
+      "pixel_accuracy": 0.9322916666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b782dc8a": {
+      "pixel_accuracy": 0.7822222222222223,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b8825c91": {
+      "pixel_accuracy": 0.84765625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b8cdaf2b": {
+      "pixel_accuracy": 0.9259259259259259,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b91ae062": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b94a9452": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b9b7f026": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ba26e723": {
+      "pixel_accuracy": 0.7647058823529411,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ba97ae07": {
+      "pixel_accuracy": 0.5454545454545454,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bb43febb": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bbc9ae5d": {
+      "pixel_accuracy": 0.5833333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bc1d5164": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bd4472b8": {
+      "pixel_accuracy": 0.11666666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bda2d7a6": {
+      "pixel_accuracy": 0.04,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "bdad9b1f": {
+      "pixel_accuracy": 0.8055555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "be94b721": {
+      "pixel_accuracy": 0.16666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "beb8660c": {
+      "pixel_accuracy": 0.48863636363636365,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c0f76784": {
+      "pixel_accuracy": 0.7361111111111112,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c1d99e64": {
+      "pixel_accuracy": 0.2325925925925926,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c3e719e8": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c3f564a4": {
+      "pixel_accuracy": 0.8828125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c444b776": {
+      "pixel_accuracy": 0.896551724137931,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c59eb873": {
+      "pixel_accuracy": 0.49,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c8cbb738": {
+      "pixel_accuracy": 0.14285714285714285,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c8f0f002": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c909285e": {
+      "pixel_accuracy": 0.027777777777777776,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c9e6f938": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c9f8e694": {
+      "pixel_accuracy": 0.4652777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "caa06a1f": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cbded52d": {
+      "pixel_accuracy": 0.9375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cce03e0d": {
+      "pixel_accuracy": 0.5925925925925926,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cdecee7f": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce22a75a": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce4f8723": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce602527": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce9e57f2": {
+      "pixel_accuracy": 0.8787878787878788,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cf98881b": {
+      "pixel_accuracy": 0.0625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d037b0a7": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d06dbe63": {
+      "pixel_accuracy": 0.8816568047337278,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d07ae81c": {
+      "pixel_accuracy": 0.021671826625386997,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d0f5fe59": {
+      "pixel_accuracy": 0.8,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d10ecb37": {
+      "pixel_accuracy": 1.0,
+      "perfect_rate": 1.0,
+      "all_perfect": true,
+      "num_test_examples": 1
+    },
+    "d13f3404": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d22278a0": {
+      "pixel_accuracy": 0.5813148788927336,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d23f8c26": {
+      "pixel_accuracy": 0.9183673469387755,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d2abd087": {
+      "pixel_accuracy": 0.71,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d364b489": {
+      "pixel_accuracy": 0.77,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d406998b": {
+      "pixel_accuracy": 0.8235294117647058,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d43fd935": {
+      "pixel_accuracy": 0.89,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d4469b4b": {
+      "pixel_accuracy": 0.3888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "d4a91cb9": {
+      "pixel_accuracy": 0.9166666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d4f3cd78": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d511f180": {
+      "pixel_accuracy": 0.5625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d5d6de2d": {
+      "pixel_accuracy": 0.7944827586206896,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "d631b094": {
+      "pixel_accuracy": 0.4,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d687bc17": {
+      "pixel_accuracy": 0.9033613445378151,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d6ad076f": {
+      "pixel_accuracy": 0.88,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d89b689b": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d8c310e9": {
+      "pixel_accuracy": 0.8133333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d90796e8": {
+      "pixel_accuracy": 0.8095238095238095,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d9f24cd1": {
+      "pixel_accuracy": 0.71,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d9fac9be": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dae9d2b5": {
+      "pixel_accuracy": 0.2777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "db3e9e38": {
+      "pixel_accuracy": 0.5679012345679012,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "db93a21d": {
+      "pixel_accuracy": 0.5722222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dbc1a6ce": {
+      "pixel_accuracy": 0.8596491228070176,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dc0a314f": {
+      "pixel_accuracy": 0.08,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dc1df850": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dc433765": {
+      "pixel_accuracy": 0.9615384615384616,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "ddf7fa4f": {
+      "pixel_accuracy": 0.58,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "de1cd16c": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ded97339": {
+      "pixel_accuracy": 0.91,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e179c5f4": {
+      "pixel_accuracy": 0.02,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e21d9049": {
+      "pixel_accuracy": 0.9175,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e26a3af2": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e3497940": {
+      "pixel_accuracy": 0.675,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e40b9e2f": {
+      "pixel_accuracy": 0.85,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e48d4e1a": {
+      "pixel_accuracy": 0.64,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e5062a87": {
+      "pixel_accuracy": 0.87,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e509e548": {
+      "pixel_accuracy": 0.8035714285714286,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e50d258f": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e6721834": {
+      "pixel_accuracy": 0.8263888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e73095fd": {
+      "pixel_accuracy": 0.9375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e76a88a6": {
+      "pixel_accuracy": 0.57,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e8593010": {
+      "pixel_accuracy": 0.72,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e8dc4411": {
+      "pixel_accuracy": 0.020833333333333332,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9614598": {
+      "pixel_accuracy": 0.9509803921568627,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "e98196ab": {
+      "pixel_accuracy": 0.6727272727272727,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9afcf9a": {
+      "pixel_accuracy": 0.4166666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ea32f347": {
+      "pixel_accuracy": 0.86,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ea786f4a": {
+      "pixel_accuracy": 0.628099173553719,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "eb281b96": {
+      "pixel_accuracy": 0.5986159169550173,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "eb5a1d5d": {
+      "pixel_accuracy": 0.06172839506172839,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ec883f72": {
+      "pixel_accuracy": 0.9583333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ecdecbb3": {
+      "pixel_accuracy": 0.8668730650154799,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ed36ccf7": {
+      "pixel_accuracy": 0.7777777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ef135b50": {
+      "pixel_accuracy": 0.93,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f15e1fac": {
+      "pixel_accuracy": 0.7009803921568627,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f1cefba8": {
+      "pixel_accuracy": 0.47368421052631576,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f25fbde4": {
+      "pixel_accuracy": 0.5166666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f25ffba3": {
+      "pixel_accuracy": 0.625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f2829549": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f35d900a": {
+      "pixel_accuracy": 0.8431372549019608,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f5b8619d": {
+      "pixel_accuracy": 0.296875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f76d97a5": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f8a8fe49": {
+      "pixel_accuracy": 0.9333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f8b3ba0a": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f8c80d96": {
+      "pixel_accuracy": 0.28,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f8ff0b80": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f9012d9b": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fafffa47": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fcb5c309": {
+      "pixel_accuracy": 0.28125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fcc82909": {
+      "pixel_accuracy": 0.7,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "feca6190": {
+      "pixel_accuracy": 0.815,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ff28f65a": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 3
+    },
+    "ff805c23": {
+      "pixel_accuracy": 0.4,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "00576224": {
+      "pixel_accuracy": 0.027777777777777776,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "009d5c81": {
+      "pixel_accuracy": 0.8367346938775511,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "00dbd492": {
+      "pixel_accuracy": 0.78,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "03560426": {
+      "pixel_accuracy": 0.71,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "05a7bcf2": {
+      "pixel_accuracy": 0.5811111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0607ce86": {
+      "pixel_accuracy": 0.9204545454545454,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0692e18c": {
+      "pixel_accuracy": 0.7530864197530864,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "070dd51e": {
+      "pixel_accuracy": 0.8925,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "08573cc6": {
+      "pixel_accuracy": 0.46153846153846156,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0934a4d8": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "09c534e7": {
+      "pixel_accuracy": 0.8433333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0a1d4ef5": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0a2355a6": {
+      "pixel_accuracy": 0.6627450980392157,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0b17323b": {
+      "pixel_accuracy": 0.9911111111111112,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0bb8deee": {
+      "pixel_accuracy": 0.3611111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0becf7df": {
+      "pixel_accuracy": 0.73,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0c786b71": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0c9aba6e": {
+      "pixel_accuracy": 0.5833333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0d87d2a6": {
+      "pixel_accuracy": 0.7060869565217391,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0e671a1a": {
+      "pixel_accuracy": 0.8757396449704142,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "0f63c0b9": {
+      "pixel_accuracy": 0.5377777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "103eff5b": {
+      "pixel_accuracy": 0.7980769230769231,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "11e1fe23": {
+      "pixel_accuracy": 0.9761904761904762,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "12422b43": {
+      "pixel_accuracy": 0.7714285714285715,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "12997ef3": {
+      "pixel_accuracy": 0.4166666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "12eac192": {
+      "pixel_accuracy": 0.515625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "136b0064": {
+      "pixel_accuracy": 0.5037593984962406,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "13713586": {
+      "pixel_accuracy": 0.5175438596491229,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "137f0df0": {
+      "pixel_accuracy": 0.56,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "140c817e": {
+      "pixel_accuracy": 0.44387755102040816,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "14754a24": {
+      "pixel_accuracy": 0.9584487534626038,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "15113be4": {
+      "pixel_accuracy": 0.9527410207939508,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "15663ba9": {
+      "pixel_accuracy": 0.8666666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "15696249": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "16b78196": {
+      "pixel_accuracy": 0.8922222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "17b80ad2": {
+      "pixel_accuracy": 0.8512110726643599,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "17cae0c1": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "18419cfa": {
+      "pixel_accuracy": 0.9766483516483516,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "184a9768": {
+      "pixel_accuracy": 0.8692307692307693,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "195ba7dc": {
+      "pixel_accuracy": 0.26666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1990f7a8": {
+      "pixel_accuracy": 0.5510204081632653,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "19bb5feb": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1a2e2828": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1a6449f1": {
+      "pixel_accuracy": 0.7,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1acc24af": {
+      "pixel_accuracy": 0.7569444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1c02dbbe": {
+      "pixel_accuracy": 0.26666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1c0d0a4b": {
+      "pixel_accuracy": 0.5857988165680473,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1c56ad9f": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1d0a4b61": {
+      "pixel_accuracy": 0.9344,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1d398264": {
+      "pixel_accuracy": 0.81,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "1da012fc": {
+      "pixel_accuracy": 0.7473684210526316,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1e81d6f9": {
+      "pixel_accuracy": 0.9155555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "1e97544e": {
+      "pixel_accuracy": 0.8941398865784499,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2037f2c7": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2072aba6": {
+      "pixel_accuracy": 0.5277777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "20818e16": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "20981f0e": {
+      "pixel_accuracy": 0.9095022624434389,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "212895b5": {
+      "pixel_accuracy": 0.9254658385093167,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "21f83797": {
+      "pixel_accuracy": 0.5384615384615384,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "22a4bbc2": {
+      "pixel_accuracy": 0.7386363636363636,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "25094a63": {
+      "pixel_accuracy": 0.9577777777777777,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2546ccf6": {
+      "pixel_accuracy": 0.9013377926421404,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "256b0a75": {
+      "pixel_accuracy": 0.49846153846153846,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2685904e": {
+      "pixel_accuracy": 0.87,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2697da3f": {
+      "pixel_accuracy": 0.7785467128027682,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2753e76c": {
+      "pixel_accuracy": 0.13333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "27a77e38": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "27f8ce4f": {
+      "pixel_accuracy": 0.4567901234567901,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "281123b4": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "292dd178": {
+      "pixel_accuracy": 0.08484848484848485,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "29700607": {
+      "pixel_accuracy": 0.7355371900826446,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2a5f8217": {
+      "pixel_accuracy": 0.7692307692307693,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2b01abd0": {
+      "pixel_accuracy": 0.9017857142857143,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2c0b0aff": {
+      "pixel_accuracy": 0.475,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2c737e39": {
+      "pixel_accuracy": 0.8272727272727273,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "2f0c5170": {
+      "pixel_accuracy": 0.15873015873015872,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "310f3251": {
+      "pixel_accuracy": 0.7638888888888888,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3194b014": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "319f2597": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "31adaf00": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "31d5ba1a": {
+      "pixel_accuracy": 0.5333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "32e9702f": {
+      "pixel_accuracy": 0.12,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "332efdb3": {
+      "pixel_accuracy": 0.2066115702479339,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3391f8c0": {
+      "pixel_accuracy": 0.8246753246753247,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "33b52de3": {
+      "pixel_accuracy": 0.722117202268431,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3490cc26": {
+      "pixel_accuracy": 0.9011857707509882,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "34b99a2b": {
+      "pixel_accuracy": 0.55,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "351d6448": {
+      "pixel_accuracy": 0.7948717948717948,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "358ba94e": {
+      "pixel_accuracy": 0.56,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "37d3e8b2": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3979b1a8": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3a301edc": {
+      "pixel_accuracy": 0.63718820861678,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3b4c2228": {
+      "pixel_accuracy": 0.7222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "3d31c5b3": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3ed85e70": {
+      "pixel_accuracy": 0.97,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3ee1011a": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "3f23242b": {
+      "pixel_accuracy": 0.7120743034055728,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "40f6cd08": {
+      "pixel_accuracy": 0.5977777777777777,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "414297c0": {
+      "pixel_accuracy": 0.037037037037037035,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "423a55dc": {
+      "pixel_accuracy": 0.7972027972027972,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "42918530": {
+      "pixel_accuracy": 0.632,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "42a15761": {
+      "pixel_accuracy": 0.9617224880382775,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4364c1c4": {
+      "pixel_accuracy": 0.8901098901098901,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "456873bc": {
+      "pixel_accuracy": 0.7368421052631579,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "45737921": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "45bbe264": {
+      "pixel_accuracy": 0.6533333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "477d2879": {
+      "pixel_accuracy": 0.005917159763313609,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "47996f11": {
+      "pixel_accuracy": 0.8466666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "48131b3c": {
+      "pixel_accuracy": 0.296875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4852f2fa": {
+      "pixel_accuracy": 0.37037037037037035,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "48f8583b": {
+      "pixel_accuracy": 0.4444444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4aab4007": {
+      "pixel_accuracy": 0.8724489795918368,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4acc7107": {
+      "pixel_accuracy": 0.74,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4b6b68e5": {
+      "pixel_accuracy": 0.7644230769230769,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4c177718": {
+      "pixel_accuracy": 0.7555555555555555,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "4cd1b7b2": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4e45f183": {
+      "pixel_accuracy": 0.8337950138504155,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4e469f39": {
+      "pixel_accuracy": 0.8,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4f537728": {
+      "pixel_accuracy": 0.885,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "4ff4c9da": {
+      "pixel_accuracy": 0.1700960219478738,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "505fff84": {
+      "pixel_accuracy": 0.52,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "506d28a5": {
+      "pixel_accuracy": 0.3,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "50a16a69": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "50aad11f": {
+      "pixel_accuracy": 0.4375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "50f325b5": {
+      "pixel_accuracy": 0.9558823529411765,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "516b51b7": {
+      "pixel_accuracy": 0.5843137254901961,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5207a7b5": {
+      "pixel_accuracy": 0.6888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5289ad53": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "52fd389e": {
+      "pixel_accuracy": 0.6397146254458977,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "54db823b": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "55059096": {
+      "pixel_accuracy": 0.9638009049773756,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "551d5bf1": {
+      "pixel_accuracy": 0.7751479289940828,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "55783887": {
+      "pixel_accuracy": 0.029605263157894735,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "575b1a71": {
+      "pixel_accuracy": 0.92,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5783df64": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5833af48": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "58743b76": {
+      "pixel_accuracy": 0.9285714285714286,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "58e15b12": {
+      "pixel_accuracy": 0.8604166666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "59341089": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5a5a2103": {
+      "pixel_accuracy": 0.6875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5af49b42": {
+      "pixel_accuracy": 0.9411764705882353,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5b526a93": {
+      "pixel_accuracy": 0.8476190476190476,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5b692c0f": {
+      "pixel_accuracy": 0.9479166666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5b6cbef5": {
+      "pixel_accuracy": 0.7265625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "5d2a5c43": {
+      "pixel_accuracy": 0.2708333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "5ffb2104": {
+      "pixel_accuracy": 0.79,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "604001fa": {
+      "pixel_accuracy": 0.7944444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "60a26a3e": {
+      "pixel_accuracy": 0.9555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "60c09cac": {
+      "pixel_accuracy": 0.65,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "626c0bcc": {
+      "pixel_accuracy": 0.673469387755102,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "62ab2642": {
+      "pixel_accuracy": 0.4,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "62b74c02": {
+      "pixel_accuracy": 0.2857142857142857,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "639f5a19": {
+      "pixel_accuracy": 0.553875236294896,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "642248e4": {
+      "pixel_accuracy": 0.9583333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "642d658d": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "64a7c07e": {
+      "pixel_accuracy": 0.8472222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "66e6c45b": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "66f2d22f": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67636eac": {
+      "pixel_accuracy": 0.19444444444444445,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67b4a34d": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "67c52801": {
+      "pixel_accuracy": 0.6103896103896104,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "68b67ca3": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "692cd3b6": {
+      "pixel_accuracy": 0.6533333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "695367ec": {
+      "pixel_accuracy": 0.6444444444444445,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "696d4842": {
+      "pixel_accuracy": 0.965,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "69889d6e": {
+      "pixel_accuracy": 0.86,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6a11f6da": {
+      "pixel_accuracy": 0.16,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6ad5bdfd": {
+      "pixel_accuracy": 0.78,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6df30ad6": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "6ea4a07e": {
+      "pixel_accuracy": 0.16666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "6f473927": {
+      "pixel_accuracy": 0.625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7039b2d7": {
+      "pixel_accuracy": 0.5333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "705a3229": {
+      "pixel_accuracy": 0.8579545454545454,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "712bf12e": {
+      "pixel_accuracy": 0.834319526627219,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "72207abc": {
+      "pixel_accuracy": 0.9195402298850575,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "72a961c9": {
+      "pixel_accuracy": 0.8585858585858586,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "73182012": {
+      "pixel_accuracy": 0.1875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "73c3b0d8": {
+      "pixel_accuracy": 0.9270833333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "73ccf9c2": {
+      "pixel_accuracy": 0.5428571428571428,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "759f3fd3": {
+      "pixel_accuracy": 0.5694444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "762cd429": {
+      "pixel_accuracy": 0.3,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "770cc55f": {
+      "pixel_accuracy": 0.8545454545454545,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "782b5218": {
+      "pixel_accuracy": 0.4,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "79369cc6": {
+      "pixel_accuracy": 0.925,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7953d61e": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "79fb03f4": {
+      "pixel_accuracy": 0.8062130177514792,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7bb29440": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7c8af763": {
+      "pixel_accuracy": 0.64,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7c9b52a0": {
+      "pixel_accuracy": 0.06666666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7d18a6fb": {
+      "pixel_accuracy": 0.5306122448979592,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7d1f7ee8": {
+      "pixel_accuracy": 0.8522167487684729,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7d419a02": {
+      "pixel_accuracy": 0.794,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7e02026e": {
+      "pixel_accuracy": 0.7916666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "7ee1c6ea": {
+      "pixel_accuracy": 0.72,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "817e6c09": {
+      "pixel_accuracy": 0.819047619047619,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "81c0276b": {
+      "pixel_accuracy": 0.3125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "833dafe3": {
+      "pixel_accuracy": 0.5078125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "845d6e51": {
+      "pixel_accuracy": 0.869281045751634,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "84db8fc4": {
+      "pixel_accuracy": 0.65,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "84f2aca1": {
+      "pixel_accuracy": 0.7692307692307693,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8597cfd7": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "85b81ff1": {
+      "pixel_accuracy": 0.8901098901098901,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "85fa5666": {
+      "pixel_accuracy": 0.625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8719f442": {
+      "pixel_accuracy": 0.7422222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "88207623": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "891232d6": {
+      "pixel_accuracy": 0.8533333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "896d5239": {
+      "pixel_accuracy": 0.9074074074074074,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8a371977": {
+      "pixel_accuracy": 0.7666666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8b28cd80": {
+      "pixel_accuracy": 0.4506172839506173,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "8ba14f53": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8cb8642d": {
+      "pixel_accuracy": 0.7039473684210527,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8dae5dfc": {
+      "pixel_accuracy": 0.3684210526315789,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8e2edd66": {
+      "pixel_accuracy": 0.7654320987654321,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8ee62060": {
+      "pixel_accuracy": 0.8163265306122449,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "8fbca751": {
+      "pixel_accuracy": 0.65625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "90347967": {
+      "pixel_accuracy": 0.8024691358024691,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "903d1b4a": {
+      "pixel_accuracy": 0.890625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9110e3c5": {
+      "pixel_accuracy": 0.5555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "917bccba": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "929ab4e9": {
+      "pixel_accuracy": 0.06597222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "92e50de0": {
+      "pixel_accuracy": 0.9429250891795482,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9356391f": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "93b4f4b3": {
+      "pixel_accuracy": 0.6941176470588235,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "93c31fbe": {
+      "pixel_accuracy": 0.9505494505494505,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "94133066": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "94414823": {
+      "pixel_accuracy": 0.83,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "94be5b80": {
+      "pixel_accuracy": 0.8111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "95a58926": {
+      "pixel_accuracy": 0.8973063973063973,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "963f59bc": {
+      "pixel_accuracy": 0.9464285714285714,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "96a8c0cd": {
+      "pixel_accuracy": 0.8885941644562334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "97239e3d": {
+      "pixel_accuracy": 0.8062283737024222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9772c176": {
+      "pixel_accuracy": 0.93,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "981571dc": {
+      "pixel_accuracy": 0.9688888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "992798f6": {
+      "pixel_accuracy": 0.95703125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "99306f82": {
+      "pixel_accuracy": 0.6725,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9a4bb226": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9b2a60aa": {
+      "pixel_accuracy": 0.9230769230769231,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9b365c51": {
+      "pixel_accuracy": 0.5204081632653061,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9b4c17c4": {
+      "pixel_accuracy": 0.7591623036649214,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "9bebae7a": {
+      "pixel_accuracy": 0.8787878787878788,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9c1e755f": {
+      "pixel_accuracy": 0.41,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9c56f360": {
+      "pixel_accuracy": 0.8271604938271605,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9caba7c3": {
+      "pixel_accuracy": 0.9279778393351801,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9ddd00f0": {
+      "pixel_accuracy": 0.5817174515235457,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9def23fe": {
+      "pixel_accuracy": 0.7125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "9f27f097": {
+      "pixel_accuracy": 0.9097222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a04b2602": {
+      "pixel_accuracy": 0.4351851851851852,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a096bf4d": {
+      "pixel_accuracy": 0.977810650887574,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a3f84088": {
+      "pixel_accuracy": 0.5733333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a406ac07": {
+      "pixel_accuracy": 0.83,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a57f2f04": {
+      "pixel_accuracy": 0.8461538461538461,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a59b95c0": {
+      "pixel_accuracy": 0.05555555555555555,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a680ac02": {
+      "pixel_accuracy": 0.3125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a8610ef7": {
+      "pixel_accuracy": 0.3888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "a934301b": {
+      "pixel_accuracy": 0.7307692307692307,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aa18de87": {
+      "pixel_accuracy": 0.3888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aa300dc3": {
+      "pixel_accuracy": 0.93,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aa4ec2a5": {
+      "pixel_accuracy": 0.05128205128205128,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aab50785": {
+      "pixel_accuracy": 0.15625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ac0c5833": {
+      "pixel_accuracy": 0.9327846364883402,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ac2e8ecf": {
+      "pixel_accuracy": 0.6208333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ac3e2b04": {
+      "pixel_accuracy": 0.7534722222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ac605cbb": {
+      "pixel_accuracy": 0.8429752066115702,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ad7e01d0": {
+      "pixel_accuracy": 0.88,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ae58858e": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "aee291af": {
+      "pixel_accuracy": 0.08,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "af22c60d": {
+      "pixel_accuracy": 0.015555555555555555,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "af24b4cc": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b0722778": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b0f4d537": {
+      "pixel_accuracy": 0.47619047619047616,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b15fca0b": {
+      "pixel_accuracy": 0.74,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b1fc8b8e": {
+      "pixel_accuracy": 0.44,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "b20f7c8b": {
+      "pixel_accuracy": 0.7474747474747475,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b457fec5": {
+      "pixel_accuracy": 0.6328502415458938,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b4a43f3b": {
+      "pixel_accuracy": 0.8518518518518519,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b7999b51": {
+      "pixel_accuracy": 0.43333333333333335,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b7cb93ac": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b7f8a4d8": {
+      "pixel_accuracy": 0.8922222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b7fb29bc": {
+      "pixel_accuracy": 0.7866666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b942fd60": {
+      "pixel_accuracy": 0.5083333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "b9630600": {
+      "pixel_accuracy": 0.9322222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ba9d41b8": {
+      "pixel_accuracy": 0.7922437673130194,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "baf41dbf": {
+      "pixel_accuracy": 0.8161764705882353,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bb52a14b": {
+      "pixel_accuracy": 0.7706611570247934,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bbb1b8b6": {
+      "pixel_accuracy": 0.40625,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "bc4146bd": {
+      "pixel_accuracy": 0.2,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bcb3040b": {
+      "pixel_accuracy": 0.9506172839506173,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bd14c3bf": {
+      "pixel_accuracy": 0.8670360110803325,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "be03b35f": {
+      "pixel_accuracy": 0.25,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bf32578f": {
+      "pixel_accuracy": 0.71875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bf699163": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "bf89d739": {
+      "pixel_accuracy": 0.9201680672268907,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c074846d": {
+      "pixel_accuracy": 0.9222222222222223,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "c1990cce": {
+      "pixel_accuracy": 0.7854671280276817,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c3202e5a": {
+      "pixel_accuracy": 0.76,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c35c1b4c": {
+      "pixel_accuracy": 0.85,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c48954c1": {
+      "pixel_accuracy": 0.09876543209876543,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c62e2108": {
+      "pixel_accuracy": 0.75,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c64f1187": {
+      "pixel_accuracy": 0.5371900826446281,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c658a4bd": {
+      "pixel_accuracy": 0.02,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c663677b": {
+      "pixel_accuracy": 0.906721536351166,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c6e1b8da": {
+      "pixel_accuracy": 0.78,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c7d4e6ad": {
+      "pixel_accuracy": 0.79,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c87289bb": {
+      "pixel_accuracy": 0.6466666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c8b7cc0f": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c92b942c": {
+      "pixel_accuracy": 0.5185185185185185,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "c97c0139": {
+      "pixel_accuracy": 0.8571428571428571,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ca8de6ea": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ca8f78db": {
+      "pixel_accuracy": 0.9655555555555555,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cad67732": {
+      "pixel_accuracy": 0.8525,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cb227835": {
+      "pixel_accuracy": 0.8901098901098901,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ccd554ac": {
+      "pixel_accuracy": 0.32,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cd3c21df": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce039d91": {
+      "pixel_accuracy": 0.8,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ce8d95cc": {
+      "pixel_accuracy": 0.31746031746031744,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cf133acc": {
+      "pixel_accuracy": 0.8577777777777778,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "cfb2ce5a": {
+      "pixel_accuracy": 0.46,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d017b73f": {
+      "pixel_accuracy": 0.5416666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d19f7514": {
+      "pixel_accuracy": 0.20833333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d282b262": {
+      "pixel_accuracy": 0.7555555555555555,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d2acf2cb": {
+      "pixel_accuracy": 0.6555555555555556,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d304284e": {
+      "pixel_accuracy": 0.9099378881987578,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d37a1ef5": {
+      "pixel_accuracy": 0.7884615384615384,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d47aa2ff": {
+      "pixel_accuracy": 0.94,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d492a647": {
+      "pixel_accuracy": 0.8274509803921568,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d4b1c2b1": {
+      "pixel_accuracy": 0.008888888888888889,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d4c90558": {
+      "pixel_accuracy": 0.375,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d56f2372": {
+      "pixel_accuracy": 0.5,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d5c634a2": {
+      "pixel_accuracy": 0.6666666666666666,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "d931c21c": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "d94c3b52": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "da2b0fe3": {
+      "pixel_accuracy": 0.9,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "da515329": {
+      "pixel_accuracy": 0.5236686390532544,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dc2aa30b": {
+      "pixel_accuracy": 0.6363636363636364,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dc2e9a9d": {
+      "pixel_accuracy": 0.9285714285714286,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "dd2401ed": {
+      "pixel_accuracy": 0.8380952380952381,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "de493100": {
+      "pixel_accuracy": 0.05,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "df8cc377": {
+      "pixel_accuracy": 0.8496503496503497,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e0fb7511": {
+      "pixel_accuracy": 0.8047337278106509,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e133d23d": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e1baa8a4": {
+      "pixel_accuracy": 0.2,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e1d2900e": {
+      "pixel_accuracy": 0.9777777777777777,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e2092e0c": {
+      "pixel_accuracy": 0.9244444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e21a174a": {
+      "pixel_accuracy": 0.6759776536312849,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "e345f17b": {
+      "pixel_accuracy": 0.6875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "e4075551": {
+      "pixel_accuracy": 0.7708333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e41c6fd3": {
+      "pixel_accuracy": 0.8627450980392157,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e57337a4": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e5790162": {
+      "pixel_accuracy": 0.8583333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e5c44e8f": {
+      "pixel_accuracy": 0.9586776859504132,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e619ca6e": {
+      "pixel_accuracy": 0.8682266009852216,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e633a9e5": {
+      "pixel_accuracy": 0.08,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e66aafb8": {
+      "pixel_accuracy": 0.1111111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e681b708": {
+      "pixel_accuracy": 0.9482248520710059,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e69241bd": {
+      "pixel_accuracy": 0.6790123456790124,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e6de6e8f": {
+      "pixel_accuracy": 0.6964285714285714,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e74e1818": {
+      "pixel_accuracy": 0.7644444444444445,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e760a62e": {
+      "pixel_accuracy": 0.46683673469387754,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e7639916": {
+      "pixel_accuracy": 0.8296703296703297,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e78887d1": {
+      "pixel_accuracy": 0.5333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e7a25a18": {
+      "pixel_accuracy": 0.07,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e7b06bea": {
+      "pixel_accuracy": 0.5802469135802469,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e7dd8335": {
+      "pixel_accuracy": 0.898989898989899,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e872b94a": {
+      "pixel_accuracy": 1.0,
+      "perfect_rate": 1.0,
+      "all_perfect": true,
+      "num_test_examples": 1
+    },
+    "e88171ec": {
+      "pixel_accuracy": 0.9727891156462585,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e95e3d8e": {
+      "pixel_accuracy": 0.9421487603305785,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e99362f0": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9ac8c9e": {
+      "pixel_accuracy": 0.7511111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9b4f6fc": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9bb6954": {
+      "pixel_accuracy": 0.7645429362880887,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "e9c9d9a1": {
+      "pixel_accuracy": 0.6711111111111111,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ea959feb": {
+      "pixel_accuracy": 0.9109090909090909,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ea9794b1": {
+      "pixel_accuracy": 0.24,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ecaa0ec1": {
+      "pixel_accuracy": 0.9173553719008265,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ed74f2f2": {
+      "pixel_accuracy": 0.2222222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ed98d772": {
+      "pixel_accuracy": 0.5833333333333334,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ef26cbf6": {
+      "pixel_accuracy": 0.4935064935064935,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f0afb749": {
+      "pixel_accuracy": 0.6944444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f0df5ff0": {
+      "pixel_accuracy": 0.8044444444444444,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f21745ec": {
+      "pixel_accuracy": 0.8063241106719368,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f3b10344": {
+      "pixel_accuracy": 0.9275862068965517,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f3cdc58f": {
+      "pixel_accuracy": 0.67,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f3e62deb": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 2
+    },
+    "f4081712": {
+      "pixel_accuracy": 0.0,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f45f5ca7": {
+      "pixel_accuracy": 0.84,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f5aa3634": {
+      "pixel_accuracy": 0.3333333333333333,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f5c89df1": {
+      "pixel_accuracy": 0.8284023668639053,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f823c43c": {
+      "pixel_accuracy": 0.36328125,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f83cb3f6": {
+      "pixel_accuracy": 0.8866666666666667,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f8be4b64": {
+      "pixel_accuracy": 0.7285318559556787,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f9a67cb5": {
+      "pixel_accuracy": 0.7238095238095238,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "f9d67f8b": {
+      "pixel_accuracy": 0.89,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fafd9572": {
+      "pixel_accuracy": 0.7738095238095238,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fb791726": {
+      "pixel_accuracy": 0.71875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fc754716": {
+      "pixel_accuracy": 0.5396825396825397,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fd096ab6": {
+      "pixel_accuracy": 0.9622222222222222,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fd4b2b02": {
+      "pixel_accuracy": 0.875,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fe9372f3": {
+      "pixel_accuracy": 0.8568627450980392,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "fea12743": {
+      "pixel_accuracy": 0.8636363636363636,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    },
+    "ff72ca3e": {
+      "pixel_accuracy": 0.68,
+      "perfect_rate": 0.0,
+      "all_perfect": false,
+      "num_test_examples": 1
+    }
+  }
+}

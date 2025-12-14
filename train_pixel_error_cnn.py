@@ -320,6 +320,100 @@ class BottleneckAttention(nn.Module):
         return x_flat.transpose(1, 2).reshape(B, C, H, W)
 
 
+class ChannelAttention(nn.Module):
+    """
+    Channel attention module from CBAM.
+    
+    Computes channel-wise attention weights using global average and max pooling
+    followed by a shared MLP. This asks "which feature channels are important?"
+    but does NOT compute relationships between spatial positions.
+    """
+    
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Shared MLP for both pooled features
+        reduced_channels = max(channels // reduction, 8)  # Ensure minimum capacity
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, reduced_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_channels, channels, bias=False)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, _, _ = x.shape
+        
+        # Global pooling: (B, C, H, W) -> (B, C, 1, 1) -> (B, C)
+        avg_out = self.mlp(self.avg_pool(x).view(B, C))
+        max_out = self.mlp(self.max_pool(x).view(B, C))
+        
+        # Combine and apply sigmoid: (B, C) -> (B, C, 1, 1)
+        attn = torch.sigmoid(avg_out + max_out).view(B, C, 1, 1)
+        
+        return attn * x
+
+
+class SpatialAttention(nn.Module):
+    """
+    Spatial attention module from CBAM.
+    
+    Computes spatial attention weights using channel-wise average and max pooling
+    followed by a convolution. This asks "which spatial locations are important?"
+    but each location is evaluated INDEPENDENTLY - no pairwise comparisons.
+    """
+    
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Channel-wise pooling: (B, C, H, W) -> (B, 1, H, W)
+        avg_out = x.mean(dim=1, keepdim=True)
+        max_out = x.max(dim=1, keepdim=True)[0]
+        
+        # Concatenate and convolve: (B, 2, H, W) -> (B, 1, H, W)
+        combined = torch.cat([avg_out, max_out], dim=1)
+        attn = torch.sigmoid(self.conv(combined))
+        
+        return attn * x
+
+
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module (CBAM).
+    
+    Applies channel attention followed by spatial attention sequentially.
+    
+    Key limitation for ARC tasks: CBAM computes "what's important" and "where's important"
+    but NEVER computes pairwise relationships between positions. This means it cannot
+    perform counting ("how many objects?") or selection ("which is smallest?") tasks
+    that require comparing objects to each other.
+    
+    Use cases where CBAM helps:
+    - Tasks where transformation depends on global image statistics
+    - Feature refinement / suppressing irrelevant channels
+    - When computational efficiency matters (much lighter than self-attention)
+    
+    Use cases where CBAM won't help:
+    - Counting objects
+    - Selecting objects by relative properties (smallest, unique, etc.)
+    - Any task requiring explicit pairwise comparison between positions
+    """
+    
+    def __init__(self, channels: int, reduction: int = 16, kernel_size: int = 7):
+        super().__init__()
+        self.channel_attn = ChannelAttention(channels, reduction)
+        self.spatial_attn = SpatialAttention(kernel_size)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.channel_attn(x)
+        x = self.spatial_attn(x)
+        return x
+
+
 class FiLMModulation(nn.Module):
     """
     Feature-wise Linear Modulation (FiLM) for injecting global context into skip connections.
@@ -433,11 +527,12 @@ class FullResolutionCNN(nn.Module):
     """
     
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 10,
-                 attention_heads: int = 8, attention_layers: int = 2):
+                 attention_type: str = "self", attention_heads: int = 8, attention_layers: int = 2):
         super().__init__()
         
         self.force_comparison = force_comparison
         self.num_classes = num_classes
+        self.attention_type = attention_type
         
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -460,12 +555,15 @@ class FullResolutionCNN(nn.Module):
         self.conv3 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
         self.conv4 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=8)
         
-        # Self-attention at full resolution (30x30 = 900 tokens)
-        self.attention = BottleneckAttention(
-            dim=hidden_dim,
-            num_heads=attention_heads,
-            num_layers=attention_layers
-        )
+        # Attention at full resolution (30x30 = 900 tokens)
+        if attention_type == "cbam":
+            self.attention = CBAM(hidden_dim)
+        else:  # "self" attention (default)
+            self.attention = BottleneckAttention(
+                dim=hidden_dim,
+                num_heads=attention_heads,
+                num_layers=attention_layers
+            )
         
         # Post-attention conv blocks
         self.conv5 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
@@ -532,6 +630,7 @@ class FullResolutionCNN(nn.Module):
         force_comparison = args.get('force_comparison', True)
         mode = args.get('mode', 'color')
         num_classes = 10 if mode == 'color' else 1
+        attention_type = args.get('attention_type', 'self')
         attention_heads = args.get('attention_heads', 8)
         attention_layers = args.get('attention_layers', 2)
         
@@ -539,6 +638,7 @@ class FullResolutionCNN(nn.Module):
             hidden_dim=hidden_dim,
             force_comparison=force_comparison,
             num_classes=num_classes,
+            attention_type=attention_type,
             attention_heads=attention_heads,
             attention_layers=attention_layers
         )
@@ -568,13 +668,15 @@ class PixelErrorCNN(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
-                 use_attention: bool = False, attention_heads: int = 8, attention_layers: int = 1,
+                 use_attention: bool = False, attention_type: str = "self", 
+                 attention_heads: int = 8, attention_layers: int = 1,
                  no_skip: bool = False):
         super().__init__()
         
         self.force_comparison = force_comparison
         self.num_classes = num_classes
         self.use_attention = use_attention
+        self.attention_type = attention_type
         self.no_skip = no_skip
 
         # Color embeddings for both grids
@@ -610,13 +712,18 @@ class PixelErrorCNN(nn.Module):
 
         # Optional bottleneck attention for global reasoning
         if use_attention:
-            self.bottleneck_attn = BottleneckAttention(
-                dim=base_ch * 8,
-                num_heads=attention_heads,
-                num_layers=attention_layers
-            )
+            if attention_type == "cbam":
+                self.bottleneck_attn = CBAM(base_ch * 8)
+            else:  # "self" attention (default)
+                self.bottleneck_attn = BottleneckAttention(
+                    dim=base_ch * 8,
+                    num_heads=attention_heads,
+                    num_layers=attention_layers
+                )
             # FiLM modulation to inject global context into skip connections (only if using skips)
-            if not no_skip:
+            # Note: FiLM is only used with self-attention since CBAM doesn't produce the same
+            # kind of global context vector
+            if not no_skip and attention_type == "self":
                 self.film = FiLMModulation(
                     bottleneck_dim=base_ch * 8,
                     skip_dims=[base_ch * 4, base_ch * 2, base_ch]
@@ -651,7 +758,8 @@ class PixelErrorCNN(nn.Module):
             x4 = self.bottleneck_attn(x4)
             
             # Generate FiLM modulation parameters from global context (only if using skip connections)
-            if not self.no_skip:
+            # Note: FiLM is only used with self-attention, not CBAM
+            if not self.no_skip and self.attention_type == "self":
                 film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
                 
                 # Modulate skip connections with global context
@@ -705,6 +813,7 @@ class PixelErrorCNN(nn.Module):
         num_classes = 10 if mode == 'color' else 1
         # Attention parameters
         use_attention = args.get('use_attention', False)
+        attention_type = args.get('attention_type', 'self')
         attention_heads = args.get('attention_heads', 8)
         attention_layers = args.get('attention_layers', 1)
         # Skip connection parameter
@@ -715,6 +824,7 @@ class PixelErrorCNN(nn.Module):
             force_comparison=force_comparison,
             num_classes=num_classes,
             use_attention=use_attention,
+            attention_type=attention_type,
             attention_heads=attention_heads,
             attention_layers=attention_layers,
             no_skip=no_skip
@@ -1857,6 +1967,10 @@ def main():
     # Bottleneck attention for global reasoning
     parser.add_argument("--use-attention", action="store_true",
                         help="Add self-attention at U-Net bottleneck for global reasoning")
+    parser.add_argument("--attention-type", type=str, default="self",
+                        choices=["self", "cbam"],
+                        help="Type of attention: 'self' for multi-head self-attention (pairwise comparisons), "
+                             "'cbam' for channel+spatial attention (no pairwise comparisons)")
     parser.add_argument("--attention-heads", type=int, default=8,
                         help="Number of attention heads (default: 8)")
     parser.add_argument("--attention-layers", type=int, default=1,
@@ -2059,6 +2173,7 @@ def main():
             hidden_dim=args.hidden_dim,
             force_comparison=force_comparison,
             num_classes=num_classes,
+            attention_type=args.attention_type,
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers
         )
@@ -2070,6 +2185,7 @@ def main():
             force_comparison=force_comparison,
             num_classes=num_classes,
             use_attention=args.use_attention,
+            attention_type=args.attention_type,
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers,
             no_skip=args.no_skip
@@ -2080,9 +2196,15 @@ def main():
     print(f"Model parameters: {num_params:,}")
     print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
     if args.full_resolution:
-        print(f"Full-resolution attention: {args.attention_layers} layer(s), {args.attention_heads} heads over 900 tokens")
+        if args.attention_type == "cbam":
+            print(f"Full-resolution attention: CBAM (channel + spatial, NO pairwise comparisons)")
+        else:
+            print(f"Full-resolution attention: Self-attention, {args.attention_layers} layer(s), {args.attention_heads} heads over 900 tokens")
     elif args.use_attention:
-        print(f"Bottleneck attention: {args.attention_layers} layer(s), {args.attention_heads} heads")
+        if args.attention_type == "cbam":
+            print(f"Bottleneck attention: CBAM (channel + spatial, NO pairwise comparisons)")
+        else:
+            print(f"Bottleneck attention: Self-attention, {args.attention_layers} layer(s), {args.attention_heads} heads")
     if args.no_skip and not args.full_resolution:
         print("Skip connections: DISABLED (all info flows through bottleneck)")
 
