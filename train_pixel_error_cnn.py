@@ -1414,6 +1414,240 @@ def evaluate_test_examples(
     }
 
 
+# =============================================================================
+# Layer-wise Ablation Analysis
+# =============================================================================
+
+def run_layer_ablation(
+    model: nn.Module,
+    test_dataset,
+    device: torch.device,
+    mode: str = "color",
+    verbose: bool = True
+) -> Dict[str, Dict]:
+    """
+    Run layer-wise ablation analysis to understand what each layer contributes.
+    
+    For each layer, we temporarily zero out its output and measure the impact
+    on test accuracy. Larger drops indicate more critical layers.
+    
+    Returns:
+        Dict mapping layer names to their ablation results
+    """
+    model.eval()
+    
+    # First, get baseline accuracy without any ablation
+    print("\n" + "="*70)
+    print("LAYER-WISE ABLATION ANALYSIS")
+    print("="*70)
+    print("Testing which layers are critical for this transformation...")
+    print("Baseline = normal model, then we zero each layer's output one at a time.\n")
+    
+    baseline_results = evaluate_test_examples(
+        model, test_dataset, device, mode=mode, verbose=False, visualize=False
+    )
+    baseline_acc = baseline_results['pixel_accuracy']
+    baseline_perfect = baseline_results['perfect_rate']
+    
+    print(f"BASELINE (no ablation):")
+    print(f"  Pixel Accuracy: {baseline_acc:.2%}")
+    print(f"  Perfect Rate:   {baseline_perfect:.2%}")
+    print(f"{'─'*70}\n")
+    
+    # Determine which model architecture we have
+    is_full_res = isinstance(model, FullResolutionCNN)
+    
+    # Define layers to ablate based on architecture
+    if is_full_res:
+        # FullResolutionCNN layers
+        layer_groups = {
+            "Embeddings": [
+                ("input_embed", model.input_embed),
+                ("output_embed", model.output_embed),
+            ],
+            "Pre-Attention Convs": [
+                ("conv1 (dilation=1)", model.conv1),
+                ("conv2 (dilation=2)", model.conv2),
+                ("conv3 (dilation=4)", model.conv3),
+                ("conv4 (dilation=8)", model.conv4),
+            ],
+            "Attention": [
+                ("attention", model.attention),
+            ],
+            "Post-Attention Convs": [
+                ("conv5 (dilation=4)", model.conv5),
+                ("conv6 (dilation=2)", model.conv6),
+                ("conv7 (dilation=1)", model.conv7),
+            ],
+        }
+    else:
+        # PixelErrorCNN (U-Net) layers
+        layer_groups = {
+            "Embeddings": [
+                ("input_embed", model.input_embed),
+                ("output_embed", model.output_embed),
+            ],
+            "Encoder": [
+                ("inc (initial conv)", model.inc),
+                ("down1 (encoder level 1)", model.down1),
+                ("down2 (encoder level 2)", model.down2),
+                ("down3 (encoder level 3 / bottleneck)", model.down3),
+            ],
+            "Decoder": [
+                ("up1 (decoder level 1)", model.up1),
+                ("up2 (decoder level 2)", model.up2),
+                ("up3 (decoder level 3)", model.up3),
+            ],
+        }
+        # Add attention if present
+        if hasattr(model, 'bottleneck_attn') and model.use_attention:
+            layer_groups["Bottleneck Attention"] = [
+                ("bottleneck_attn", model.bottleneck_attn),
+            ]
+            if hasattr(model, 'film') and not model.no_skip:
+                layer_groups["FiLM Modulation"] = [
+                    ("film (global context injection)", model.film),
+                ]
+    
+    # Store ablation results
+    ablation_results = {}
+    
+    # Hook storage
+    handles = []
+    ablation_active = {"enabled": False, "layer": None}
+    
+    def make_zero_hook(layer_name):
+        """Create a hook that zeros out the layer's output when ablation is active."""
+        def hook(module, input, output):
+            if ablation_active["enabled"] and ablation_active["layer"] == layer_name:
+                if isinstance(output, torch.Tensor):
+                    return torch.zeros_like(output)
+                elif isinstance(output, tuple):
+                    return tuple(torch.zeros_like(o) if isinstance(o, torch.Tensor) else o for o in output)
+            return output
+        return hook
+    
+    # Register hooks on all layers
+    all_layers = []
+    for group_name, layers in layer_groups.items():
+        for layer_name, layer_module in layers:
+            all_layers.append((group_name, layer_name, layer_module))
+            handle = layer_module.register_forward_hook(make_zero_hook(layer_name))
+            handles.append(handle)
+    
+    # Test each layer
+    print("Testing each layer (zeroing its output):\n")
+    
+    for group_name, layer_name, layer_module in all_layers:
+        # Enable ablation for this layer
+        ablation_active["enabled"] = True
+        ablation_active["layer"] = layer_name
+        
+        # Run evaluation
+        try:
+            results = evaluate_test_examples(
+                model, test_dataset, device, mode=mode, verbose=False, visualize=False
+            )
+            acc = results['pixel_accuracy']
+            perfect = results['perfect_rate']
+            
+            # Calculate drop from baseline
+            acc_drop = baseline_acc - acc
+            perfect_drop = baseline_perfect - perfect
+            
+            # Store results
+            ablation_results[layer_name] = {
+                "group": group_name,
+                "accuracy": acc,
+                "perfect_rate": perfect,
+                "accuracy_drop": acc_drop,
+                "perfect_drop": perfect_drop,
+                "relative_drop": acc_drop / baseline_acc if baseline_acc > 0 else 0,
+            }
+            
+            # Determine impact level
+            if acc_drop > 0.5:
+                impact = "██████████ CRITICAL"
+            elif acc_drop > 0.3:
+                impact = "████████░░ HIGH"
+            elif acc_drop > 0.1:
+                impact = "█████░░░░░ MEDIUM"
+            elif acc_drop > 0.02:
+                impact = "██░░░░░░░░ LOW"
+            else:
+                impact = "░░░░░░░░░░ MINIMAL"
+            
+            print(f"  [{group_name}] {layer_name}")
+            print(f"    Accuracy: {acc:.2%} (drop: {acc_drop:+.2%})  {impact}")
+            if baseline_perfect > 0:
+                print(f"    Perfect:  {perfect:.2%} (drop: {perfect_drop:+.2%})")
+            print()
+            
+        except Exception as e:
+            print(f"  [{group_name}] {layer_name}: ERROR - {e}")
+            ablation_results[layer_name] = {"error": str(e)}
+        
+        # Disable ablation
+        ablation_active["enabled"] = False
+    
+    # Remove all hooks
+    for handle in handles:
+        handle.remove()
+    
+    # Print summary
+    print("="*70)
+    print("ABLATION SUMMARY (sorted by impact)")
+    print("="*70)
+    
+    # Sort by accuracy drop
+    sorted_layers = sorted(
+        [(name, res) for name, res in ablation_results.items() if "error" not in res],
+        key=lambda x: x[1]["accuracy_drop"],
+        reverse=True
+    )
+    
+    print("\nMost Critical Layers (largest accuracy drop when ablated):")
+    for i, (name, res) in enumerate(sorted_layers[:5], 1):
+        print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
+    
+    print("\nLeast Critical Layers (smallest accuracy drop when ablated):")
+    for i, (name, res) in enumerate(sorted_layers[-3:], 1):
+        print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
+    
+    # Interpretation
+    print("\n" + "─"*70)
+    print("INTERPRETATION:")
+    
+    critical_layers = [name for name, res in sorted_layers if res["accuracy_drop"] > 0.3]
+    if critical_layers:
+        print(f"  • Critical layers: {', '.join(critical_layers)}")
+        print(f"    These layers store essential transformation knowledge.")
+    
+    minimal_layers = [name for name, res in sorted_layers if res["accuracy_drop"] < 0.02]
+    if minimal_layers:
+        print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+        print(f"    These layers may be redundant or store non-essential features.")
+    
+    # Check if attention matters
+    attention_results = [res for name, res in ablation_results.items() 
+                        if "attention" in name.lower() and "error" not in res]
+    if attention_results:
+        attn_drop = max(res["accuracy_drop"] for res in attention_results)
+        if attn_drop > 0.1:
+            print(f"  • Attention is important (drop: {attn_drop:+.2%})")
+            print(f"    The transformation likely requires global/relational reasoning.")
+        else:
+            print(f"  • Attention has minimal impact (drop: {attn_drop:+.2%})")
+            print(f"    The transformation may be primarily local/convolutional.")
+    
+    print("─"*70 + "\n")
+    
+    return {
+        "baseline": {"accuracy": baseline_acc, "perfect_rate": baseline_perfect},
+        "layers": ablation_results,
+    }
+
+
 def train_epoch_binary(
     model: nn.Module,
     loader: DataLoader,
@@ -1981,6 +2215,12 @@ def main():
     # Full resolution architecture (no downsampling)
     parser.add_argument("--full-resolution", action="store_true",
                         help="Use FullResolutionCNN instead of U-Net (no downsampling, dilated convs, attention at 30x30)")
+    
+    # Layer-wise ablation analysis
+    parser.add_argument("--ablation", action="store_true",
+                        help="Run layer-wise ablation analysis after training. "
+                             "Zeros each layer's output and measures accuracy drop. "
+                             "Requires --eval-on-test to have test data to evaluate against.")
 
     args = parser.parse_args()
 
@@ -2032,6 +2272,12 @@ def main():
     if args.eval_on_test and not args.single_puzzle:
         print("Error: --eval-on-test requires --single-puzzle")
         return
+    
+    # Check ablation requirements
+    if args.ablation and not args.eval_on_test:
+        print("Warning: --ablation requires --eval-on-test to have test data to evaluate against.")
+        print("         Ablation analysis will be skipped. Add --eval-on-test to enable it.")
+        args.ablation = False
     
     # For --eval-on-test mode, explain what we're doing
     if args.eval_on_test:
@@ -2345,6 +2591,14 @@ def main():
             print(f"  Gap: {gap:.2%} - mild overfitting")
         else:
             print(f"  Gap: {gap:.2%} - good generalization!")
+        
+        # =========================================================================
+        # LAYER-WISE ABLATION ANALYSIS
+        # =========================================================================
+        if args.ablation:
+            ablation_results = run_layer_ablation(
+                model, test_eval_dataset, DEVICE, mode=args.mode
+            )
 
     print("\nDone!")
     if not args.eval_on_test:
