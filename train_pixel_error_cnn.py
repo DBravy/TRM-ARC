@@ -2518,6 +2518,18 @@ def run_counting_experiment(args):
         # Visualize predictions
         visualize_counting_predictions(model, test_loader, grid_size, DEVICE, num_samples=4)
 
+        # Store one sample for final summary visualization
+        sample_batch = next(iter(test_loader))
+        sample_input, sample_output, sample_target, _ = sample_batch
+        with torch.no_grad():
+            sample_logits = model(sample_input[:1].to(DEVICE), sample_output[:1].to(DEVICE))
+            sample_pred = sample_logits.argmax(dim=1)[0].cpu().numpy()
+        sample_viz = {
+            "input": sample_input[0].numpy(),
+            "target": sample_target[0].numpy(),
+            "pred": sample_pred
+        }
+
         # Store results
         result = {
             "grid_size": grid_size,
@@ -2525,7 +2537,8 @@ def run_counting_experiment(args):
             "final_test_acc": test_acc,
             "final_grid_acc": test_grid_acc,
             "best_epoch": best_epoch,
-            "ablation": ablation_results
+            "ablation": ablation_results,
+            "sample_viz": sample_viz
         }
         all_results.append(result)
 
@@ -2567,7 +2580,54 @@ def run_counting_experiment(args):
                 row += f"{drop:+.1%}     "
             print(row)
 
-    print("\nDone!")
+    # Final visualization: one sample from each grid size
+    print("\n" + "=" * 80)
+    print("SAMPLE PREDICTIONS BY GRID SIZE")
+    print("=" * 80)
+
+    for r in all_results:
+        grid_size = r["grid_size"]
+        viz = r["sample_viz"]
+        inp = viz["input"]
+        target = viz["target"]
+        pred = viz["pred"]
+
+        # Get expected and predicted winner colors
+        expected_color = target[0, 0]
+        predicted_color = pred[0, 0]
+        is_correct = (pred[:3, :3] == target[:3, :3]).all()
+        status = "✓" if is_correct else "✗"
+
+        # Count colors in input
+        from collections import Counter
+        inp_flat = inp[:grid_size, :grid_size].flatten()
+        color_counts = Counter(inp_flat)
+        top_colors = color_counts.most_common(3)
+
+        print(f"\n[{grid_size}x{grid_size}] {status} Expected: {expected_color}, Predicted: {predicted_color}")
+        print(f"  Top colors: {', '.join(f'{c}:{cnt}' for c, cnt in top_colors)}")
+
+        # Show input (compact for large grids)
+        max_display = min(grid_size, 8)
+        print(f"  Input ({grid_size}x{grid_size}):", end="")
+        if grid_size <= 8:
+            print()
+            for row in range(grid_size):
+                print(f"    {' '.join(str(inp[row, c]) for c in range(grid_size))}")
+        else:
+            print(f" (showing {max_display}x{max_display})")
+            for row in range(max_display):
+                print(f"    {' '.join(str(inp[row, c]) for c in range(max_display))} ...")
+
+        # Show expected vs predicted (3x3)
+        print(f"  Expected → Predicted:")
+        for row in range(3):
+            exp_row = ' '.join(str(target[row, c]) for c in range(3))
+            pred_row = ' '.join(str(pred[row, c]) for c in range(3))
+            print(f"    {exp_row}    {pred_row}")
+
+    print("\n" + "=" * 80)
+    print("Done!")
 
 
 def run_ablation_analysis(model, test_loader, mode):
