@@ -2109,6 +2109,471 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
 
 
 # =============================================================================
+# Counting Experiment - Synthetic Puzzle Generation
+# =============================================================================
+
+def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Generator) -> Dict:
+    """
+    Generate a single 'most frequent color' puzzle example.
+
+    The winner color has exactly 1 more pixel than the runner-up (hardest case).
+    Output is the entire grid filled with the winner color.
+    """
+    # Pick num_colors random colors from 0-9
+    available_colors = list(range(10))
+    rng.shuffle(available_colors)
+    colors = available_colors[:num_colors]
+
+    total_pixels = grid_size * grid_size
+
+    # Distribute pixels with winner having exactly 1 more than runner-up
+    # Strategy: make counts as equal as possible, then give winner +1
+    base_count = total_pixels // num_colors
+    remainder = total_pixels % num_colors
+
+    # Start with base counts
+    counts = [base_count] * num_colors
+
+    # Distribute remainder evenly (but not to winner yet)
+    winner_idx = rng.integers(num_colors)
+    runner_up_idx = (winner_idx + 1) % num_colors
+
+    # Give remainder to non-winners first
+    extra_indices = [i for i in range(num_colors) if i != winner_idx]
+    for i in range(remainder):
+        counts[extra_indices[i % len(extra_indices)]] += 1
+
+    # Now ensure winner has exactly 1 more than the current max (runner-up)
+    current_max = max(counts[i] for i in range(num_colors) if i != winner_idx)
+    counts[winner_idx] = current_max + 1
+
+    # Adjust total if we went over
+    current_total = sum(counts)
+    if current_total > total_pixels:
+        # Remove from non-winner, non-runner-up colors
+        diff = current_total - total_pixels
+        for i in range(num_colors):
+            if i != winner_idx and diff > 0 and counts[i] > 1:
+                remove = min(diff, counts[i] - 1)
+                counts[i] -= remove
+                diff -= remove
+    elif current_total < total_pixels:
+        # Add to winner
+        counts[winner_idx] += total_pixels - current_total
+
+    # Build input grid
+    pixels = []
+    for color, count in zip(colors, counts):
+        pixels.extend([color] * count)
+
+    # Ensure exact size
+    while len(pixels) < total_pixels:
+        pixels.append(colors[winner_idx])
+    pixels = pixels[:total_pixels]
+
+    # Shuffle pixel positions
+    rng.shuffle(pixels)
+    input_grid = np.array(pixels).reshape(grid_size, grid_size).tolist()
+
+    # Output is all winner color
+    winner_color = colors[winner_idx]
+    output_grid = [[winner_color] * grid_size for _ in range(grid_size)]
+
+    return {"input": input_grid, "output": output_grid}
+
+
+def generate_counting_puzzles(grid_size: int, num_train: int, num_test: int,
+                               num_colors: int, seed: int = 42) -> Dict:
+    """
+    Generate synthetic puzzle dict matching ARC format.
+
+    Returns a dict with one puzzle containing train and test examples.
+    """
+    rng = np.random.default_rng(seed)
+
+    train_examples = [generate_counting_puzzle(grid_size, num_colors, rng)
+                      for _ in range(num_train)]
+    test_examples = [generate_counting_puzzle(grid_size, num_colors, rng)
+                     for _ in range(num_test)]
+
+    puzzle_id = f"counting_{grid_size}x{grid_size}"
+
+    return {
+        puzzle_id: {
+            "train": train_examples,
+            "test": test_examples
+        }
+    }
+
+
+def run_counting_experiment(args):
+    """
+    Run the counting experiment across multiple grid sizes.
+
+    For each grid size:
+    1. Generate synthetic 'most frequent color' puzzles
+    2. Train PixelErrorCNN from scratch
+    3. Evaluate on held-out test examples
+    4. Run ablation analysis
+    5. Collect and report results
+    """
+    print("=" * 80)
+    print("COUNTING EXPERIMENT: Most Frequent Color Task")
+    print("=" * 80)
+    print(f"Device: {DEVICE}")
+    print(f"Grid sizes to test: {args.counting_grid_sizes}")
+    print(f"Colors per grid: {args.counting_num_colors}")
+    print(f"Train examples per size: {args.counting_num_train}")
+    print(f"Test examples per size: {args.counting_num_test}")
+    print(f"Negatives per example: {args.counting_num_negatives}")
+    print(f"Epochs per size: {args.epochs}")
+    print(f"Winner margin: 1 pixel (hardest case)")
+    print("=" * 80)
+
+    # Force color mode for this experiment (we're predicting what color output should be)
+    args.mode = "color"
+    args.eval_on_test = True
+    args.ablation = True
+
+    # Collect results across all grid sizes
+    all_results = []
+
+    for grid_size in args.counting_grid_sizes:
+        print(f"\n{'='*80}")
+        print(f"GRID SIZE: {grid_size}x{grid_size}")
+        print(f"{'='*80}")
+
+        # Generate puzzles for this grid size
+        puzzles = generate_counting_puzzles(
+            grid_size=grid_size,
+            num_train=args.counting_num_train,
+            num_test=args.counting_num_test,
+            num_colors=args.counting_num_colors,
+            seed=args.seed + grid_size  # Different seed per size for variety
+        )
+
+        puzzle_id = list(puzzles.keys())[0]
+        puzzle = puzzles[puzzle_id]
+
+        print(f"Generated {len(puzzle['train'])} train, {len(puzzle['test'])} test examples")
+
+        # Verify puzzle correctness (sanity check)
+        sample = puzzle['train'][0]
+        input_flat = [c for row in sample['input'] for c in row]
+        output_color = sample['output'][0][0]
+        from collections import Counter
+        counts = Counter(input_flat)
+        most_common = counts.most_common(1)[0]
+        print(f"Sample puzzle: most frequent color = {most_common[0]} (count={most_common[1]}), output = {output_color}")
+
+        # Setup datasets
+        use_augment = not args.no_augment
+        dihedral_only = args.dihedral_only
+        color_only = args.color_only
+
+        # Create separate puzzle dicts for train and test
+        # CorrespondenceDataset pulls from "train" key, so we put our data there
+        train_puzzle = {puzzle_id: {"train": puzzle["train"]}}
+        test_puzzle = {puzzle_id: {"train": puzzle["test"]}}  # Put test in "train" key for loading
+
+        # Distribute negatives across types (same as main training)
+        num_neg = args.counting_num_negatives
+        num_positives = max(1, num_neg // 4)  # Same ratio as main training
+        num_corrupted = max(1, int(num_neg * 0.35))
+        num_wrong_input = max(1, int(num_neg * 0.15))
+        num_mismatched_aug = max(1, int(num_neg * 0.15)) if use_augment else 0
+        num_color_swap = max(1, int(num_neg * 0.15))
+        remaining = num_neg - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
+        num_all_zeros = max(1, remaining // 3)
+        num_constant_fill = max(1, remaining // 3)
+        num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+
+        # For counting, we want augmentation to test generalization
+        train_dataset = CorrespondenceDataset(
+            puzzles=train_puzzle,
+            num_positives=num_positives,
+            num_corrupted=num_corrupted,
+            num_wrong_input=num_wrong_input,
+            num_mismatched_aug=num_mismatched_aug,
+            num_color_swap=num_color_swap,
+            num_all_zeros=num_all_zeros,
+            num_constant_fill=num_constant_fill,
+            num_random_noise=num_random_noise,
+            augment=use_augment,
+            dihedral_only=dihedral_only,
+            color_only=color_only,
+            mode=args.mode,
+            include_test=False
+        )
+
+        test_dataset = CorrespondenceDataset(
+            puzzles=test_puzzle,
+            num_positives=1,
+            num_corrupted=0,
+            num_wrong_input=0,
+            num_mismatched_aug=0,
+            num_color_swap=0,
+            num_all_zeros=0,
+            num_constant_fill=0,
+            num_random_noise=0,
+            augment=False,  # No augmentation for test
+            dihedral_only=False,
+            color_only=False,
+            mode=args.mode,
+            include_test=False
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                                  shuffle=True, num_workers=args.num_workers)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                                 shuffle=False, num_workers=args.num_workers)
+
+        print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+
+        # Create model
+        num_classes = NUM_COLORS if args.mode == "color" else 1
+        model = PixelErrorCNN(
+            hidden_dim=args.hidden_dim,
+            force_comparison=not args.no_force_comparison,
+            num_classes=num_classes,
+            use_attention=args.use_attention,
+            attention_type=args.attention_type,
+            attention_heads=args.attention_heads,
+            attention_layers=args.attention_layers,
+            no_skip=args.no_skip
+        ).to(DEVICE)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+
+        # Training loop
+        best_test_acc = 0
+        best_epoch = 0
+
+        for epoch in range(args.epochs):
+            model.train()
+            total_loss = 0
+            correct = 0
+            total = 0
+
+            for batch in train_loader:
+                # CorrespondenceDataset returns tuple: (input, output, target, mask) for color mode
+                input_grid, output_grid, target, _ = batch
+                input_grid = input_grid.to(DEVICE)
+                output_grid = output_grid.to(DEVICE)
+                target = target.to(DEVICE)
+
+                optimizer.zero_grad()
+                logits = model(input_grid, output_grid)
+
+                if args.mode == "color":
+                    # Cross-entropy for color prediction
+                    loss = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, NUM_COLORS),
+                                           target.reshape(-1).long())
+                    preds = logits.argmax(dim=1)
+                    correct += (preds == target).sum().item()
+                    total += target.numel()
+                else:
+                    # Binary cross-entropy
+                    loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), target)
+                    preds = (logits.squeeze(1) > 0).float()
+                    correct += (preds == target).sum().item()
+                    total += target.numel()
+
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            scheduler.step()
+
+            # Evaluate on test set
+            model.eval()
+            test_correct = 0
+            test_total = 0
+            test_grid_correct = 0
+            test_grid_total = 0
+
+            with torch.no_grad():
+                for batch in test_loader:
+                    input_grid, output_grid, target, _ = batch
+                    input_grid = input_grid.to(DEVICE)
+                    output_grid = output_grid.to(DEVICE)
+                    target = target.to(DEVICE)
+
+                    logits = model(input_grid, output_grid)
+
+                    if args.mode == "color":
+                        preds = logits.argmax(dim=1)
+                        test_correct += (preds == target).sum().item()
+                        test_total += target.numel()
+                        # Grid-level accuracy (entire grid must be correct)
+                        grid_match = (preds == target).all(dim=(1, 2))
+                        test_grid_correct += grid_match.sum().item()
+                        test_grid_total += grid_match.size(0)
+                    else:
+                        preds = (logits.squeeze(1) > 0).float()
+                        test_correct += (preds == target).sum().item()
+                        test_total += target.numel()
+
+            train_acc = correct / total if total > 0 else 0
+            test_acc = test_correct / test_total if test_total > 0 else 0
+            test_grid_acc = test_grid_correct / test_grid_total if test_grid_total > 0 else 0
+
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                best_epoch = epoch + 1
+
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1:3d}: Train={train_acc:.1%}, Test={test_acc:.1%}, GridAcc={test_grid_acc:.1%}")
+
+        print(f"\n  Best test accuracy: {best_test_acc:.1%} (epoch {best_epoch})")
+        print(f"  Final grid accuracy: {test_grid_acc:.1%}")
+
+        # Run ablation analysis
+        print(f"\n  Running ablation analysis...")
+        ablation_results = run_ablation_analysis(model, test_loader, args.mode)
+
+        # Store results
+        result = {
+            "grid_size": grid_size,
+            "best_test_acc": best_test_acc,
+            "final_test_acc": test_acc,
+            "final_grid_acc": test_grid_acc,
+            "best_epoch": best_epoch,
+            "ablation": ablation_results
+        }
+        all_results.append(result)
+
+        # Print ablation summary
+        print(f"\n  Ablation Results (accuracy drop when layer zeroed):")
+        for layer_name, drop in ablation_results.items():
+            print(f"    {layer_name}: {drop:+.1%}")
+
+    # Final summary
+    print("\n" + "=" * 80)
+    print("COUNTING EXPERIMENT SUMMARY")
+    print("=" * 80)
+    print(f"{'Grid Size':<12} {'Best Acc':<12} {'Grid Acc':<12} {'Best Epoch':<12}")
+    print("-" * 48)
+
+    for r in all_results:
+        print(f"{r['grid_size']}x{r['grid_size']:<9} {r['best_test_acc']:<12.1%} {r['final_grid_acc']:<12.1%} {r['best_epoch']:<12}")
+
+    print("\n" + "=" * 80)
+    print("ABLATION SUMMARY BY GRID SIZE")
+    print("=" * 80)
+
+    # Get all layer names from first result
+    if all_results and all_results[0]["ablation"]:
+        layer_names = list(all_results[0]["ablation"].keys())
+
+        # Print header
+        header = f"{'Grid':<8}"
+        for layer in layer_names[:6]:  # Limit to first 6 layers for readability
+            header += f"{layer:<10}"
+        print(header)
+        print("-" * (8 + 10 * min(6, len(layer_names))))
+
+        # Print each row
+        for r in all_results:
+            row = f"{r['grid_size']}x{r['grid_size']:<5}"
+            for layer in layer_names[:6]:
+                drop = r["ablation"].get(layer, 0)
+                row += f"{drop:+.1%}     "
+            print(row)
+
+    print("\nDone!")
+
+
+def run_ablation_analysis(model, test_loader, mode):
+    """
+    Run layer-wise ablation: zero each layer and measure accuracy drop.
+    """
+    model.eval()
+
+    # Get baseline accuracy
+    baseline_correct = 0
+    baseline_total = 0
+
+    with torch.no_grad():
+        for batch in test_loader:
+            # CorrespondenceDataset returns tuple: (input, output, target, mask)
+            input_grid, output_grid, target, _ = batch
+            input_grid = input_grid.to(DEVICE)
+            output_grid = output_grid.to(DEVICE)
+            target = target.to(DEVICE)
+
+            logits = model(input_grid, output_grid)
+
+            if mode == "color":
+                preds = logits.argmax(dim=1)
+                baseline_correct += (preds == target).sum().item()
+                baseline_total += target.numel()
+            else:
+                preds = (logits.squeeze(1) > 0).float()
+                baseline_correct += (preds == target).sum().item()
+                baseline_total += target.numel()
+
+    baseline_acc = baseline_correct / baseline_total if baseline_total > 0 else 0
+
+    # Test each layer
+    ablation_results = {}
+    layers_to_test = ["inc", "down1", "down2", "down3", "up1", "up2", "up3"]
+
+    for layer_name in layers_to_test:
+        if not hasattr(model, layer_name):
+            continue
+
+        layer = getattr(model, layer_name)
+
+        # Store original forward
+        original_forward = layer.forward
+
+        # Create zeroing forward
+        def zero_forward(*args, **kwargs):
+            out = original_forward(*args, **kwargs)
+            return torch.zeros_like(out)
+
+        # Replace forward
+        layer.forward = zero_forward
+
+        # Measure accuracy with this layer zeroed
+        zeroed_correct = 0
+        zeroed_total = 0
+
+        with torch.no_grad():
+            for batch in test_loader:
+                input_grid, output_grid, target, _ = batch
+                input_grid = input_grid.to(DEVICE)
+                output_grid = output_grid.to(DEVICE)
+                target = target.to(DEVICE)
+
+                try:
+                    logits = model(input_grid, output_grid)
+
+                    if mode == "color":
+                        preds = logits.argmax(dim=1)
+                        zeroed_correct += (preds == target).sum().item()
+                        zeroed_total += target.numel()
+                    else:
+                        preds = (logits.squeeze(1) > 0).float()
+                        zeroed_correct += (preds == target).sum().item()
+                        zeroed_total += target.numel()
+                except Exception:
+                    # If zeroing breaks the model, record as 0 accuracy
+                    zeroed_total = baseline_total
+                    break
+
+        # Restore original forward
+        layer.forward = original_forward
+
+        zeroed_acc = zeroed_correct / zeroed_total if zeroed_total > 0 else 0
+        ablation_results[layer_name] = zeroed_acc - baseline_acc
+
+    return ablation_results
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2222,11 +2687,31 @@ def main():
                              "Zeros each layer's output and measures accuracy drop. "
                              "Requires --eval-on-test to have test data to evaluate against.")
 
+    # Counting experiment mode
+    parser.add_argument("--counting-experiment", action="store_true",
+                        help="Run synthetic 'most frequent color' counting experiment across grid sizes")
+    parser.add_argument("--counting-grid-sizes", type=int, nargs="+",
+                        default=[3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30],
+                        help="Grid sizes to test in counting experiment")
+    parser.add_argument("--counting-num-colors", type=int, default=5,
+                        help="Number of distinct colors per grid in counting experiment")
+    parser.add_argument("--counting-num-train", type=int, default=100,
+                        help="Number of training examples per grid size")
+    parser.add_argument("--counting-num-test", type=int, default=20,
+                        help="Number of test examples per grid size")
+    parser.add_argument("--counting-num-negatives", type=int, default=8,
+                        help="Number of negative samples per example in counting experiment")
+
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # Handle counting experiment mode separately
+    if args.counting_experiment:
+        run_counting_experiment(args)
+        return
 
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
