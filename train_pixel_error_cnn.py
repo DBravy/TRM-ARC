@@ -2306,14 +2306,16 @@ def run_counting_experiment(args):
             include_test=False
         )
 
+        # For test: give model (input, all_zeros) and see if it predicts correct output
+        # This tests actual prediction ability, not just copying
         test_dataset = CorrespondenceDataset(
             puzzles=test_puzzle,
-            num_positives=1,
+            num_positives=0,  # Don't give correct answer!
             num_corrupted=0,
             num_wrong_input=0,
             num_mismatched_aug=0,
             num_color_swap=0,
-            num_all_zeros=0,
+            num_all_zeros=1,  # Give blank output, model must predict correct color
             num_constant_fill=0,
             num_random_noise=0,
             augment=False,  # No augmentation for test
