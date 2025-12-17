@@ -2509,9 +2509,16 @@ def run_ablation_analysis(model, test_loader, mode):
 
     baseline_acc = baseline_correct / baseline_total if baseline_total > 0 else 0
 
-    # Test each layer
+    # Test each layer (including embeddings and output conv for completeness)
     ablation_results = {}
-    layers_to_test = ["inc", "down1", "down2", "down3", "up1", "up2", "up3"]
+    layers_to_test = [
+        "input_embed",   # Input color embedding
+        "output_embed",  # Output color embedding
+        "inc",           # Initial convolution
+        "down1", "down2", "down3",  # Encoder
+        "up1", "up2", "up3",        # Decoder
+        "outc",          # Output convolution
+    ]
 
     for layer_name in layers_to_test:
         if not hasattr(model, layer_name):
