@@ -2276,29 +2276,20 @@ def run_counting_experiment(args):
         train_puzzle = {puzzle_id: {"train": puzzle["train"]}}
         test_puzzle = {puzzle_id: {"train": puzzle["test"]}}  # Put test in "train" key for loading
 
-        # Distribute negatives across types (same as main training)
-        num_neg = args.counting_num_negatives
-        num_positives = max(1, num_neg // 4)  # Same ratio as main training
-        num_corrupted = max(1, int(num_neg * 0.35))
-        num_wrong_input = max(1, int(num_neg * 0.15))
-        num_mismatched_aug = max(1, int(num_neg * 0.15)) if use_augment else 0
-        num_color_swap = max(1, int(num_neg * 0.15))
-        remaining = num_neg - num_corrupted - num_wrong_input - num_mismatched_aug - num_color_swap
-        num_all_zeros = max(1, remaining // 3)
-        num_constant_fill = max(1, remaining // 3)
-        num_random_noise = max(1, remaining - num_all_zeros - num_constant_fill)
+        # For counting experiment: ONLY all_zeros samples
+        # Model sees (input, blank) and must predict the correct output
+        num_all_zeros = args.counting_num_negatives
 
-        # For counting, we want augmentation to test generalization
         train_dataset = CorrespondenceDataset(
             puzzles=train_puzzle,
-            num_positives=num_positives,
-            num_corrupted=num_corrupted,
-            num_wrong_input=num_wrong_input,
-            num_mismatched_aug=num_mismatched_aug,
-            num_color_swap=num_color_swap,
+            num_positives=0,
+            num_corrupted=0,
+            num_wrong_input=0,
+            num_mismatched_aug=0,
+            num_color_swap=0,
             num_all_zeros=num_all_zeros,
-            num_constant_fill=num_constant_fill,
-            num_random_noise=num_random_noise,
+            num_constant_fill=0,
+            num_random_noise=0,
             augment=use_augment,
             dihedral_only=dihedral_only,
             color_only=color_only,
