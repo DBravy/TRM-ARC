@@ -2108,6 +2108,93 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
     print("="*80 + "\n")
 
 
+def visualize_counting_predictions(model: nn.Module, test_loader: DataLoader,
+                                    grid_size: int, device: torch.device,
+                                    num_samples: int = 4):
+    """
+    Visualize predictions for the counting experiment.
+    Shows input grid, expected output (3x3), and predicted output (3x3).
+    """
+    model.eval()
+
+    print(f"\n{'─'*80}")
+    print(f"SAMPLE PREDICTIONS (Grid {grid_size}x{grid_size} → Output 3x3)")
+    print(f"{'─'*80}")
+
+    # Get a batch of test data
+    batch = next(iter(test_loader))
+    input_grids, output_grids, targets, _ = batch
+
+    input_grids = input_grids.to(device)
+    output_grids = output_grids.to(device)
+
+    with torch.no_grad():
+        logits = model(input_grids, output_grids)
+        predictions = logits.argmax(dim=1)  # (B, H, W)
+
+    # Show up to num_samples examples
+    num_to_show = min(num_samples, input_grids.size(0))
+
+    for i in range(num_to_show):
+        inp = input_grids[i].cpu().numpy()
+        target = targets[i].cpu().numpy()
+        pred = predictions[i].cpu().numpy()
+
+        # Find actual content size for input (exclude padding)
+        inp_rows = inp.shape[0]
+        inp_cols = inp.shape[1]
+        # Find non-padded region
+        for r in range(inp_rows - 1, -1, -1):
+            if any(inp[r, :] != 0):
+                inp_rows = r + 1
+                break
+        for c in range(inp_cols - 1, -1, -1):
+            if any(inp[:inp_rows, c] != 0):
+                inp_cols = c + 1
+                break
+        inp_rows = max(inp_rows, grid_size)
+        inp_cols = max(inp_cols, grid_size)
+
+        # Output is always 3x3
+        out_rows, out_cols = 3, 3
+
+        # Count colors in input to show analysis
+        from collections import Counter
+        inp_flat = inp[:grid_size, :grid_size].flatten()
+        color_counts = Counter(inp_flat)
+        most_common = color_counts.most_common(3)
+
+        # Get expected and predicted winner colors
+        expected_color = target[0, 0]  # All same in target
+        predicted_color = pred[0, 0]  # Check prediction at (0,0)
+        is_correct = (pred[:out_rows, :out_cols] == target[:out_rows, :out_cols]).all()
+
+        status = "✓ CORRECT" if is_correct else "✗ WRONG"
+
+        print(f"\n[Example {i+1}] {status}")
+        print(f"  Top colors: {', '.join(f'{c}:{cnt}' for c, cnt in most_common)}")
+        print(f"  Expected: {expected_color}, Predicted: {predicted_color}")
+
+        # Print input grid (truncated if large)
+        print(f"\n  INPUT ({grid_size}x{grid_size}):")
+        max_display = min(grid_size, 10)  # Limit display for large grids
+        for r in range(max_display):
+            row_str = " ".join(f"{inp[r, c]}" for c in range(max_display))
+            suffix = " ..." if grid_size > 10 else ""
+            print(f"    {row_str}{suffix}")
+        if grid_size > 10:
+            print(f"    ... ({grid_size - 10} more rows)")
+
+        # Print output side by side: EXPECTED vs PREDICTED
+        print(f"\n  {'EXPECTED (3x3)':<20} {'PREDICTED (3x3)':<20}")
+        for r in range(out_rows):
+            exp_row = " ".join(f"{target[r, c]}" for c in range(out_cols))
+            pred_row = " ".join(f"{pred[r, c]}" for c in range(out_cols))
+            print(f"    {exp_row:<18} {pred_row:<18}")
+
+    print(f"\n{'─'*80}\n")
+
+
 # =============================================================================
 # Counting Experiment - Synthetic Puzzle Generation
 # =============================================================================
@@ -2427,6 +2514,9 @@ def run_counting_experiment(args):
         # Run ablation analysis
         print(f"\n  Running ablation analysis...")
         ablation_results = run_ablation_analysis(model, test_loader, args.mode)
+
+        # Visualize predictions
+        visualize_counting_predictions(model, test_loader, grid_size, DEVICE, num_samples=4)
 
         # Store results
         result = {
