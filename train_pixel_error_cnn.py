@@ -2112,12 +2112,14 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
 # Counting Experiment - Synthetic Puzzle Generation
 # =============================================================================
 
-def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Generator) -> Dict:
+def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Generator,
+                              output_size: int = 3) -> Dict:
     """
     Generate a single 'most frequent color' puzzle example.
 
     The winner color has exactly 1 more pixel than the runner-up (hardest case).
-    Output is the entire grid filled with the winner color.
+    Output is always a fixed-size grid (default 3x3) filled with the winner color.
+    This decouples input complexity from output size.
     """
     # Pick num_colors random colors from 0-9
     available_colors = list(range(10))
@@ -2175,9 +2177,9 @@ def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Gen
     rng.shuffle(pixels)
     input_grid = np.array(pixels).reshape(grid_size, grid_size).tolist()
 
-    # Output is all winner color
+    # Output is all winner color (fixed size, default 3x3)
     winner_color = colors[winner_idx]
-    output_grid = [[winner_color] * grid_size for _ in range(grid_size)]
+    output_grid = [[winner_color] * output_size for _ in range(output_size)]
 
     return {"input": input_grid, "output": output_grid}
 
