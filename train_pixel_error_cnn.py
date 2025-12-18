@@ -2551,10 +2551,13 @@ def run_counting_experiment(args):
         }
         all_results.append(result)
 
-        # Print ablation summary
-        print(f"\n  Ablation Results (accuracy drop when layer zeroed):")
-        for layer_name, drop in ablation_results.items():
-            print(f"    {layer_name}: {drop:+.1%}")
+        # Print ablation summary (detailed output already printed by run_ablation_analysis)
+        # Just show a compact per-grid-size summary here
+        print(f"\n  Ablation Summary (accuracy drop when layer zeroed):")
+        for layer_name, layer_data in ablation_results["layers"].items():
+            if "error" not in layer_data:
+                drop = layer_data["accuracy_drop"]
+                print(f"    {layer_name}: {drop:+.1%}")
 
     # Final summary
     print("\n" + "=" * 80)
@@ -2570,24 +2573,38 @@ def run_counting_experiment(args):
     print("ABLATION SUMMARY BY GRID SIZE")
     print("=" * 80)
 
-    # Get all layer names from first result
-    if all_results and all_results[0]["ablation"]:
-        layer_names = list(all_results[0]["ablation"].keys())
+    # Get all layer names from first result (using short attr names for table)
+    if all_results and all_results[0]["ablation"].get("layers"):
+        # Get short layer names (attr_name) for compact display
+        first_layers = all_results[0]["ablation"]["layers"]
+        layer_info = [(name, data.get("attr_name", name)) for name, data in first_layers.items()
+                      if "error" not in data]
 
-        # Print header
+        # Print header with short names
         header = f"{'Grid':<8}"
-        for layer in layer_names[:6]:  # Limit to first 6 layers for readability
-            header += f"{layer:<10}"
+        for _, short_name in layer_info[:6]:  # Limit to first 6 layers for readability
+            header += f"{short_name:<12}"
         print(header)
-        print("-" * (8 + 10 * min(6, len(layer_names))))
+        print("-" * (8 + 12 * min(6, len(layer_info))))
 
         # Print each row
         for r in all_results:
             row = f"{r['grid_size']}x{r['grid_size']:<5}"
-            for layer in layer_names[:6]:
-                drop = r["ablation"].get(layer, 0)
-                row += f"{drop:+.1%}     "
+            layers_data = r["ablation"].get("layers", {})
+            for full_name, short_name in layer_info[:6]:
+                layer_data = layers_data.get(full_name, {})
+                drop = layer_data.get("accuracy_drop", 0) if "error" not in layer_data else 0
+                row += f"{drop:+.1%}       "
             print(row)
+
+        # Also show baseline accuracy trend
+        print("\n" + "-" * 60)
+        print("Baseline Accuracy by Grid Size:")
+        for r in all_results:
+            baseline = r["ablation"].get("baseline", {})
+            pixel_acc = baseline.get("accuracy", 0)
+            grid_acc = baseline.get("grid_accuracy", 0)
+            print(f"  {r['grid_size']}x{r['grid_size']}: Pixel={pixel_acc:.1%}, Grid={grid_acc:.1%}")
 
     # Final visualization: one sample from each grid size
     print("\n" + "=" * 80)
@@ -2639,99 +2656,247 @@ def run_counting_experiment(args):
     print("Done!")
 
 
-def run_ablation_analysis(model, test_loader, mode):
+def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
     """
-    Run layer-wise ablation: zero each layer and measure accuracy drop.
+    Run layer-wise ablation using forward hooks (consistent with run_layer_ablation).
+
+    For each layer, we temporarily zero out its output and measure the impact
+    on test accuracy. Larger drops indicate more critical layers.
+
+    Args:
+        model: The model to analyze
+        test_loader: DataLoader for test data
+        mode: "color" or "binary"
+        verbose: Whether to print detailed output
+
+    Returns:
+        Dict with 'baseline' and 'layers' keys containing ablation results
     """
     model.eval()
 
-    # Get baseline accuracy
-    baseline_correct = 0
-    baseline_total = 0
-
-    with torch.no_grad():
-        for batch in test_loader:
-            # CorrespondenceDataset returns tuple: (input, output, target, mask)
-            input_grid, output_grid, target, _ = batch
-            input_grid = input_grid.to(DEVICE)
-            output_grid = output_grid.to(DEVICE)
-            target = target.to(DEVICE)
-
-            logits = model(input_grid, output_grid)
-
-            if mode == "color":
-                preds = logits.argmax(dim=1)
-                baseline_correct += (preds == target).sum().item()
-                baseline_total += target.numel()
-            else:
-                preds = (logits.squeeze(1) > 0).float()
-                baseline_correct += (preds == target).sum().item()
-                baseline_total += target.numel()
-
-    baseline_acc = baseline_correct / baseline_total if baseline_total > 0 else 0
-
-    # Test each layer (including embeddings and output conv for completeness)
-    ablation_results = {}
-    layers_to_test = [
-        "input_embed",   # Input color embedding
-        "output_embed",  # Output color embedding
-        "inc",           # Initial convolution
-        "down1", "down2", "down3",  # Encoder
-        "up1", "up2", "up3",        # Decoder
-        "outc",          # Output convolution
-    ]
-
-    for layer_name in layers_to_test:
-        if not hasattr(model, layer_name):
-            continue
-
-        layer = getattr(model, layer_name)
-
-        # Store original forward
-        original_forward = layer.forward
-
-        # Create zeroing forward
-        def zero_forward(*args, **kwargs):
-            out = original_forward(*args, **kwargs)
-            return torch.zeros_like(out)
-
-        # Replace forward
-        layer.forward = zero_forward
-
-        # Measure accuracy with this layer zeroed
-        zeroed_correct = 0
-        zeroed_total = 0
+    def evaluate_loader(loader, device, mode):
+        """Evaluate model on a DataLoader, returning pixel and grid accuracy."""
+        pixel_correct = 0
+        pixel_total = 0
+        grid_correct = 0
+        grid_total = 0
 
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in loader:
                 input_grid, output_grid, target, _ = batch
-                input_grid = input_grid.to(DEVICE)
-                output_grid = output_grid.to(DEVICE)
-                target = target.to(DEVICE)
+                input_grid = input_grid.to(device)
+                output_grid = output_grid.to(device)
+                target = target.to(device)
 
-                try:
-                    logits = model(input_grid, output_grid)
+                logits = model(input_grid, output_grid)
 
-                    if mode == "color":
-                        preds = logits.argmax(dim=1)
-                        zeroed_correct += (preds == target).sum().item()
-                        zeroed_total += target.numel()
-                    else:
-                        preds = (logits.squeeze(1) > 0).float()
-                        zeroed_correct += (preds == target).sum().item()
-                        zeroed_total += target.numel()
-                except Exception:
-                    # If zeroing breaks the model, record as 0 accuracy
-                    zeroed_total = baseline_total
-                    break
+                if mode == "color":
+                    preds = logits.argmax(dim=1)
+                else:
+                    preds = (logits.squeeze(1) > 0).float()
 
-        # Restore original forward
-        layer.forward = original_forward
+                pixel_correct += (preds == target).sum().item()
+                pixel_total += target.numel()
 
-        zeroed_acc = zeroed_correct / zeroed_total if zeroed_total > 0 else 0
-        ablation_results[layer_name] = zeroed_acc - baseline_acc
+                # Grid-level accuracy (entire grid must be correct)
+                grid_match = (preds == target).all(dim=(1, 2))
+                grid_correct += grid_match.sum().item()
+                grid_total += grid_match.size(0)
 
-    return ablation_results
+        pixel_acc = pixel_correct / pixel_total if pixel_total > 0 else 0
+        grid_acc = grid_correct / grid_total if grid_total > 0 else 0
+        return pixel_acc, grid_acc
+
+    # Get baseline accuracy
+    if verbose:
+        print("\n" + "="*70)
+        print("LAYER-WISE ABLATION ANALYSIS")
+        print("="*70)
+        print("Testing which layers are critical for this task...")
+        print("Baseline = normal model, then we zero each layer's output one at a time.\n")
+
+    baseline_acc, baseline_grid_acc = evaluate_loader(test_loader, DEVICE, mode)
+
+    if verbose:
+        print(f"BASELINE (no ablation):")
+        print(f"  Pixel Accuracy: {baseline_acc:.2%}")
+        print(f"  Grid Accuracy:  {baseline_grid_acc:.2%}")
+        print(f"{'─'*70}\n")
+
+    # Define layer groups based on architecture (similar to run_layer_ablation)
+    layer_groups = {
+        "Embeddings": [
+            ("input_embed", "input_embed"),
+            ("output_embed", "output_embed"),
+        ],
+        "Encoder": [
+            ("inc (initial conv)", "inc"),
+            ("down1 (encoder level 1)", "down1"),
+            ("down2 (encoder level 2)", "down2"),
+            ("down3 (encoder level 3 / bottleneck)", "down3"),
+        ],
+        "Decoder": [
+            ("up1 (decoder level 1)", "up1"),
+            ("up2 (decoder level 2)", "up2"),
+            ("up3 (decoder level 3)", "up3"),
+        ],
+        "Output": [
+            ("outc (output conv)", "outc"),
+        ],
+    }
+
+    # Add attention if present
+    if hasattr(model, 'bottleneck_attn') and getattr(model, 'use_attention', False):
+        layer_groups["Attention"] = [
+            ("bottleneck_attn", "bottleneck_attn"),
+        ]
+        if hasattr(model, 'film') and not getattr(model, 'no_skip', True):
+            layer_groups["FiLM"] = [
+                ("film (global context)", "film"),
+            ]
+
+    # Collect all layers to test
+    all_layers = []
+    for group_name, layers in layer_groups.items():
+        for display_name, attr_name in layers:
+            if hasattr(model, attr_name):
+                all_layers.append((group_name, display_name, attr_name, getattr(model, attr_name)))
+
+    # Hook storage
+    handles = []
+    ablation_active = {"enabled": False, "layer": None}
+
+    def make_zero_hook(layer_attr_name):
+        """Create a hook that zeros out the layer's output when ablation is active."""
+        def hook(module, input, output):
+            if ablation_active["enabled"] and ablation_active["layer"] == layer_attr_name:
+                if isinstance(output, torch.Tensor):
+                    return torch.zeros_like(output)
+                elif isinstance(output, tuple):
+                    return tuple(torch.zeros_like(o) if isinstance(o, torch.Tensor) else o for o in output)
+            return output
+        return hook
+
+    # Register hooks on all layers
+    for group_name, display_name, attr_name, layer_module in all_layers:
+        handle = layer_module.register_forward_hook(make_zero_hook(attr_name))
+        handles.append(handle)
+
+    # Store ablation results
+    ablation_results = {}
+
+    if verbose:
+        print("Testing each layer (zeroing its output):\n")
+
+    # Test each layer
+    for group_name, display_name, attr_name, layer_module in all_layers:
+        # Enable ablation for this layer
+        ablation_active["enabled"] = True
+        ablation_active["layer"] = attr_name
+
+        try:
+            acc, grid_acc = evaluate_loader(test_loader, DEVICE, mode)
+
+            # Calculate drops from baseline
+            acc_drop = baseline_acc - acc
+            grid_drop = baseline_grid_acc - grid_acc
+
+            # Store results
+            ablation_results[display_name] = {
+                "group": group_name,
+                "attr_name": attr_name,
+                "accuracy": acc,
+                "grid_accuracy": grid_acc,
+                "accuracy_drop": acc_drop,
+                "grid_drop": grid_drop,
+                "relative_drop": acc_drop / baseline_acc if baseline_acc > 0 else 0,
+            }
+
+            if verbose:
+                # Determine impact level
+                if acc_drop > 0.5:
+                    impact = "██████████ CRITICAL"
+                elif acc_drop > 0.3:
+                    impact = "████████░░ HIGH"
+                elif acc_drop > 0.1:
+                    impact = "█████░░░░░ MEDIUM"
+                elif acc_drop > 0.02:
+                    impact = "██░░░░░░░░ LOW"
+                else:
+                    impact = "░░░░░░░░░░ MINIMAL"
+
+                print(f"  [{group_name}] {display_name}")
+                print(f"    Pixel Acc: {acc:.2%} (drop: {acc_drop:+.2%})  {impact}")
+                if baseline_grid_acc > 0:
+                    print(f"    Grid Acc:  {grid_acc:.2%} (drop: {grid_drop:+.2%})")
+                print()
+
+        except Exception as e:
+            if verbose:
+                print(f"  [{group_name}] {display_name}: ERROR - {e}")
+            ablation_results[display_name] = {"error": str(e), "group": group_name}
+
+        # Disable ablation
+        ablation_active["enabled"] = False
+
+    # Remove all hooks
+    for handle in handles:
+        handle.remove()
+
+    # Print summary if verbose
+    if verbose:
+        print("="*70)
+        print("ABLATION SUMMARY (sorted by impact)")
+        print("="*70)
+
+        # Sort by accuracy drop
+        sorted_layers = sorted(
+            [(name, res) for name, res in ablation_results.items() if "error" not in res],
+            key=lambda x: x[1]["accuracy_drop"],
+            reverse=True
+        )
+
+        print("\nMost Critical Layers (largest accuracy drop when ablated):")
+        for i, (name, res) in enumerate(sorted_layers[:5], 1):
+            print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
+
+        if len(sorted_layers) > 3:
+            print("\nLeast Critical Layers (smallest accuracy drop when ablated):")
+            for i, (name, res) in enumerate(sorted_layers[-3:], 1):
+                print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
+
+        # Interpretation
+        print("\n" + "─"*70)
+        print("INTERPRETATION:")
+
+        critical_layers = [name for name, res in sorted_layers if res["accuracy_drop"] > 0.3]
+        if critical_layers:
+            print(f"  • Critical layers: {', '.join(critical_layers)}")
+
+        minimal_layers = [name for name, res in sorted_layers if res["accuracy_drop"] < 0.02]
+        if minimal_layers:
+            print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+
+        # Check encoder vs decoder balance
+        encoder_drops = [res["accuracy_drop"] for name, res in ablation_results.items()
+                        if res.get("group") == "Encoder" and "error" not in res]
+        decoder_drops = [res["accuracy_drop"] for name, res in ablation_results.items()
+                        if res.get("group") == "Decoder" and "error" not in res]
+
+        if encoder_drops and decoder_drops:
+            avg_encoder = sum(encoder_drops) / len(encoder_drops)
+            avg_decoder = sum(decoder_drops) / len(decoder_drops)
+            if avg_encoder > avg_decoder * 1.5:
+                print(f"  • Encoder-heavy: avg encoder drop {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
+            elif avg_decoder > avg_encoder * 1.5:
+                print(f"  • Decoder-heavy: avg decoder drop {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
+
+        print("─"*70 + "\n")
+
+    return {
+        "baseline": {"accuracy": baseline_acc, "grid_accuracy": baseline_grid_acc},
+        "layers": ablation_results,
+    }
 
 
 # =============================================================================
