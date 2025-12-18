@@ -2236,16 +2236,25 @@ def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Gen
     current_max = max(counts[i] for i in range(num_colors) if i != winner_idx)
     counts[winner_idx] = current_max + 1
 
+    # Find actual runner-up index (the one with current_max count)
+    runner_up_idx = None
+    for i in range(num_colors):
+        if i != winner_idx and counts[i] == current_max:
+            runner_up_idx = i
+            break
+
     # Adjust total if we went over
     current_total = sum(counts)
     if current_total > total_pixels:
-        # Remove from non-winner, non-runner-up colors
+        # Remove from non-winner, non-runner-up colors only
         diff = current_total - total_pixels
         for i in range(num_colors):
-            if i != winner_idx and diff > 0 and counts[i] > 1:
+            if i != winner_idx and i != runner_up_idx and diff > 0 and counts[i] > 1:
                 remove = min(diff, counts[i] - 1)
                 counts[i] -= remove
                 diff -= remove
+        # If still over (not enough other colors), we must accept larger margin
+        # This shouldn't happen with reasonable num_colors
     elif current_total < total_pixels:
         # Add to winner
         counts[winner_idx] += total_pixels - current_total
