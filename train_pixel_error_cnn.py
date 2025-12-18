@@ -205,10 +205,10 @@ class DoubleConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.Conv2d(in_ch, out_ch, 5, padding=2),  # CHANGED: 3x3 -> 5x5, padding 1 -> 2
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.Conv2d(out_ch, out_ch, 5, padding=2),  # CHANGED: 3x3 -> 5x5, padding 1 -> 2
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
@@ -489,12 +489,12 @@ class DilatedConvBlock(nn.Module):
     
     def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
         super().__init__()
-        # Padding must equal dilation for 3x3 kernel to maintain spatial size
+        # CHANGED: Padding must equal dilation*2 for 5x5 kernel to maintain spatial size (was dilation for 3x3)
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(in_ch, out_ch, 5, padding=dilation*2, dilation=dilation),  # CHANGED: 3x3 -> 5x5, padding dilation -> dilation*2
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(out_ch, out_ch, 5, padding=dilation*2, dilation=dilation),  # CHANGED: 3x3 -> 5x5, padding dilation -> dilation*2
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
