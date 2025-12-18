@@ -2552,16 +2552,13 @@ def run_counting_experiment(args):
         all_results.append(result)
 
         # Print ablation summary (detailed output already printed by run_ablation_analysis)
-        # Just show a compact per-grid-size summary here with max impact
-        print(f"\n  Ablation Summary (max of pixel/grid drop when layer zeroed):")
+        # Just show a compact per-grid-size summary here
+        print(f"\n  Ablation Summary (drop when layer zeroed):")
         for layer_name, layer_data in ablation_results["layers"].items():
             if "error" not in layer_data:
-                max_drop = layer_data["max_drop"]
                 grid_drop = layer_data["grid_drop"]
                 pixel_drop = layer_data["accuracy_drop"]
-                # Flag if grid is hit harder than pixel
-                flag = " ⚠️grid" if grid_drop > pixel_drop + 0.1 else ""
-                print(f"    {layer_name}: {max_drop:+.1%}{flag}")
+                print(f"    {layer_name}: grid {grid_drop:+.1%}, pixel {pixel_drop:+.1%}")
 
     # Final summary
     print("\n" + "=" * 80)
@@ -2591,25 +2588,25 @@ def run_counting_experiment(args):
         print(header)
         print("-" * (8 + 12 * min(6, len(layer_info))))
 
-        # Print each row (showing max drop = max of pixel and grid drops)
-        print("\nMax Impact (max of pixel/grid drop):")
-        for r in all_results:
-            row = f"{r['grid_size']}x{r['grid_size']:<5}"
-            layers_data = r["ablation"].get("layers", {})
-            for full_name, short_name in layer_info[:6]:
-                layer_data = layers_data.get(full_name, {})
-                drop = layer_data.get("max_drop", 0) if "error" not in layer_data else 0
-                row += f"{drop:+.1%}       "
-            print(row)
-
-        # Show grid-specific drops (often more severe than pixel drops)
-        print("\nGrid Accuracy Drop (critical for whole-puzzle correctness):")
+        # Show grid accuracy drops
+        print("\nGrid Accuracy Drop:")
         for r in all_results:
             row = f"{r['grid_size']}x{r['grid_size']:<5}"
             layers_data = r["ablation"].get("layers", {})
             for full_name, short_name in layer_info[:6]:
                 layer_data = layers_data.get(full_name, {})
                 drop = layer_data.get("grid_drop", 0) if "error" not in layer_data else 0
+                row += f"{drop:+.1%}       "
+            print(row)
+
+        # Show pixel accuracy drops
+        print("\nPixel Accuracy Drop:")
+        for r in all_results:
+            row = f"{r['grid_size']}x{r['grid_size']:<5}"
+            layers_data = r["ablation"].get("layers", {})
+            for full_name, short_name in layer_info[:6]:
+                layer_data = layers_data.get(full_name, {})
+                drop = layer_data.get("accuracy_drop", 0) if "error" not in layer_data else 0
                 row += f"{drop:+.1%}       "
             print(row)
 
@@ -2835,25 +2832,23 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
             }
 
             if verbose:
-                # Determine impact level based on MAX of pixel and grid drops
-                # This ensures layers that wipe out grid accuracy are flagged as critical
-                if max_drop > 0.5:
-                    impact = "██████████ CRITICAL"
-                elif max_drop > 0.3:
-                    impact = "████████░░ HIGH"
-                elif max_drop > 0.1:
-                    impact = "█████░░░░░ MEDIUM"
-                elif max_drop > 0.02:
-                    impact = "██░░░░░░░░ LOW"
-                else:
-                    impact = "░░░░░░░░░░ MINIMAL"
+                # Determine impact levels separately for pixel and grid
+                def get_impact_bar(drop):
+                    if drop > 0.5:
+                        return "██████████ CRITICAL"
+                    elif drop > 0.3:
+                        return "████████░░ HIGH"
+                    elif drop > 0.1:
+                        return "█████░░░░░ MEDIUM"
+                    elif drop > 0.02:
+                        return "██░░░░░░░░ LOW"
+                    else:
+                        return "░░░░░░░░░░ MINIMAL"
 
                 print(f"  [{group_name}] {display_name}")
-                # Show grid accuracy first (prioritized)
                 if baseline_grid_acc > 0:
-                    grid_impact = "⚠️ " if grid_drop > acc_drop + 0.1 else ""
-                    print(f"    Grid Acc:  {grid_acc:.2%} (drop: {grid_drop:+.2%}) {grid_impact}")
-                print(f"    Pixel Acc: {acc:.2%} (drop: {acc_drop:+.2%})  {impact}")
+                    print(f"    Grid Acc:  {grid_acc:.2%} (drop: {grid_drop:+.2%})  {get_impact_bar(grid_drop)}")
+                print(f"    Pixel Acc: {acc:.2%} (drop: {acc_drop:+.2%})  {get_impact_bar(acc_drop)}")
                 print()
 
         except Exception as e:
@@ -2871,75 +2866,64 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
     # Print summary if verbose
     if verbose:
         print("="*70)
-        print("ABLATION SUMMARY (sorted by max impact)")
+        print("ABLATION SUMMARY")
         print("="*70)
 
-        # Sort by max_drop (max of pixel and grid drops)
-        sorted_layers = sorted(
+        # Sort by grid_drop for grid-critical analysis
+        sorted_by_grid = sorted(
             [(name, res) for name, res in ablation_results.items() if "error" not in res],
-            key=lambda x: x[1]["max_drop"],
+            key=lambda x: x[1]["grid_drop"],
             reverse=True
         )
 
-        print("\nMost Critical Layers (largest impact when ablated):")
-        for i, (name, res) in enumerate(sorted_layers[:5], 1):
-            pixel_drop = res['accuracy_drop']
-            grid_drop = res['grid_drop']
-            # Show which metric was more affected
-            if grid_drop > pixel_drop + 0.05:
-                detail = f"grid: {grid_drop:+.2%}, pixel: {pixel_drop:+.2%}"
-            elif pixel_drop > grid_drop + 0.05:
-                detail = f"pixel: {pixel_drop:+.2%}, grid: {grid_drop:+.2%}"
-            else:
-                detail = f"both: ~{res['max_drop']:+.2%}"
-            print(f"  {i}. {name}: {detail}")
+        # Sort by pixel_drop for pixel-critical analysis
+        sorted_by_pixel = sorted(
+            [(name, res) for name, res in ablation_results.items() if "error" not in res],
+            key=lambda x: x[1]["accuracy_drop"],
+            reverse=True
+        )
 
-        if len(sorted_layers) > 3:
-            print("\nLeast Critical Layers (smallest impact when ablated):")
-            for i, (name, res) in enumerate(sorted_layers[-3:], 1):
-                print(f"  {i}. {name}: max drop {res['max_drop']:+.2%}")
+        print("\nGrid-Critical Layers (sorted by grid accuracy drop):")
+        for i, (name, res) in enumerate(sorted_by_grid[:5], 1):
+            print(f"  {i}. {name}: {res['grid_drop']:+.2%} grid drop")
+
+        print("\nPixel-Critical Layers (sorted by pixel accuracy drop):")
+        for i, (name, res) in enumerate(sorted_by_pixel[:5], 1):
+            print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} pixel drop")
 
         # Interpretation
         print("\n" + "─"*70)
         print("INTERPRETATION:")
 
-        # Critical for grid accuracy (even if pixel accuracy is OK)
-        grid_critical = [name for name, res in sorted_layers if res["grid_drop"] > 0.3]
-        pixel_critical = [name for name, res in sorted_layers if res["accuracy_drop"] > 0.3]
+        # Critical thresholds
+        grid_critical = [name for name, res in sorted_by_grid if res["grid_drop"] > 0.3]
+        pixel_critical = [name for name, res in sorted_by_pixel if res["accuracy_drop"] > 0.3]
 
         if grid_critical:
-            print(f"  • Grid-critical layers: {', '.join(grid_critical)}")
-            print(f"    (Ablating these wipes out whole-grid accuracy)")
+            print(f"  • Grid-critical (>30% drop): {', '.join(grid_critical)}")
 
-        # Layers critical for pixel but not grid (or vice versa)
-        pixel_only_critical = [n for n in pixel_critical if n not in grid_critical]
-        if pixel_only_critical:
-            print(f"  • Pixel-critical (not grid): {', '.join(pixel_only_critical)}")
+        if pixel_critical:
+            print(f"  • Pixel-critical (>30% drop): {', '.join(pixel_critical)}")
 
-        # Layers that hurt grid more than pixel (interesting diagnostic)
-        grid_sensitive = [name for name, res in sorted_layers
-                        if res["grid_drop"] > res["accuracy_drop"] + 0.15]
-        if grid_sensitive:
-            print(f"  • Grid-sensitive layers: {', '.join(grid_sensitive)}")
-            print(f"    (Grid accuracy drops much more than pixel accuracy)")
-
-        minimal_layers = [name for name, res in sorted_layers if res["max_drop"] < 0.02]
+        # Minimal impact (both metrics)
+        minimal_layers = [name for name, res in sorted_by_grid
+                        if res["grid_drop"] < 0.02 and res["accuracy_drop"] < 0.02]
         if minimal_layers:
             print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
 
-        # Check encoder vs decoder balance (using max_drop)
-        encoder_drops = [res["max_drop"] for _, res in ablation_results.items()
-                        if res.get("group") == "Encoder" and "error" not in res]
-        decoder_drops = [res["max_drop"] for _, res in ablation_results.items()
-                        if res.get("group") == "Decoder" and "error" not in res]
+        # Check encoder vs decoder balance
+        encoder_grid_drops = [res["grid_drop"] for _, res in ablation_results.items()
+                             if res.get("group") == "Encoder" and "error" not in res]
+        decoder_grid_drops = [res["grid_drop"] for _, res in ablation_results.items()
+                             if res.get("group") == "Decoder" and "error" not in res]
 
-        if encoder_drops and decoder_drops:
-            avg_encoder = sum(encoder_drops) / len(encoder_drops)
-            avg_decoder = sum(decoder_drops) / len(decoder_drops)
+        if encoder_grid_drops and decoder_grid_drops:
+            avg_encoder = sum(encoder_grid_drops) / len(encoder_grid_drops)
+            avg_decoder = sum(decoder_grid_drops) / len(decoder_grid_drops)
             if avg_encoder > avg_decoder * 1.5:
-                print(f"  • Encoder-heavy: avg encoder impact {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
+                print(f"  • Encoder-heavy (grid): avg {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
             elif avg_decoder > avg_encoder * 1.5:
-                print(f"  • Decoder-heavy: avg decoder impact {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
+                print(f"  • Decoder-heavy (grid): avg {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
 
         print("─"*70 + "\n")
 
