@@ -1531,23 +1531,30 @@ def run_layer_ablation(
             ],
         }
     else:
-        # PixelErrorCNN (U-Net) layers
+        # PixelErrorCNN (U-Net) layers - build based on num_layers
+        encoder_layers = [
+            ("inc (initial conv)", model.inc),
+            ("down1 (encoder level 1)", model.down1),
+        ]
+        if model.num_layers >= 2:
+            encoder_layers.append(("down2 (encoder level 2)", model.down2))
+        if model.num_layers >= 3:
+            encoder_layers.append(("down3 (encoder level 3 / bottleneck)", model.down3))
+
+        decoder_layers = []
+        if model.num_layers >= 3:
+            decoder_layers.append(("up1 (decoder level 1)", model.up1))
+        if model.num_layers >= 2:
+            decoder_layers.append(("up2 (decoder level 2)", model.up2))
+        decoder_layers.append(("up3 (decoder level 3)", model.up3))
+
         layer_groups = {
             "Embeddings": [
                 ("input_embed", model.input_embed),
                 ("output_embed", model.output_embed),
             ],
-            "Encoder": [
-                ("inc (initial conv)", model.inc),
-                ("down1 (encoder level 1)", model.down1),
-                ("down2 (encoder level 2)", model.down2),
-                ("down3 (encoder level 3 / bottleneck)", model.down3),
-            ],
-            "Decoder": [
-                ("up1 (decoder level 1)", model.up1),
-                ("up2 (decoder level 2)", model.up2),
-                ("up3 (decoder level 3)", model.up3),
-            ],
+            "Encoder": encoder_layers,
+            "Decoder": decoder_layers,
         }
         # Add attention if present
         if hasattr(model, 'bottleneck_attn') and model.use_attention:
