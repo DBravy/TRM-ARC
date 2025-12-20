@@ -668,16 +668,17 @@ class PixelErrorCNN(nn.Module):
     """
 
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
-                 use_attention: bool = False, attention_type: str = "self", 
+                 use_attention: bool = False, attention_type: str = "self",
                  attention_heads: int = 8, attention_layers: int = 1,
-                 no_skip: bool = False):
+                 no_skip: bool = False, num_layers: int = 3):
         super().__init__()
-        
+
         self.force_comparison = force_comparison
         self.num_classes = num_classes
         self.use_attention = use_attention
         self.attention_type = attention_type
         self.no_skip = no_skip
+        self.num_layers = num_layers
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -689,34 +690,44 @@ class PixelErrorCNN(nn.Module):
             in_channels = 64
         else:
             in_channels = 32
-            
+
         base_ch = hidden_dim
 
-        # Encoder
+        # Bottleneck dimension depends on num_layers: 2^num_layers * base_ch
+        # 1 layer: base_ch * 2, 2 layers: base_ch * 4, 3 layers: base_ch * 8
+        bottleneck_dim = base_ch * (2 ** num_layers)
+
+        # Encoder - create layers based on num_layers
         self.inc = DoubleConv(in_channels, base_ch)
         self.down1 = Down(base_ch, base_ch * 2)
-        self.down2 = Down(base_ch * 2, base_ch * 4)
-        self.down3 = Down(base_ch * 4, base_ch * 8)
+        if num_layers >= 2:
+            self.down2 = Down(base_ch * 2, base_ch * 4)
+        if num_layers >= 3:
+            self.down3 = Down(base_ch * 4, base_ch * 8)
 
-        # Decoder
+        # Decoder - create layers based on num_layers
         if no_skip:
             # No skip connections - all info must flow through bottleneck
-            self.up1 = UpNoSkip(base_ch * 8, base_ch * 4)
-            self.up2 = UpNoSkip(base_ch * 4, base_ch * 2)
+            if num_layers >= 3:
+                self.up1 = UpNoSkip(base_ch * 8, base_ch * 4)
+            if num_layers >= 2:
+                self.up2 = UpNoSkip(base_ch * 4, base_ch * 2)
             self.up3 = UpNoSkip(base_ch * 2, base_ch)
         else:
             # Standard U-Net with skip connections
-            self.up1 = Up(base_ch * 8, base_ch * 4)
-            self.up2 = Up(base_ch * 4, base_ch * 2)
+            if num_layers >= 3:
+                self.up1 = Up(base_ch * 8, base_ch * 4)
+            if num_layers >= 2:
+                self.up2 = Up(base_ch * 4, base_ch * 2)
             self.up3 = Up(base_ch * 2, base_ch)
 
         # Optional bottleneck attention for global reasoning
         if use_attention:
             if attention_type == "cbam":
-                self.bottleneck_attn = CBAM(base_ch * 8)
+                self.bottleneck_attn = CBAM(bottleneck_dim)
             else:  # "self" attention (default)
                 self.bottleneck_attn = BottleneckAttention(
-                    dim=base_ch * 8,
+                    dim=bottleneck_dim,
                     num_heads=attention_heads,
                     num_layers=attention_layers
                 )
@@ -724,9 +735,16 @@ class PixelErrorCNN(nn.Module):
             # Note: FiLM is only used with self-attention since CBAM doesn't produce the same
             # kind of global context vector
             if not no_skip and attention_type == "self":
+                # Adjust skip_dims based on num_layers
+                if num_layers == 3:
+                    skip_dims = [base_ch * 4, base_ch * 2, base_ch]
+                elif num_layers == 2:
+                    skip_dims = [base_ch * 2, base_ch]
+                else:  # num_layers == 1
+                    skip_dims = [base_ch]
                 self.film = FiLMModulation(
-                    bottleneck_dim=base_ch * 8,
-                    skip_dims=[base_ch * 4, base_ch * 2, base_ch]
+                    bottleneck_dim=bottleneck_dim,
+                    skip_dims=skip_dims
                 )
 
         # Output: 1 channel for binary, 10 channels for color prediction
@@ -744,43 +762,72 @@ class PixelErrorCNN(nn.Module):
             x = torch.cat([inp_emb, out_emb, diff, prod], dim=-1)  # (B, 30, 30, 64)
         else:
             x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, 30, 30, 32)
-            
+
         x = x.permute(0, 3, 1, 2).contiguous()
 
-        # U-Net forward
+        # U-Net forward - encoder
         x1 = self.inc(x)
         x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
+
+        if self.num_layers >= 2:
+            x3 = self.down2(x2)
+        if self.num_layers >= 3:
+            x4 = self.down3(x3)
+
+        # Determine bottleneck based on num_layers
+        if self.num_layers == 1:
+            bottleneck = x2
+        elif self.num_layers == 2:
+            bottleneck = x3
+        else:  # num_layers == 3
+            bottleneck = x4
 
         # Apply bottleneck attention for global reasoning (if enabled)
         if self.use_attention:
-            x4 = self.bottleneck_attn(x4)
-            
+            bottleneck = self.bottleneck_attn(bottleneck)
+
             # Generate FiLM modulation parameters from global context (only if using skip connections)
             # Note: FiLM is only used with self-attention, not CBAM
             if not self.no_skip and self.attention_type == "self":
-                film_params = self.film(x4)  # [(γ3, β3), (γ2, β2), (γ1, β1)]
-                
-                # Modulate skip connections with global context
-                x3 = FiLMModulation.apply_film(x3, *film_params[0])
-                x2 = FiLMModulation.apply_film(x2, *film_params[1])
-                x1 = FiLMModulation.apply_film(x1, *film_params[2])
+                film_params = self.film(bottleneck)
 
-        # Decoder
+                # Modulate skip connections with global context based on num_layers
+                if self.num_layers == 3:
+                    x3 = FiLMModulation.apply_film(x3, *film_params[0])
+                    x2 = FiLMModulation.apply_film(x2, *film_params[1])
+                    x1 = FiLMModulation.apply_film(x1, *film_params[2])
+                elif self.num_layers == 2:
+                    x2 = FiLMModulation.apply_film(x2, *film_params[0])
+                    x1 = FiLMModulation.apply_film(x1, *film_params[1])
+                else:  # num_layers == 1
+                    x1 = FiLMModulation.apply_film(x1, *film_params[0])
+
+        # Decoder - based on num_layers
         if self.no_skip:
             # No skip connections - pass target sizes for proper upsampling
-            x = self.up1(x4, target_size=(x3.size(2), x3.size(3)))
-            x = self.up2(x, target_size=(x2.size(2), x2.size(3)))
-            x = self.up3(x, target_size=(x1.size(2), x1.size(3)))
+            if self.num_layers == 3:
+                x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)))
+                x = self.up2(x, target_size=(x2.size(2), x2.size(3)))
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)))
+            elif self.num_layers == 2:
+                x = self.up2(bottleneck, target_size=(x2.size(2), x2.size(3)))
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)))
+            else:  # num_layers == 1
+                x = self.up3(bottleneck, target_size=(x1.size(2), x1.size(3)))
         else:
             # Standard U-Net with skip connections
-            x = self.up1(x4, x3)
-            x = self.up2(x, x2)
-            x = self.up3(x, x1)
+            if self.num_layers == 3:
+                x = self.up1(bottleneck, x3)
+                x = self.up2(x, x2)
+                x = self.up3(x, x1)
+            elif self.num_layers == 2:
+                x = self.up2(bottleneck, x2)
+                x = self.up3(x, x1)
+            else:  # num_layers == 1
+                x = self.up3(bottleneck, x1)
 
         logits = self.outc(x)
-        
+
         if self.num_classes == 1:
             return logits.squeeze(1)  # (B, H, W) for binary
         else:
@@ -818,7 +865,9 @@ class PixelErrorCNN(nn.Module):
         attention_layers = args.get('attention_layers', 1)
         # Skip connection parameter
         no_skip = args.get('no_skip', False)
-        
+        # Depth parameter (default 3 for backward compatibility)
+        num_layers = args.get('num_layers', 3)
+
         model = cls(
             hidden_dim=hidden_dim,
             force_comparison=force_comparison,
@@ -827,11 +876,12 @@ class PixelErrorCNN(nn.Module):
             attention_type=attention_type,
             attention_heads=attention_heads,
             attention_layers=attention_layers,
-            no_skip=no_skip
+            no_skip=no_skip,
+            num_layers=num_layers
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        
+
         if device:
             model = model.to(device)
         return model
@@ -2431,7 +2481,8 @@ def run_counting_experiment(args):
             attention_type=args.attention_type,
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers,
-            no_skip=args.no_skip
+            no_skip=args.no_skip,
+            num_layers=args.num_layers
         ).to(DEVICE)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -3036,7 +3087,9 @@ def main():
                         help="Number of attention layers at bottleneck (default: 1)")
     parser.add_argument("--no-skip", action="store_true",
                         help="Remove skip connections - forces all info through bottleneck")
-    
+    parser.add_argument("--num-layers", type=int, default=3, choices=[1, 2, 3],
+                        help="Number of encoder/decoder layers (1, 2, or 3). Default: 3")
+
     # Full resolution architecture (no downsampling)
     parser.add_argument("--full-resolution", action="store_true",
                         help="Use FullResolutionCNN instead of U-Net (no downsampling, dilated convs, attention at 30x30)")
@@ -3270,7 +3323,7 @@ def main():
         )
     else:
         # Standard U-Net architecture
-        print("Architecture: U-Net")
+        print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers)")
         model = PixelErrorCNN(
             hidden_dim=args.hidden_dim,
             force_comparison=force_comparison,
@@ -3279,7 +3332,8 @@ def main():
             attention_type=args.attention_type,
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers,
-            no_skip=args.no_skip
+            no_skip=args.no_skip,
+            num_layers=args.num_layers
         )
     model = model.to(DEVICE)
 
