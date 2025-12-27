@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CNN Learning Visualizer - ARC</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 10px;
+            color: #00d4ff;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+        }
+
+        /* Tab Navigation */
+        .tab-nav {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab-btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            background: #16213e;
+            color: #aaa;
+            font-size: 1em;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid #0f3460;
+        }
+
+        .tab-btn:hover {
+            background: #1a2a4a;
+            color: #fff;
+        }
+
+        .tab-btn.active {
+            background: #00d4ff;
+            color: #000;
+            border-color: #00d4ff;
+        }
+
+        /* Panel styling */
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #0f3460;
+            margin-bottom: 20px;
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .panel-title {
+            font-size: 1.3em;
+            font-weight: 600;
+            color: #00d4ff;
+        }
+
+        .tab-content {
+            display: none;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Kernel Visualization Styles */
+        .kernel-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .kernel-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px;
+            background: #0d1b2a;
+            border-radius: 8px;
+        }
+
+        .color-swatch {
+            width: 40px;
+            height: 40px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.2em;
+            flex-shrink: 0;
+        }
+
+        .kernel-cell {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2px;
+        }
+
+        .kernel-cell canvas {
+            border-radius: 4px;
+            border: 1px solid #333;
+        }
+
+        .kernel-label {
+            font-size: 0.7em;
+            color: #888;
+        }
+
+        /* ARC Grid Styles */
+        .arc-grid-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .arc-grid {
+            display: grid;
+            gap: 1px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .arc-cell {
+            width: 15px;
+            height: 15px;
+        }
+
+        .grid-label {
+            font-size: 0.8em;
+            color: #888;
+            text-align: center;
+        }
+
+        /* Layer Flow Styles */
+        .flow-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #0d1b2a;
+            border-radius: 8px;
+        }
+
+        .flow-controls button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            background: #00d4ff;
+            color: #000;
+            font-size: 0.9em;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .flow-controls button:hover {
+            background: #00a8cc;
+        }
+
+        .flow-controls button:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+        }
+
+        .flow-slider {
+            width: 200px;
+        }
+
+        .layer-info {
+            font-size: 0.9em;
+            color: #00d4ff;
+            min-width: 150px;
+            text-align: center;
+        }
+
+        .speed-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85em;
+            color: #888;
+        }
+
+        .flow-display {
+            display: grid;
+            grid-template-columns: 1fr 2fr 1fr;
+            gap: 20px;
+        }
+
+        .flow-panel {
+            background: #0d1b2a;
+            border-radius: 8px;
+            padding: 15px;
+        }
+
+        .flow-panel h3 {
+            font-size: 1em;
+            color: #888;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .activations-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+        }
+
+        .activation-cell {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 3px;
+        }
+
+        .activation-cell canvas {
+            border-radius: 4px;
+            border: 1px solid #333;
+        }
+
+        .channel-label {
+            font-size: 0.7em;
+            color: #888;
+        }
+
+        /* Puzzle Browser Styles */
+        .puzzle-controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .puzzle-controls input,
+        .puzzle-controls select {
+            padding: 10px 15px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #0d1b2a;
+            color: #fff;
+            font-size: 0.95em;
+        }
+
+        .puzzle-controls input {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .puzzle-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+        }
+
+        .puzzle-card {
+            background: #0d1b2a;
+            border-radius: 8px;
+            padding: 15px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 2px solid transparent;
+        }
+
+        .puzzle-card:hover {
+            border-color: #00d4ff;
+        }
+
+        .puzzle-card.selected {
+            border-color: #00d4ff;
+            background: #1a2a4a;
+        }
+
+        .puzzle-card-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+
+        .puzzle-id {
+            font-family: monospace;
+            color: #00d4ff;
+            font-size: 0.9em;
+        }
+
+        .puzzle-meta {
+            font-size: 0.8em;
+            color: #888;
+        }
+
+        .puzzle-preview {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        /* Model Info */
+        .model-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .info-item {
+            background: #0d1b2a;
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .info-label {
+            font-size: 0.75em;
+            color: #888;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .info-value {
+            font-size: 1.1em;
+            color: #00d4ff;
+            font-weight: 600;
+        }
+
+        /* Loading state */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+
+        .loading::after {
+            content: '';
+            animation: dots 1.5s infinite;
+        }
+
+        @keyframes dots {
+            0%, 20% { content: '.'; }
+            40% { content: '..'; }
+            60%, 100% { content: '...'; }
+        }
+
+        /* Stats display */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .stat-item {
+            background: #16213e;
+            padding: 8px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 0.7em;
+            color: #666;
+        }
+
+        .stat-value {
+            font-size: 0.85em;
+            color: #00d4ff;
+        }
+
+        /* Colorbar */
+        .colorbar {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 10px;
+            justify-content: center;
+        }
+
+        .colorbar-gradient {
+            width: 150px;
+            height: 15px;
+            border-radius: 3px;
+        }
+
+        /* Pixel Trace Panel Styles */
+        .pixel-trace-container {
+            margin-top: 20px;
+            border-top: 1px solid #0f3460;
+            padding-top: 20px;
+        }
+
+        .pixel-trace-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .pixel-trace-header h3 {
+            color: #00d4ff;
+            font-size: 1.1em;
+        }
+
+        .pixel-trace-close {
+            background: #ff4136;
+            border: none;
+            color: white;
+            padding: 5px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+
+        .pixel-trace-close:hover {
+            background: #cc3429;
+        }
+
+        .trace-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 15px;
+        }
+
+        .trace-section {
+            background: #0d1b2a;
+            border-radius: 8px;
+            padding: 15px;
+        }
+
+        .trace-section h4 {
+            color: #00d4ff;
+            font-size: 0.95em;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #1a3a5c;
+        }
+
+        .trace-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            font-size: 0.85em;
+        }
+
+        .trace-label {
+            color: #888;
+        }
+
+        .trace-value {
+            color: #eee;
+            font-family: monospace;
+        }
+
+        .trace-value.correct {
+            color: #2ECC40;
+        }
+
+        .trace-value.incorrect {
+            color: #FF4136;
+        }
+
+        .color-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .color-swatch-small {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            border: 1px solid #444;
+        }
+
+        /* Receptive field visualization */
+        .rf-container {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        .rf-grid-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .rf-grid-label {
+            font-size: 0.8em;
+            color: #888;
+        }
+
+        .rf-grid {
+            display: grid;
+            gap: 2px;
+            background: #333;
+            padding: 2px;
+            border-radius: 4px;
+        }
+
+        .rf-cell {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7em;
+            font-weight: bold;
+            border-radius: 2px;
+        }
+
+        .rf-cell.center {
+            border: 2px solid #00d4ff;
+        }
+
+        /* Feature vector bar chart */
+        .feature-bars {
+            display: flex;
+            gap: 1px;
+            height: 60px;
+            align-items: flex-end;
+            background: #0a1428;
+            padding: 5px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+
+        .feature-bar {
+            min-width: 4px;
+            background: #00d4ff;
+            border-radius: 1px 1px 0 0;
+        }
+
+        .feature-bar.negative {
+            background: #ff4136;
+        }
+
+        /* Embedding visualization */
+        .embedding-row {
+            display: flex;
+            gap: 2px;
+            margin: 5px 0;
+            flex-wrap: wrap;
+        }
+
+        .embedding-cell {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+
+        /* Probability bars */
+        .prob-bars {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .prob-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .prob-color {
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7em;
+            font-weight: bold;
+        }
+
+        .prob-bar-container {
+            flex: 1;
+            height: 16px;
+            background: #0a1428;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .prob-bar {
+            height: 100%;
+            background: #00d4ff;
+            border-radius: 3px;
+            transition: width 0.3s;
+        }
+
+        .prob-bar.predicted {
+            background: #2ECC40;
+        }
+
+        .prob-bar.expected {
+            background: #FFDC00;
+        }
+
+        .prob-value {
+            width: 50px;
+            text-align: right;
+            font-size: 0.8em;
+            font-family: monospace;
+            color: #888;
+        }
+
+        .prob-value.highlight {
+            color: #00d4ff;
+            font-weight: bold;
+        }
+
+        /* Clickable grid cells */
+        .arc-cell.clickable {
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+        }
+
+        .arc-cell.clickable:hover {
+            transform: scale(1.1);
+            box-shadow: 0 0 8px rgba(0, 212, 255, 0.6);
+            z-index: 10;
+            position: relative;
+        }
+
+        .arc-cell.selected {
+            box-shadow: 0 0 0 2px #00d4ff;
+            z-index: 10;
+            position: relative;
+        }
+
+        /* Calculation breakdown */
+        .calc-breakdown {
+            font-family: monospace;
+            font-size: 0.8em;
+            background: #0a1428;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 8px;
+        }
+
+        .calc-line {
+            padding: 2px 0;
+        }
+
+        .calc-operator {
+            color: #888;
+        }
+
+        .calc-result {
+            color: #00d4ff;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>CNN Learning Visualizer</h1>
+    <p class="subtitle">Understanding how PixelErrorCNN learns ARC patterns</p>
+
+    <!-- Tab Navigation -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" onclick="showTab('kernels')">Per-Color Kernels</button>
+        <button class="tab-btn" onclick="showTab('flow')">Layer Flow</button>
+        <button class="tab-btn" onclick="showTab('puzzles')">Puzzle Browser</button>
+    </nav>
+
+    <!-- Kernel Visualization Tab -->
+    <div id="kernels-tab" class="tab-content active">
+        <div class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Per-Color Kernel Response</span>
+            </div>
+            <p style="color: #888; margin-bottom: 15px; font-size: 0.9em;">
+                Shows how each kernel in the first conv layer responds to each ARC color.
+                Blue = negative weights, Red = positive weights.
+            </p>
+            <div id="model-info" class="model-info">
+                <div class="loading">Loading model info</div>
+            </div>
+            <div id="kernel-grid" class="kernel-grid">
+                <div class="loading">Loading kernels</div>
+            </div>
+            <div class="colorbar">
+                <span>-</span>
+                <div class="colorbar-gradient" style="background: linear-gradient(to right, #2166ac, #f7f7f7, #b2182b);"></div>
+                <span>+</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Layer Flow Tab -->
+    <div id="flow-tab" class="tab-content">
+        <div class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Layer-by-Layer Activation Flow</span>
+            </div>
+            <p style="color: #888; margin-bottom: 15px; font-size: 0.9em;">
+                Step through the network to see how the input transforms at each layer.
+                Select a puzzle first from the Puzzle Browser tab.
+            </p>
+
+            <!-- Puzzle & Example Selection -->
+            <div id="puzzle-selection" class="flow-controls" style="margin-bottom: 10px;">
+                <span style="color: #888;">Puzzle:</span>
+                <span id="selected-puzzle-id" style="font-family: monospace; color: #00d4ff;">None</span>
+                <span style="color: #888; margin-left: 20px;">Example:</span>
+                <select id="example-select" onchange="changeExample()" disabled style="padding: 8px; background: #0d1b2a; color: #fff; border: 1px solid #0f3460; border-radius: 6px;">
+                    <option value="">Select a puzzle first</option>
+                </select>
+            </div>
+
+            <div class="flow-controls">
+                <button id="prev-layer" onclick="prevLayer()" disabled>Previous</button>
+                <input type="range" id="layer-slider" class="flow-slider" min="0" max="0" value="0" oninput="displayLayer(this.value)">
+                <button id="next-layer" onclick="nextLayer()" disabled>Next</button>
+                <button id="play-btn" onclick="togglePlay()" disabled>Play</button>
+                <div class="speed-control">
+                    <label>Speed:</label>
+                    <input type="range" id="speed-slider" min="100" max="2000" value="500" style="width: 80px;">
+                </div>
+                <span id="layer-info" class="layer-info">No puzzle selected</span>
+            </div>
+
+            <div id="flow-display" class="flow-display">
+                <div class="flow-panel">
+                    <h3>Input / Output</h3>
+                    <div id="io-panel" style="display: flex; flex-direction: column; gap: 15px; align-items: center;">
+                        <p style="color: #666; font-size: 0.9em;">Select a puzzle to visualize</p>
+                    </div>
+                </div>
+                <div class="flow-panel">
+                    <h3>Feature Maps</h3>
+                    <div id="activations-panel">
+                        <p style="color: #666; font-size: 0.9em; text-align: center;">Activations will appear here</p>
+                    </div>
+                </div>
+                <div class="flow-panel">
+                    <h3>Overlay</h3>
+                    <div id="overlay-panel" style="display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                        <p style="color: #666; font-size: 0.9em;">Mean activation overlay</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Pixel Trace Panel -->
+            <div id="pixel-trace-panel" class="pixel-trace-container" style="display: none;">
+                <div class="pixel-trace-header">
+                    <h3>Pixel Computation Trace</h3>
+                    <button class="pixel-trace-close" onclick="closePixelTrace()">Close</button>
+                </div>
+                <p style="color: #888; margin-bottom: 15px; font-size: 0.9em;">
+                    Click on any cell in the <strong>Prediction</strong> grid above to see how the model computed that pixel's prediction.
+                </p>
+                <div id="pixel-trace-content">
+                    <!-- Trace content will be rendered here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Puzzle Browser Tab -->
+    <div id="puzzles-tab" class="tab-content">
+        <div class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Puzzle Browser</span>
+            </div>
+
+            <div class="puzzle-controls">
+                <input type="text" id="puzzle-search" placeholder="Search puzzle ID..." oninput="filterPuzzles()">
+                <select id="example-type" onchange="filterPuzzles()">
+                    <option value="all">All Examples</option>
+                    <option value="train">Training Only</option>
+                    <option value="test">Test Only</option>
+                </select>
+            </div>
+
+            <div id="puzzle-grid" class="puzzle-grid">
+                <div class="loading">Loading puzzles</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/cnn_viz.js"></script>
+</body>
+</html>

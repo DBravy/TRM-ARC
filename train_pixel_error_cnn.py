@@ -202,13 +202,14 @@ def generate_color_swap(grid: np.ndarray) -> np.ndarray:
 # =============================================================================
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3):
         super().__init__()
+        padding = (kernel_size - 1) // 2
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.Conv2d(out_ch, out_ch, kernel_size, padding=padding),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
@@ -217,23 +218,43 @@ class DoubleConv(nn.Module):
         return self.conv(x)
 
 
-class Down(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+class SingleConv(nn.Module):
+    """Single convolution with BatchNorm and ReLU."""
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3):
         super().__init__()
-        self.pool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_ch, out_ch)
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        return self.pool_conv(x)
+        return self.conv(x)
+
+
+def get_conv_block(in_ch: int, out_ch: int, single_conv: bool = False, kernel_size: int = 3):
+    """Factory function to get the appropriate conv block."""
+    if single_conv:
+        return SingleConv(in_ch, out_ch, kernel_size)
+    return DoubleConv(in_ch, out_ch, kernel_size)
+
+
+class Down(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, single_conv: bool = False, kernel_size: int = 3):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = get_conv_block(in_ch, out_ch, single_conv, kernel_size)
+
+    def forward(self, x):
+        return self.conv(self.pool(x))
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, single_conv: bool = False, kernel_size: int = 3):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_ch, out_ch)
+        self.conv = get_conv_block(in_ch, out_ch, single_conv, kernel_size)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -247,10 +268,10 @@ class Up(nn.Module):
 
 class UpNoSkip(nn.Module):
     """Decoder block without skip connections - forces all info through bottleneck."""
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, single_conv: bool = False, kernel_size: int = 3):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.conv = DoubleConv(out_ch, out_ch)
+        self.conv = get_conv_block(out_ch, out_ch, single_conv, kernel_size)
 
     def forward(self, x, target_size=None):
         x = self.up(x)
@@ -486,22 +507,23 @@ class FiLMModulation(nn.Module):
 
 class DilatedConvBlock(nn.Module):
     """Convolutional block with configurable dilation for growing receptive field without downsampling."""
-    
-    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
+
+    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1, kernel_size: int = 3):
         super().__init__()
-        # Padding must equal dilation for 3x3 kernel to maintain spatial size
+        # Padding for dilated conv to maintain spatial size: dilation * (kernel_size - 1) // 2
+        padding = dilation * (kernel_size - 1) // 2
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(out_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
-        
+
         # Residual connection if dimensions match
         self.residual = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    
+
     def forward(self, x):
         return self.conv(x) + self.residual(x)
 
@@ -527,34 +549,36 @@ class FullResolutionCNN(nn.Module):
     """
     
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 10,
-                 attention_type: str = "self", attention_heads: int = 8, attention_layers: int = 2):
+                 attention_type: str = "self", attention_heads: int = 8, attention_layers: int = 2,
+                 kernel_size: int = 3):
         super().__init__()
-        
+
         self.force_comparison = force_comparison
         self.num_classes = num_classes
         self.attention_type = attention_type
-        
+        self.kernel_size = kernel_size
+
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
         self.output_embed = nn.Embedding(NUM_COLORS, 16)
-        
+
         # Input channels: 64 if force_comparison, else 32
         if force_comparison:
             in_channels = 64
         else:
             in_channels = 32
-        
+
         # Dilated conv blocks - no downsampling, grow receptive field via dilation
         # RF after each block (cumulative):
         # Block 1 (d=1): ~5x5
-        # Block 2 (d=2): ~13x13  
+        # Block 2 (d=2): ~13x13
         # Block 3 (d=4): ~29x29 (covers full 30x30 grid)
         # Block 4 (d=8): ~61x61 (redundant but adds depth)
-        self.conv1 = DilatedConvBlock(in_channels, hidden_dim, dilation=1)
-        self.conv2 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2)
-        self.conv3 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
-        self.conv4 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=8)
-        
+        self.conv1 = DilatedConvBlock(in_channels, hidden_dim, dilation=1, kernel_size=kernel_size)
+        self.conv2 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2, kernel_size=kernel_size)
+        self.conv3 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4, kernel_size=kernel_size)
+        self.conv4 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=8, kernel_size=kernel_size)
+
         # Attention at full resolution (30x30 = 900 tokens)
         if attention_type == "cbam":
             self.attention = CBAM(hidden_dim)
@@ -564,12 +588,12 @@ class FullResolutionCNN(nn.Module):
                 num_heads=attention_heads,
                 num_layers=attention_layers
             )
-        
+
         # Post-attention conv blocks
-        self.conv5 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4)
-        self.conv6 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2)
-        self.conv7 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=1)
-        
+        self.conv5 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4, kernel_size=kernel_size)
+        self.conv6 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2, kernel_size=kernel_size)
+        self.conv7 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=1, kernel_size=kernel_size)
+
         # Output head
         self.outc = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
     
@@ -633,18 +657,20 @@ class FullResolutionCNN(nn.Module):
         attention_type = args.get('attention_type', 'self')
         attention_heads = args.get('attention_heads', 8)
         attention_layers = args.get('attention_layers', 2)
-        
+        kernel_size = args.get('kernel_size', 3)
+
         model = cls(
             hidden_dim=hidden_dim,
             force_comparison=force_comparison,
             num_classes=num_classes,
             attention_type=attention_type,
             attention_heads=attention_heads,
-            attention_layers=attention_layers
+            attention_layers=attention_layers,
+            kernel_size=kernel_size
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        
+
         if device:
             model = model.to(device)
         return model
@@ -670,7 +696,8 @@ class PixelErrorCNN(nn.Module):
     def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
                  use_attention: bool = False, attention_type: str = "self",
                  attention_heads: int = 8, attention_layers: int = 1,
-                 no_skip: bool = False, num_layers: int = 3):
+                 no_skip: bool = False, num_layers: int = 3, single_conv: bool = False,
+                 kernel_size: int = 3):
         super().__init__()
 
         self.force_comparison = force_comparison
@@ -679,6 +706,8 @@ class PixelErrorCNN(nn.Module):
         self.attention_type = attention_type
         self.no_skip = no_skip
         self.num_layers = num_layers
+        self.single_conv = single_conv
+        self.kernel_size = kernel_size
 
         # Color embeddings for both grids
         self.input_embed = nn.Embedding(NUM_COLORS, 16)
@@ -694,32 +723,34 @@ class PixelErrorCNN(nn.Module):
         base_ch = hidden_dim
 
         # Bottleneck dimension depends on num_layers: 2^num_layers * base_ch
-        # 1 layer: base_ch * 2, 2 layers: base_ch * 4, 3 layers: base_ch * 8
-        bottleneck_dim = base_ch * (2 ** num_layers)
+        # 0 layers: base_ch, 1 layer: base_ch * 2, 2 layers: base_ch * 4, 3 layers: base_ch * 8
+        bottleneck_dim = base_ch * (2 ** num_layers) if num_layers > 0 else base_ch
 
         # Encoder - create layers based on num_layers
-        self.inc = DoubleConv(in_channels, base_ch)
-        self.down1 = Down(base_ch, base_ch * 2)
+        self.inc = get_conv_block(in_channels, base_ch, single_conv, kernel_size)
+        if num_layers >= 1:
+            self.down1 = Down(base_ch, base_ch * 2, single_conv, kernel_size)
         if num_layers >= 2:
-            self.down2 = Down(base_ch * 2, base_ch * 4)
+            self.down2 = Down(base_ch * 2, base_ch * 4, single_conv, kernel_size)
         if num_layers >= 3:
-            self.down3 = Down(base_ch * 4, base_ch * 8)
+            self.down3 = Down(base_ch * 4, base_ch * 8, single_conv, kernel_size)
 
-        # Decoder - create layers based on num_layers
-        if no_skip:
-            # No skip connections - all info must flow through bottleneck
-            if num_layers >= 3:
-                self.up1 = UpNoSkip(base_ch * 8, base_ch * 4)
-            if num_layers >= 2:
-                self.up2 = UpNoSkip(base_ch * 4, base_ch * 2)
-            self.up3 = UpNoSkip(base_ch * 2, base_ch)
-        else:
-            # Standard U-Net with skip connections
-            if num_layers >= 3:
-                self.up1 = Up(base_ch * 8, base_ch * 4)
-            if num_layers >= 2:
-                self.up2 = Up(base_ch * 4, base_ch * 2)
-            self.up3 = Up(base_ch * 2, base_ch)
+        # Decoder - create layers based on num_layers (no up layers needed for num_layers=0)
+        if num_layers >= 1:
+            if no_skip:
+                # No skip connections - all info must flow through bottleneck
+                if num_layers >= 3:
+                    self.up1 = UpNoSkip(base_ch * 8, base_ch * 4, single_conv, kernel_size)
+                if num_layers >= 2:
+                    self.up2 = UpNoSkip(base_ch * 4, base_ch * 2, single_conv, kernel_size)
+                self.up3 = UpNoSkip(base_ch * 2, base_ch, single_conv, kernel_size)
+            else:
+                # Standard U-Net with skip connections
+                if num_layers >= 3:
+                    self.up1 = Up(base_ch * 8, base_ch * 4, single_conv, kernel_size)
+                if num_layers >= 2:
+                    self.up2 = Up(base_ch * 4, base_ch * 2, single_conv, kernel_size)
+                self.up3 = Up(base_ch * 2, base_ch, single_conv, kernel_size)
 
         # Optional bottleneck attention for global reasoning
         if use_attention:
@@ -734,7 +765,7 @@ class PixelErrorCNN(nn.Module):
             # FiLM modulation to inject global context into skip connections (only if using skips)
             # Note: FiLM is only used with self-attention since CBAM doesn't produce the same
             # kind of global context vector
-            if not no_skip and attention_type == "self":
+            if not no_skip and attention_type == "self" and num_layers >= 1:
                 # Adjust skip_dims based on num_layers
                 if num_layers == 3:
                     skip_dims = [base_ch * 4, base_ch * 2, base_ch]
@@ -767,15 +798,17 @@ class PixelErrorCNN(nn.Module):
 
         # U-Net forward - encoder
         x1 = self.inc(x)
-        x2 = self.down1(x1)
-
+        if self.num_layers >= 1:
+            x2 = self.down1(x1)
         if self.num_layers >= 2:
             x3 = self.down2(x2)
         if self.num_layers >= 3:
             x4 = self.down3(x3)
 
         # Determine bottleneck based on num_layers
-        if self.num_layers == 1:
+        if self.num_layers == 0:
+            bottleneck = x1  # No downsampling, inc output is the "bottleneck"
+        elif self.num_layers == 1:
             bottleneck = x2
         elif self.num_layers == 2:
             bottleneck = x3
@@ -787,8 +820,8 @@ class PixelErrorCNN(nn.Module):
             bottleneck = self.bottleneck_attn(bottleneck)
 
             # Generate FiLM modulation parameters from global context (only if using skip connections)
-            # Note: FiLM is only used with self-attention, not CBAM
-            if not self.no_skip and self.attention_type == "self":
+            # Note: FiLM is only used with self-attention, not CBAM, and only if num_layers >= 1
+            if not self.no_skip and self.attention_type == "self" and self.num_layers >= 1:
                 film_params = self.film(bottleneck)
 
                 # Modulate skip connections with global context based on num_layers
@@ -803,7 +836,10 @@ class PixelErrorCNN(nn.Module):
                     x1 = FiLMModulation.apply_film(x1, *film_params[0])
 
         # Decoder - based on num_layers
-        if self.no_skip:
+        if self.num_layers == 0:
+            # No encoder/decoder layers - just use bottleneck (which is x1) directly
+            x = bottleneck
+        elif self.no_skip:
             # No skip connections - pass target sizes for proper upsampling
             if self.num_layers == 3:
                 x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)))
@@ -867,6 +903,10 @@ class PixelErrorCNN(nn.Module):
         no_skip = args.get('no_skip', False)
         # Depth parameter (default 3 for backward compatibility)
         num_layers = args.get('num_layers', 3)
+        # Single conv parameter (default False for backward compatibility)
+        single_conv = args.get('single_conv', False)
+        # Kernel size parameter (default 3 for backward compatibility)
+        kernel_size = args.get('kernel_size', 3)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -877,7 +917,9 @@ class PixelErrorCNN(nn.Module):
             attention_heads=attention_heads,
             attention_layers=attention_layers,
             no_skip=no_skip,
-            num_layers=num_layers
+            num_layers=num_layers,
+            single_conv=single_conv,
+            kernel_size=kernel_size
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1534,8 +1576,9 @@ def run_layer_ablation(
         # PixelErrorCNN (U-Net) layers - build based on num_layers
         encoder_layers = [
             ("inc (initial conv)", model.inc),
-            ("down1 (encoder level 1)", model.down1),
         ]
+        if model.num_layers >= 1:
+            encoder_layers.append(("down1 (encoder level 1)", model.down1))
         if model.num_layers >= 2:
             encoder_layers.append(("down2 (encoder level 2)", model.down2))
         if model.num_layers >= 3:
@@ -1546,7 +1589,8 @@ def run_layer_ablation(
             decoder_layers.append(("up1 (decoder level 1)", model.up1))
         if model.num_layers >= 2:
             decoder_layers.append(("up2 (decoder level 2)", model.up2))
-        decoder_layers.append(("up3 (decoder level 3)", model.up3))
+        if model.num_layers >= 1:
+            decoder_layers.append(("up3 (decoder level 3)", model.up3))
 
         layer_groups = {
             "Embeddings": [
@@ -1554,8 +1598,9 @@ def run_layer_ablation(
                 ("output_embed", model.output_embed),
             ],
             "Encoder": encoder_layers,
-            "Decoder": decoder_layers,
         }
+        if decoder_layers:  # Only add Decoder group if there are decoder layers
+            layer_groups["Decoder"] = decoder_layers
         # Add attention if present
         if hasattr(model, 'bottleneck_attn') and model.use_attention:
             layer_groups["Bottleneck Attention"] = [
@@ -2489,7 +2534,8 @@ def run_counting_experiment(args):
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers,
             no_skip=args.no_skip,
-            num_layers=args.num_layers
+            num_layers=args.num_layers,
+            single_conv=args.single_conv
         ).to(DEVICE)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -3094,8 +3140,13 @@ def main():
                         help="Number of attention layers at bottleneck (default: 1)")
     parser.add_argument("--no-skip", action="store_true",
                         help="Remove skip connections - forces all info through bottleneck")
-    parser.add_argument("--num-layers", type=int, default=3, choices=[1, 2, 3],
-                        help="Number of encoder/decoder layers (1, 2, or 3). Default: 3")
+    parser.add_argument("--num-layers", type=int, default=3, choices=[0, 1, 2, 3],
+                        help="Number of encoder/decoder layers (0-3). 0 = just inc+outc, no down/up. Default: 3")
+    parser.add_argument("--single-conv", action="store_true",
+                        help="Use single conv instead of double conv in each block. With --num-layers 0, "
+                             "this gives a minimal 2-conv architecture (inc + outc)")
+    parser.add_argument("--kernel-size", type=int, default=3,
+                        help="Kernel size for convolutional layers (default: 3). Use odd numbers (3, 5, 7, etc.)")
 
     # Full resolution architecture (no downsampling)
     parser.add_argument("--full-resolution", action="store_true",
@@ -3319,18 +3370,20 @@ def main():
     
     if args.full_resolution:
         # Full resolution architecture - no downsampling, dilated convs, attention at 30x30
-        print("Architecture: FullResolutionCNN (no downsampling)")
+        print(f"Architecture: FullResolutionCNN (no downsampling, {args.kernel_size}x{args.kernel_size} kernels)")
         model = FullResolutionCNN(
             hidden_dim=args.hidden_dim,
             force_comparison=force_comparison,
             num_classes=num_classes,
             attention_type=args.attention_type,
             attention_heads=args.attention_heads,
-            attention_layers=args.attention_layers
+            attention_layers=args.attention_layers,
+            kernel_size=args.kernel_size
         )
     else:
         # Standard U-Net architecture
-        print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers)")
+        conv_type = "single conv" if args.single_conv else "double conv"
+        print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers, {conv_type}, {args.kernel_size}x{args.kernel_size} kernels)")
         model = PixelErrorCNN(
             hidden_dim=args.hidden_dim,
             force_comparison=force_comparison,
@@ -3340,7 +3393,9 @@ def main():
             attention_heads=args.attention_heads,
             attention_layers=args.attention_layers,
             no_skip=args.no_skip,
-            num_layers=args.num_layers
+            num_layers=args.num_layers,
+            single_conv=args.single_conv,
+            kernel_size=args.kernel_size
         )
     model = model.to(DEVICE)
 

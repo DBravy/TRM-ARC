@@ -354,7 +354,18 @@ def main():
                             plt.close(fig)
 
                     if len(train_examples) > 3:
-                        st.caption(f"... and {len(train_examples) - 3} more training examples")
+                        remaining = len(train_examples) - 3
+                        with st.expander(f"Show {remaining} more training example{'s' if remaining > 1 else ''}"):
+                            # Display remaining examples in rows of 3
+                            for row_start in range(3, len(train_examples), 3):
+                                row_end = min(row_start + 3, len(train_examples))
+                                row_examples = train_examples[row_start:row_end]
+                                extra_cols = st.columns(min(len(row_examples), 3))
+                                for j, ex in enumerate(row_examples):
+                                    with extra_cols[j]:
+                                        fig = render_example(ex, f"Train {row_start + j + 1}: ")
+                                        st.pyplot(fig)
+                                        plt.close(fig)
 
                 # Test examples
                 test_examples = puzzle_data.get("test", [])
