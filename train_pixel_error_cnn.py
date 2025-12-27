@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Pixel-Level Error Detection CNN - CORRESPONDENCE VERSION
+Pixel-Level Color Prediction CNN - CORRESPONDENCE VERSION
 
 This version forces the CNN to learn input-output correspondence by:
 1. Using augmented PAIRS as positives (same aug applied to both input and output)
 2. Using mismatched inputs as negatives (correct output, wrong input)
 3. Using mismatched augmentations as negatives
 
-The key insight: the CNN must see the SAME output labeled both "correct" and 
+The key insight: the CNN must see the SAME output labeled both "correct" and
 "incorrect" depending on the input. This forces it to actually compare them.
 
-Modes:
-- binary: Predict whether each pixel is correct (1) or incorrect (0)
-- color: Predict what color each pixel SHOULD be (0-9)
+Predicts what color each pixel SHOULD be (0-9).
 
 Usage:
     python train_pixel_error_cnn.py --dataset arc-agi-1
     python train_pixel_error_cnn.py --single-puzzle 00d62c1b
-    python train_pixel_error_cnn.py --mode color  # Color prediction mode
 """
 
 import argparse
@@ -283,427 +280,28 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
-class BottleneckAttention(nn.Module):
-    """
-    Self-attention over spatial positions at the U-Net bottleneck.
-    
-    This allows global reasoning: each spatial position can query all others,
-    enabling comparisons like "am I the smallest object?" or "am I symmetric?"
-    that require global context rather than local convolutions.
-    """
-    
-    def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 1):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.num_layers = num_layers
-        
-        # Stack multiple attention layers if requested
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                'norm': nn.LayerNorm(dim),
-                'qkv': nn.Linear(dim, dim * 3),
-                'proj': nn.Linear(dim, dim),
-            })
-            for _ in range(num_layers)
-        ])
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)
-        B, C, H, W = x.shape
-        
-        # Flatten spatial dims: (B, C, H*W) -> (B, H*W, C)
-        x_flat = x.flatten(2).transpose(1, 2)
-        
-        for layer in self.layers:
-            # Self-attention with residual
-            residual = x_flat
-            x_norm = layer['norm'](x_flat)
-            
-            # Compute Q, K, V
-            qkv = layer['qkv'](x_norm).reshape(B, H*W, 3, self.num_heads, self.head_dim)
-            qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            
-            # Attention
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-            
-            # Apply attention to values
-            out = (attn @ v).transpose(1, 2).reshape(B, H*W, C)
-            out = layer['proj'](out)
-            
-            # Residual connection
-            x_flat = residual + out
-        
-        # Reshape back to spatial
-        return x_flat.transpose(1, 2).reshape(B, C, H, W)
-
-
-class ChannelAttention(nn.Module):
-    """
-    Channel attention module from CBAM.
-    
-    Computes channel-wise attention weights using global average and max pooling
-    followed by a shared MLP. This asks "which feature channels are important?"
-    but does NOT compute relationships between spatial positions.
-    """
-    
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-        # Shared MLP for both pooled features
-        reduced_channels = max(channels // reduction, 8)  # Ensure minimum capacity
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, reduced_channels, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(reduced_channels, channels, bias=False)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, _, _ = x.shape
-        
-        # Global pooling: (B, C, H, W) -> (B, C, 1, 1) -> (B, C)
-        avg_out = self.mlp(self.avg_pool(x).view(B, C))
-        max_out = self.mlp(self.max_pool(x).view(B, C))
-        
-        # Combine and apply sigmoid: (B, C) -> (B, C, 1, 1)
-        attn = torch.sigmoid(avg_out + max_out).view(B, C, 1, 1)
-        
-        return attn * x
-
-
-class SpatialAttention(nn.Module):
-    """
-    Spatial attention module from CBAM.
-    
-    Computes spatial attention weights using channel-wise average and max pooling
-    followed by a convolution. This asks "which spatial locations are important?"
-    but each location is evaluated INDEPENDENTLY - no pairwise comparisons.
-    """
-    
-    def __init__(self, kernel_size: int = 7):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Channel-wise pooling: (B, C, H, W) -> (B, 1, H, W)
-        avg_out = x.mean(dim=1, keepdim=True)
-        max_out = x.max(dim=1, keepdim=True)[0]
-        
-        # Concatenate and convolve: (B, 2, H, W) -> (B, 1, H, W)
-        combined = torch.cat([avg_out, max_out], dim=1)
-        attn = torch.sigmoid(self.conv(combined))
-        
-        return attn * x
-
-
-class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module (CBAM).
-    
-    Applies channel attention followed by spatial attention sequentially.
-    
-    Key limitation for ARC tasks: CBAM computes "what's important" and "where's important"
-    but NEVER computes pairwise relationships between positions. This means it cannot
-    perform counting ("how many objects?") or selection ("which is smallest?") tasks
-    that require comparing objects to each other.
-    
-    Use cases where CBAM helps:
-    - Tasks where transformation depends on global image statistics
-    - Feature refinement / suppressing irrelevant channels
-    - When computational efficiency matters (much lighter than self-attention)
-    
-    Use cases where CBAM won't help:
-    - Counting objects
-    - Selecting objects by relative properties (smallest, unique, etc.)
-    - Any task requiring explicit pairwise comparison between positions
-    """
-    
-    def __init__(self, channels: int, reduction: int = 16, kernel_size: int = 7):
-        super().__init__()
-        self.channel_attn = ChannelAttention(channels, reduction)
-        self.spatial_attn = SpatialAttention(kernel_size)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.channel_attn(x)
-        x = self.spatial_attn(x)
-        return x
-
-
-class FiLMModulation(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) for injecting global context into skip connections.
-    
-    Takes a global context vector from the bottleneck and produces scale (γ) and shift (β)
-    parameters for each skip connection level. This allows global reasoning (e.g., "the blue
-    object is smallest") to directly influence all spatial locations in the decoder.
-    """
-    
-    def __init__(self, bottleneck_dim: int, skip_dims: list):
-        """
-        Args:
-            bottleneck_dim: Channel dimension of bottleneck (e.g., 512)
-            skip_dims: List of channel dimensions for skip connections [x3_ch, x2_ch, x1_ch]
-                       e.g., [256, 128, 64]
-        """
-        super().__init__()
-        
-        self.skip_dims = skip_dims
-        
-        # MLP to process global vector before generating modulation params
-        self.global_mlp = nn.Sequential(
-            nn.Linear(bottleneck_dim, bottleneck_dim),
-            nn.ReLU(inplace=True),
-        )
-        
-        # Separate heads for each skip level, each producing scale and shift
-        self.film_generators = nn.ModuleList([
-            nn.Linear(bottleneck_dim, dim * 2)  # *2 for both γ and β
-            for dim in skip_dims
-        ])
-        
-    def forward(self, bottleneck: torch.Tensor) -> list:
-        """
-        Args:
-            bottleneck: (B, C, H, W) bottleneck features (after attention)
-            
-        Returns:
-            List of (gamma, beta) tuples for each skip level
-        """
-        # Global average pool: (B, C, H, W) -> (B, C)
-        global_vec = bottleneck.mean(dim=(2, 3))
-        
-        # Process through MLP
-        global_vec = self.global_mlp(global_vec)
-        
-        # Generate modulation params for each skip level
-        modulation_params = []
-        for i, generator in enumerate(self.film_generators):
-            params = generator(global_vec)  # (B, dim*2)
-            gamma, beta = params.chunk(2, dim=-1)  # Each (B, dim)
-            
-            # Reshape for broadcasting: (B, dim) -> (B, dim, 1, 1)
-            gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-            beta = beta.unsqueeze(-1).unsqueeze(-1)
-            
-            # Initialize gamma around 1 (multiplicative identity)
-            # The linear layer will learn deviations from this
-            gamma = gamma + 1.0
-            
-            modulation_params.append((gamma, beta))
-            
-        return modulation_params
-    
-    @staticmethod
-    def apply_film(features: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-        """Apply FiLM modulation: out = gamma * features + beta"""
-        return gamma * features + beta
-
-
-class DilatedConvBlock(nn.Module):
-    """Convolutional block with configurable dilation for growing receptive field without downsampling."""
-
-    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1, kernel_size: int = 3):
-        super().__init__()
-        # Padding for dilated conv to maintain spatial size: dilation * (kernel_size - 1) // 2
-        padding = dilation * (kernel_size - 1) // 2
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-        # Residual connection if dimensions match
-        self.residual = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-
-    def forward(self, x):
-        return self.conv(x) + self.residual(x)
-
-
-class FullResolutionCNN(nn.Module):
-    """
-    CNN that maintains full 30x30 resolution throughout, using dilated convolutions
-    to grow receptive field without spatial downsampling.
-    
-    This allows attention to operate over 900 pixel positions rather than 9 spatial
-    regions, potentially enabling better object-level reasoning.
-    
-    Architecture:
-    - Dilated conv blocks grow receptive field: 1 -> 2 -> 4 -> 8
-    - After sufficient RF, apply self-attention at full resolution
-    - Final conv layers to produce output
-    
-    Receptive field growth with dilation:
-    - dilation=1: 3x3 kernel sees 3x3 (RF grows by 2 per layer)
-    - dilation=2: 3x3 kernel sees 5x5 effective spacing
-    - dilation=4: 3x3 kernel sees 9x9 effective spacing
-    - etc.
-    """
-    
-    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 10,
-                 attention_type: str = "self", attention_heads: int = 8, attention_layers: int = 2,
-                 kernel_size: int = 3):
-        super().__init__()
-
-        self.force_comparison = force_comparison
-        self.num_classes = num_classes
-        self.attention_type = attention_type
-        self.kernel_size = kernel_size
-
-        # Color embeddings for both grids
-        self.input_embed = nn.Embedding(NUM_COLORS, 16)
-        self.output_embed = nn.Embedding(NUM_COLORS, 16)
-
-        # Input channels: 64 if force_comparison, else 32
-        if force_comparison:
-            in_channels = 64
-        else:
-            in_channels = 32
-
-        # Dilated conv blocks - no downsampling, grow receptive field via dilation
-        # RF after each block (cumulative):
-        # Block 1 (d=1): ~5x5
-        # Block 2 (d=2): ~13x13
-        # Block 3 (d=4): ~29x29 (covers full 30x30 grid)
-        # Block 4 (d=8): ~61x61 (redundant but adds depth)
-        self.conv1 = DilatedConvBlock(in_channels, hidden_dim, dilation=1, kernel_size=kernel_size)
-        self.conv2 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2, kernel_size=kernel_size)
-        self.conv3 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4, kernel_size=kernel_size)
-        self.conv4 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=8, kernel_size=kernel_size)
-
-        # Attention at full resolution (30x30 = 900 tokens)
-        if attention_type == "cbam":
-            self.attention = CBAM(hidden_dim)
-        else:  # "self" attention (default)
-            self.attention = BottleneckAttention(
-                dim=hidden_dim,
-                num_heads=attention_heads,
-                num_layers=attention_layers
-            )
-
-        # Post-attention conv blocks
-        self.conv5 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=4, kernel_size=kernel_size)
-        self.conv6 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=2, kernel_size=kernel_size)
-        self.conv7 = DilatedConvBlock(hidden_dim, hidden_dim, dilation=1, kernel_size=kernel_size)
-
-        # Output head
-        self.outc = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
-    
-    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        # Embed both grids
-        inp_emb = self.input_embed(input_grid)   # (B, H, W, 16)
-        out_emb = self.output_embed(output_grid) # (B, H, W, 16)
-        
-        if self.force_comparison:
-            diff = inp_emb - out_emb
-            prod = inp_emb * out_emb
-            x = torch.cat([inp_emb, out_emb, diff, prod], dim=-1)  # (B, H, W, 64)
-        else:
-            x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, H, W, 32)
-        
-        x = x.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
-        
-        # Dilated convolutions - grow receptive field while maintaining resolution
-        x = self.conv1(x)  # (B, hidden_dim, 30, 30)
-        x = self.conv2(x)  # (B, hidden_dim, 30, 30)
-        x = self.conv3(x)  # (B, hidden_dim, 30, 30)
-        x = self.conv4(x)  # (B, hidden_dim, 30, 30)
-        
-        # Full-resolution attention (900 tokens)
-        x = self.attention(x)  # (B, hidden_dim, 30, 30)
-        
-        # Post-attention processing
-        x = self.conv5(x)
-        x = self.conv6(x)
-        x = self.conv7(x)
-        
-        # Output
-        logits = self.outc(x)  # (B, num_classes, 30, 30)
-        
-        if self.num_classes == 1:
-            return logits.squeeze(1)  # (B, H, W) for binary
-        else:
-            return logits  # (B, 10, H, W) for color prediction
-    
-    def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        logits = self.forward(input_grid, output_grid)
-        if self.num_classes == 1:
-            return torch.sigmoid(logits)
-        else:
-            return F.softmax(logits, dim=1)
-    
-    def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        logits = self.forward(input_grid, output_grid)
-        if self.num_classes == 1:
-            raise ValueError("predict_colors only valid for color mode (num_classes=10)")
-        return logits.argmax(dim=1)
-    
-    @classmethod
-    def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
-        checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
-        args = checkpoint.get('args', {})
-        hidden_dim = args.get('hidden_dim', 64)
-        force_comparison = args.get('force_comparison', True)
-        mode = args.get('mode', 'color')
-        num_classes = 10 if mode == 'color' else 1
-        attention_type = args.get('attention_type', 'self')
-        attention_heads = args.get('attention_heads', 8)
-        attention_layers = args.get('attention_layers', 2)
-        kernel_size = args.get('kernel_size', 3)
-
-        model = cls(
-            hidden_dim=hidden_dim,
-            force_comparison=force_comparison,
-            num_classes=num_classes,
-            attention_type=attention_type,
-            attention_heads=attention_heads,
-            attention_layers=attention_layers,
-            kernel_size=kernel_size
-        )
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-
-        if device:
-            model = model.to(device)
-        return model
-
-
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN with EXPLICIT comparison between input and output.
-    
+
     Instead of just concatenating embeddings, we compute:
     - input embedding
-    - output embedding  
+    - output embedding
     - difference (input - output)
     - element-wise product (input * output)
-    
+
     This forces the network to see both and compare them.
-    
-    Modes:
-    - binary (num_classes=1): Predict correct (1) vs incorrect (0) per pixel
-    - color (num_classes=10): Predict what color each pixel SHOULD be
+
+    Predicts what color each pixel SHOULD be (0-9).
     """
 
-    def __init__(self, hidden_dim: int = 64, force_comparison: bool = True, num_classes: int = 1,
-                 use_attention: bool = False, attention_type: str = "self",
-                 attention_heads: int = 8, attention_layers: int = 1,
+    def __init__(self, hidden_dim: int = 64, force_comparison: bool = False,
                  no_skip: bool = False, num_layers: int = 3, single_conv: bool = False,
                  kernel_size: int = 3):
         super().__init__()
 
         self.force_comparison = force_comparison
-        self.num_classes = num_classes
-        self.use_attention = use_attention
-        self.attention_type = attention_type
+        self.num_classes = NUM_COLORS  # Always 10 for color prediction
         self.no_skip = no_skip
         self.num_layers = num_layers
         self.single_conv = single_conv
@@ -721,10 +319,6 @@ class PixelErrorCNN(nn.Module):
             in_channels = 32
 
         base_ch = hidden_dim
-
-        # Bottleneck dimension depends on num_layers: 2^num_layers * base_ch
-        # 0 layers: base_ch, 1 layer: base_ch * 2, 2 layers: base_ch * 4, 3 layers: base_ch * 8
-        bottleneck_dim = base_ch * (2 ** num_layers) if num_layers > 0 else base_ch
 
         # Encoder - create layers based on num_layers
         self.inc = get_conv_block(in_channels, base_ch, single_conv, kernel_size)
@@ -752,34 +346,8 @@ class PixelErrorCNN(nn.Module):
                     self.up2 = Up(base_ch * 4, base_ch * 2, single_conv, kernel_size)
                 self.up3 = Up(base_ch * 2, base_ch, single_conv, kernel_size)
 
-        # Optional bottleneck attention for global reasoning
-        if use_attention:
-            if attention_type == "cbam":
-                self.bottleneck_attn = CBAM(bottleneck_dim)
-            else:  # "self" attention (default)
-                self.bottleneck_attn = BottleneckAttention(
-                    dim=bottleneck_dim,
-                    num_heads=attention_heads,
-                    num_layers=attention_layers
-                )
-            # FiLM modulation to inject global context into skip connections (only if using skips)
-            # Note: FiLM is only used with self-attention since CBAM doesn't produce the same
-            # kind of global context vector
-            if not no_skip and attention_type == "self" and num_layers >= 1:
-                # Adjust skip_dims based on num_layers
-                if num_layers == 3:
-                    skip_dims = [base_ch * 4, base_ch * 2, base_ch]
-                elif num_layers == 2:
-                    skip_dims = [base_ch * 2, base_ch]
-                else:  # num_layers == 1
-                    skip_dims = [base_ch]
-                self.film = FiLMModulation(
-                    bottleneck_dim=bottleneck_dim,
-                    skip_dims=skip_dims
-                )
-
-        # Output: 1 channel for binary, 10 channels for color prediction
-        self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
+        # Output: 10 channels for color prediction
+        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=3, padding=1)
 
     def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
         # Embed both grids
@@ -815,26 +383,6 @@ class PixelErrorCNN(nn.Module):
         else:  # num_layers == 3
             bottleneck = x4
 
-        # Apply bottleneck attention for global reasoning (if enabled)
-        if self.use_attention:
-            bottleneck = self.bottleneck_attn(bottleneck)
-
-            # Generate FiLM modulation parameters from global context (only if using skip connections)
-            # Note: FiLM is only used with self-attention, not CBAM, and only if num_layers >= 1
-            if not self.no_skip and self.attention_type == "self" and self.num_layers >= 1:
-                film_params = self.film(bottleneck)
-
-                # Modulate skip connections with global context based on num_layers
-                if self.num_layers == 3:
-                    x3 = FiLMModulation.apply_film(x3, *film_params[0])
-                    x2 = FiLMModulation.apply_film(x2, *film_params[1])
-                    x1 = FiLMModulation.apply_film(x1, *film_params[2])
-                elif self.num_layers == 2:
-                    x2 = FiLMModulation.apply_film(x2, *film_params[0])
-                    x1 = FiLMModulation.apply_film(x1, *film_params[1])
-                else:  # num_layers == 1
-                    x1 = FiLMModulation.apply_film(x1, *film_params[0])
-
         # Decoder - based on num_layers
         if self.num_layers == 0:
             # No encoder/decoder layers - just use bottleneck (which is x1) directly
@@ -863,26 +411,16 @@ class PixelErrorCNN(nn.Module):
                 x = self.up3(bottleneck, x1)
 
         logits = self.outc(x)
-
-        if self.num_classes == 1:
-            return logits.squeeze(1)  # (B, H, W) for binary
-        else:
-            return logits  # (B, 10, H, W) for color prediction
+        return logits  # (B, 10, H, W) for color prediction
 
     def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        """For binary mode: return probability of pixel being correct"""
+        """Return softmax probabilities for color prediction"""
         logits = self.forward(input_grid, output_grid)
-        if self.num_classes == 1:
-            return torch.sigmoid(logits)
-        else:
-            # For color mode, return softmax probabilities
-            return F.softmax(logits, dim=1)
-    
+        return F.softmax(logits, dim=1)
+
     def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        """For color mode: return predicted color per pixel"""
+        """Return predicted color per pixel"""
         logits = self.forward(input_grid, output_grid)
-        if self.num_classes == 1:
-            raise ValueError("predict_colors only valid for color mode (num_classes=10)")
         return logits.argmax(dim=1)  # (B, H, W)
 
     @classmethod
@@ -890,32 +428,16 @@ class PixelErrorCNN(nn.Module):
         checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
         args = checkpoint.get('args', {})
         hidden_dim = args.get('hidden_dim', 64)
-        force_comparison = args.get('force_comparison', True)
-        # Support both old checkpoints (binary only) and new ones
-        mode = args.get('mode', 'binary')
-        num_classes = 10 if mode == 'color' else 1
-        # Attention parameters
-        use_attention = args.get('use_attention', False)
-        attention_type = args.get('attention_type', 'self')
-        attention_heads = args.get('attention_heads', 8)
-        attention_layers = args.get('attention_layers', 1)
-        # Skip connection parameter
+        # force_comparison is saved as top-level key, fall back to args for older checkpoints
+        force_comparison = checkpoint.get('force_comparison', args.get('force_comparison', True))
         no_skip = args.get('no_skip', False)
-        # Depth parameter (default 3 for backward compatibility)
         num_layers = args.get('num_layers', 3)
-        # Single conv parameter (default False for backward compatibility)
         single_conv = args.get('single_conv', False)
-        # Kernel size parameter (default 3 for backward compatibility)
         kernel_size = args.get('kernel_size', 3)
 
         model = cls(
             hidden_dim=hidden_dim,
             force_comparison=force_comparison,
-            num_classes=num_classes,
-            use_attention=use_attention,
-            attention_type=attention_type,
-            attention_heads=attention_heads,
-            attention_layers=attention_layers,
             no_skip=no_skip,
             num_layers=num_layers,
             single_conv=single_conv,
@@ -948,10 +470,8 @@ class CorrespondenceDataset(Dataset):
     8. NEGATIVE - color_swap: one color swapped with another
 
     Types 3-8 force the CNN to detect various failure modes!
-    
-    Modes:
-    - binary: Returns pixel_mask where 1=correct, 0=incorrect
-    - color: Returns target_colors where each pixel has the correct color (0-9)
+
+    Returns target_colors where each pixel has the correct color (0-9).
     """
 
     def __init__(
@@ -968,7 +488,6 @@ class CorrespondenceDataset(Dataset):
         augment: bool = True,
         dihedral_only: bool = False,
         color_only: bool = False,
-        mode: str = "binary",  # "binary" or "color"
         include_test: bool = True,  # Whether to include test examples
     ):
         self.num_positives = num_positives
@@ -986,7 +505,6 @@ class CorrespondenceDataset(Dataset):
         self.augment = augment
         self.dihedral_only = dihedral_only
         self.color_only = color_only
-        self.mode = mode
         self.include_test = include_test
 
         # Extract all (input, output) pairs
@@ -1005,7 +523,6 @@ class CorrespondenceDataset(Dataset):
                         self.examples.append((inp, out, puzzle_id))
 
         print(f"Loaded {len(self.examples)} examples from {len(puzzles)} puzzles (include_test={include_test})")
-        print(f"Mode: {mode.upper()}")
         print(f"Samples per example: {self.samples_per_example} "
               f"({num_positives} pos, {num_corrupted} corrupt, "
               f"{num_wrong_input} wrong_input, {num_mismatched_aug} mismatch, "
@@ -1234,20 +751,12 @@ class CorrespondenceDataset(Dataset):
         pixel_mask = np.ascontiguousarray(pixel_mask)
         target_correct = np.ascontiguousarray(target_correct)
 
-        if self.mode == "binary":
-            return (
-                torch.from_numpy(final_input.copy()).long(),
-                torch.from_numpy(final_output.copy()).long(),
-                torch.from_numpy(pixel_mask.copy()).float(),
-                torch.tensor(is_positive, dtype=torch.float32)
-            )
-        else:  # color mode
-            return (
-                torch.from_numpy(final_input.copy()).long(),
-                torch.from_numpy(final_output.copy()).long(),
-                torch.from_numpy(target_correct.copy()).long(),  # Target colors (0-9)
-                torch.from_numpy(pixel_mask.copy()).float(),  # Still useful for metrics
-            )
+        return (
+            torch.from_numpy(final_input.copy()).long(),
+            torch.from_numpy(final_output.copy()).long(),
+            torch.from_numpy(target_correct.copy()).long(),  # Target colors (0-9)
+            torch.from_numpy(pixel_mask.copy()).float(),  # Still useful for metrics
+        )
 
 
 # =============================================================================
@@ -1258,12 +767,11 @@ class TestEvalDataset(Dataset):
     """
     Simple dataset for evaluating on held-out test examples.
     No augmentation, no corruptions - just raw (input, output) pairs.
-    
+
     For the critical generalization test: did the CNN learn the rule?
     """
-    
-    def __init__(self, puzzles: Dict, mode: str = "color", test_only: bool = True):
-        self.mode = mode
+
+    def __init__(self, puzzles: Dict, test_only: bool = True):
         self.examples = []
         
         for puzzle_id, puzzle in puzzles.items():
@@ -1378,7 +886,6 @@ def evaluate_test_examples(
     model: nn.Module,
     dataset: TestEvalDataset,
     device: torch.device,
-    mode: str = "color",
     verbose: bool = True,
     visualize: bool = True,
     recursive_iters: int = 1,
@@ -1386,7 +893,7 @@ def evaluate_test_examples(
     """
     Evaluate model on held-out test examples.
     This is the critical generalization test.
-    
+
     With recursive_iters > 1, we feed the model's output back as the candidate
     and iterate, tracking accuracy at each step.
     """
@@ -1412,53 +919,41 @@ def evaluate_test_examples(
             
             # Start with blank candidate
             candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
-            
-            if mode == "color":
-                # Recursive iteration
-                for iter_idx in range(recursive_iters):
-                    # Predict colors from (input, current_candidate)
-                    logits = model(inp_t, candidate)  # (1, 10, H, W)
-                    pred_colors = logits.argmax(dim=1)  # (1, H, W)
-                    
-                    # Track accuracy at this iteration
-                    pred_np = pred_colors[0].cpu().numpy()
-                    pred_region = pred_np[:out_h, :out_w]
-                    target_region = target_colors[:out_h, :out_w]
-                    
-                    correct = (pred_region == target_region).sum()
-                    total = out_h * out_w
-                    
-                    iter_stats[iter_idx]["correct"] += correct
-                    iter_stats[iter_idx]["total"] += total
-                    
-                    # Update candidate for next iteration
-                    candidate = pred_colors.long()
-                
-                # Final results use last iteration
-                is_perfect = (correct == total)
-                
-                # Visualize final result
-                if visualize:
-                    visualize_prediction(
-                        input_grid.numpy(),
-                        target_colors,
-                        pred_np,
-                        inp_h, inp_w,
-                        out_h, out_w,
-                        puzzle_id
-                    )
-                
-            else:  # binary mode
-                # Binary mode doesn't make sense with recursion in the same way
-                out_t = output_grid.unsqueeze(0).to(device)
-                logits = model(inp_t, out_t)  # (1, H, W)
-                pred_correct = (logits > 0)[0].cpu().numpy()
-                
-                pred_region = pred_correct[:out_h, :out_w]
-                correct = pred_region.sum()
+
+            # Recursive iteration
+            for iter_idx in range(recursive_iters):
+                # Predict colors from (input, current_candidate)
+                logits = model(inp_t, candidate)  # (1, 10, H, W)
+                pred_colors = logits.argmax(dim=1)  # (1, H, W)
+
+                # Track accuracy at this iteration
+                pred_np = pred_colors[0].cpu().numpy()
+                pred_region = pred_np[:out_h, :out_w]
+                target_region = target_colors[:out_h, :out_w]
+
+                correct = (pred_region == target_region).sum()
                 total = out_h * out_w
-                is_perfect = (correct == total)
-            
+
+                iter_stats[iter_idx]["correct"] += correct
+                iter_stats[iter_idx]["total"] += total
+
+                # Update candidate for next iteration
+                candidate = pred_colors.long()
+
+            # Final results use last iteration
+            is_perfect = (correct == total)
+
+            # Visualize final result
+            if visualize:
+                visualize_prediction(
+                    input_grid.numpy(),
+                    target_colors,
+                    pred_np,
+                    inp_h, inp_w,
+                    out_h, out_w,
+                    puzzle_id
+                )
+
             total_correct += correct
             total_pixels += total
             total_examples += 1
@@ -1514,29 +1009,28 @@ def run_layer_ablation(
     model: nn.Module,
     test_dataset,
     device: torch.device,
-    mode: str = "color",
     verbose: bool = True
 ) -> Dict[str, Dict]:
     """
     Run layer-wise ablation analysis to understand what each layer contributes.
-    
+
     For each layer, we temporarily zero out its output and measure the impact
     on test accuracy. Larger drops indicate more critical layers.
-    
+
     Returns:
         Dict mapping layer names to their ablation results
     """
     model.eval()
-    
+
     # First, get baseline accuracy without any ablation
     print("\n" + "="*70)
     print("LAYER-WISE ABLATION ANALYSIS")
     print("="*70)
     print("Testing which layers are critical for this transformation...")
     print("Baseline = normal model, then we zero each layer's output one at a time.\n")
-    
+
     baseline_results = evaluate_test_examples(
-        model, test_dataset, device, mode=mode, verbose=False, visualize=False
+        model, test_dataset, device, verbose=False, visualize=False
     )
     baseline_acc = baseline_results['pixel_accuracy']
     baseline_perfect = baseline_results['perfect_rate']
@@ -1545,71 +1039,35 @@ def run_layer_ablation(
     print(f"  Pixel Accuracy: {baseline_acc:.2%}")
     print(f"  Perfect Rate:   {baseline_perfect:.2%}")
     print(f"{'─'*70}\n")
-    
-    # Determine which model architecture we have
-    is_full_res = isinstance(model, FullResolutionCNN)
-    
-    # Define layers to ablate based on architecture
-    if is_full_res:
-        # FullResolutionCNN layers
-        layer_groups = {
-            "Embeddings": [
-                ("input_embed", model.input_embed),
-                ("output_embed", model.output_embed),
-            ],
-            "Pre-Attention Convs": [
-                ("conv1 (dilation=1)", model.conv1),
-                ("conv2 (dilation=2)", model.conv2),
-                ("conv3 (dilation=4)", model.conv3),
-                ("conv4 (dilation=8)", model.conv4),
-            ],
-            "Attention": [
-                ("attention", model.attention),
-            ],
-            "Post-Attention Convs": [
-                ("conv5 (dilation=4)", model.conv5),
-                ("conv6 (dilation=2)", model.conv6),
-                ("conv7 (dilation=1)", model.conv7),
-            ],
-        }
-    else:
-        # PixelErrorCNN (U-Net) layers - build based on num_layers
-        encoder_layers = [
-            ("inc (initial conv)", model.inc),
-        ]
-        if model.num_layers >= 1:
-            encoder_layers.append(("down1 (encoder level 1)", model.down1))
-        if model.num_layers >= 2:
-            encoder_layers.append(("down2 (encoder level 2)", model.down2))
-        if model.num_layers >= 3:
-            encoder_layers.append(("down3 (encoder level 3 / bottleneck)", model.down3))
 
-        decoder_layers = []
-        if model.num_layers >= 3:
-            decoder_layers.append(("up1 (decoder level 1)", model.up1))
-        if model.num_layers >= 2:
-            decoder_layers.append(("up2 (decoder level 2)", model.up2))
-        if model.num_layers >= 1:
-            decoder_layers.append(("up3 (decoder level 3)", model.up3))
+    # PixelErrorCNN (U-Net) layers - build based on num_layers
+    encoder_layers = [
+        ("inc (initial conv)", model.inc),
+    ]
+    if model.num_layers >= 1:
+        encoder_layers.append(("down1 (encoder level 1)", model.down1))
+    if model.num_layers >= 2:
+        encoder_layers.append(("down2 (encoder level 2)", model.down2))
+    if model.num_layers >= 3:
+        encoder_layers.append(("down3 (encoder level 3 / bottleneck)", model.down3))
 
-        layer_groups = {
-            "Embeddings": [
-                ("input_embed", model.input_embed),
-                ("output_embed", model.output_embed),
-            ],
-            "Encoder": encoder_layers,
-        }
-        if decoder_layers:  # Only add Decoder group if there are decoder layers
-            layer_groups["Decoder"] = decoder_layers
-        # Add attention if present
-        if hasattr(model, 'bottleneck_attn') and model.use_attention:
-            layer_groups["Bottleneck Attention"] = [
-                ("bottleneck_attn", model.bottleneck_attn),
-            ]
-            if hasattr(model, 'film') and not model.no_skip:
-                layer_groups["FiLM Modulation"] = [
-                    ("film (global context injection)", model.film),
-                ]
+    decoder_layers = []
+    if model.num_layers >= 3:
+        decoder_layers.append(("up1 (decoder level 1)", model.up1))
+    if model.num_layers >= 2:
+        decoder_layers.append(("up2 (decoder level 2)", model.up2))
+    if model.num_layers >= 1:
+        decoder_layers.append(("up3 (decoder level 3)", model.up3))
+
+    layer_groups = {
+        "Embeddings": [
+            ("input_embed", model.input_embed),
+            ("output_embed", model.output_embed),
+        ],
+        "Encoder": encoder_layers,
+    }
+    if decoder_layers:  # Only add Decoder group if there are decoder layers
+        layer_groups["Decoder"] = decoder_layers
     
     # Store ablation results
     ablation_results = {}
@@ -1648,7 +1106,7 @@ def run_layer_ablation(
         # Run evaluation
         try:
             results = evaluate_test_examples(
-                model, test_dataset, device, mode=mode, verbose=False, visualize=False
+                model, test_dataset, device, verbose=False, visualize=False
             )
             acc = results['pixel_accuracy']
             perfect = results['perfect_rate']
@@ -1750,78 +1208,13 @@ def run_layer_ablation(
     }
 
 
-def train_epoch_binary(
+def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Training epoch for binary mode"""
-    model.train()
-
-    total_loss = 0.0
-    total_pixel_correct = 0
-    total_pixels = 0
-    total_error_tp = 0
-    total_error_fp = 0
-    total_error_fn = 0
-    num_batches = 0
-
-    pbar = tqdm(loader, desc="Training")
-    for input_grid, output_grid, pixel_mask, is_positive in pbar:
-        input_grid = input_grid.to(device)
-        output_grid = output_grid.to(device)
-        pixel_mask = pixel_mask.to(device)
-
-        optimizer.zero_grad()
-
-        logits = model(input_grid, output_grid)
-        loss = F.binary_cross_entropy_with_logits(logits, pixel_mask)
-
-        loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            preds = (logits > 0).float()
-            
-            correct = (preds == pixel_mask).sum().item()
-            total = pixel_mask.numel()
-            total_pixel_correct += correct
-            total_pixels += total
-
-            error_target = (pixel_mask == 0)
-            error_pred = (preds == 0)
-            
-            total_error_tp += (error_target & error_pred).sum().item()
-            total_error_fp += (~error_target & error_pred).sum().item()
-            total_error_fn += (error_target & ~error_pred).sum().item()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        pbar.set_postfix(loss=loss.item())
-
-    pixel_accuracy = total_pixel_correct / max(total_pixels, 1)
-    precision = total_error_tp / max(total_error_tp + total_error_fp, 1)
-    recall = total_error_tp / max(total_error_tp + total_error_fn, 1)
-    error_iou = total_error_tp / max(total_error_tp + total_error_fp + total_error_fn, 1)
-
-    return {
-        "loss": total_loss / max(num_batches, 1),
-        "pixel_accuracy": pixel_accuracy,
-        "error_precision": precision,
-        "error_recall": recall,
-        "error_iou": error_iou,
-    }
-
-
-def train_epoch_color(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> Dict[str, float]:
-    """Training epoch for color prediction mode"""
+    """Training epoch for color prediction"""
     model.train()
 
     total_loss = 0.0
@@ -1879,76 +1272,12 @@ def train_epoch_color(
     }
 
 
-def evaluate_binary(
+def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Evaluation for binary mode"""
-    model.eval()
-
-    total_loss = 0.0
-    total_pixel_correct = 0
-    total_pixels = 0
-    total_error_tp = 0
-    total_error_fp = 0
-    total_error_fn = 0
-    total_perfect = 0
-    total_samples = 0
-    num_batches = 0
-
-    with torch.no_grad():
-        for input_grid, output_grid, pixel_mask, is_positive in loader:
-            input_grid = input_grid.to(device)
-            output_grid = output_grid.to(device)
-            pixel_mask = pixel_mask.to(device)
-
-            logits = model(input_grid, output_grid)
-            loss = F.binary_cross_entropy_with_logits(logits, pixel_mask)
-
-            preds = (logits > 0).float()
-
-            correct = (preds == pixel_mask).sum().item()
-            total = pixel_mask.numel()
-            total_pixel_correct += correct
-            total_pixels += total
-
-            error_target = (pixel_mask == 0)
-            error_pred = (preds == 0)
-            
-            total_error_tp += (error_target & error_pred).sum().item()
-            total_error_fp += (~error_target & error_pred).sum().item()
-            total_error_fn += (error_target & ~error_pred).sum().item()
-
-            batch_perfect = (preds == pixel_mask).all(dim=-1).all(dim=-1).sum().item()
-            total_perfect += batch_perfect
-            total_samples += input_grid.size(0)
-
-            total_loss += loss.item()
-            num_batches += 1
-
-    pixel_accuracy = total_pixel_correct / max(total_pixels, 1)
-    precision = total_error_tp / max(total_error_tp + total_error_fp, 1)
-    recall = total_error_tp / max(total_error_tp + total_error_fn, 1)
-    error_iou = total_error_tp / max(total_error_tp + total_error_fp + total_error_fn, 1)
-    perfect_rate = total_perfect / max(total_samples, 1)
-
-    return {
-        "loss": total_loss / max(num_batches, 1),
-        "pixel_accuracy": pixel_accuracy,
-        "error_precision": precision,
-        "error_recall": recall,
-        "error_iou": error_iou,
-        "perfect_rate": perfect_rate,
-    }
-
-
-def evaluate_color(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> Dict[str, float]:
-    """Evaluation for color prediction mode"""
+    """Evaluation for color prediction"""
     model.eval()
 
     total_loss = 0.0
@@ -2018,102 +1347,8 @@ def _find_grid_bounds(grid: np.ndarray, max_size: int = 30) -> Tuple[int, int]:
     return r_max, c_max
 
 
-def visualize_predictions_binary(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
-    """Visualize predictions for binary mode"""
-    model.eval()
-
-    print("\n" + "="*80)
-    print("Sample Predictions (Binary Mode - Error Detection)")
-    print("="*80)
-
-    # Get samples of each type with their counts
-    base = 0
-    type_info = [
-        ("positive", base, dataset.num_positives),
-    ]
-    base += dataset.num_positives
-    type_info.append(("corrupted", base, dataset.num_corrupted))
-    base += dataset.num_corrupted
-    type_info.append(("wrong_input", base, dataset.num_wrong_input))
-    base += dataset.num_wrong_input
-    type_info.append(("mismatched_aug", base, dataset.num_mismatched_aug))
-    base += dataset.num_mismatched_aug
-    type_info.append(("all_zeros", base, dataset.num_all_zeros))
-    base += dataset.num_all_zeros
-    type_info.append(("constant_fill", base, dataset.num_constant_fill))
-    base += dataset.num_constant_fill
-    type_info.append(("random_noise", base, dataset.num_random_noise))
-    base += dataset.num_random_noise
-    type_info.append(("color_swap", base, dataset.num_color_swap))
-
-    for sample_type, offset, count in type_info:
-        if count == 0:
-            continue
-
-        print(f"\n{'â”€'*80}")
-        print(f"Sample Type: {sample_type.upper()}")
-        print(f"{'â”€'*80}")
-
-        samples_to_show = min(2, count)
-        for i in range(samples_to_show):
-            # Calculate index for this sample type
-            example_idx = random.randint(0, len(dataset.examples) - 1)
-            sample_idx = example_idx * dataset.samples_per_example + offset + i
-
-            if sample_idx >= len(dataset):
-                continue
-
-            input_grid, output_grid, pixel_mask, is_positive = dataset[sample_idx]
-
-            inp_t = input_grid.unsqueeze(0).to(device)
-            out_t = output_grid.unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                pred_proba = model.predict_proba(inp_t, out_t)[0].cpu().numpy()
-
-            input_np = input_grid.numpy()
-            output_np = output_grid.numpy()
-            mask_np = pixel_mask.numpy()
-
-            # Find content bounds SEPARATELY for input and output
-            inp_r, inp_c = _find_grid_bounds(input_np)
-            out_r, out_c = _find_grid_bounds(output_np)
-
-            # For all-zeros output, use mask to find content region
-            if out_r == 1 and out_c == 1:
-                error_positions = np.where(mask_np == 0)
-                if len(error_positions[0]) > 0:
-                    out_r = min(error_positions[0].max() + 1, 30)
-                    out_c = min(error_positions[1].max() + 1, 30)
-
-            num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
-            expected = "ALL CORRECT" if is_positive > 0.5 else f"{num_errors} errors"
-
-            print(f"\nInput: {inp_r}Ã—{inp_c} â†’ Output: {out_r}Ã—{out_c}")
-            print(f"Expected: {expected}")
-
-            # Print INPUT separately with its own dimensions
-            print(f"\nINPUT ({inp_r}Ã—{inp_c}):")
-            for r in range(inp_r):
-                inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
-                print(f"  {inp_row}")
-
-            # Print OUTPUT and PREDICTED ERRORS with output dimensions
-            print(f"\n{'OUTPUT':<30} {'PREDICTED ERRORS':<30}")
-            for r in range(out_r):
-                out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
-                err_row = " ".join("X" if pred_proba[r, c] < 0.5 else "Â·" for c in range(out_c))
-                print(f"  {out_row:<28} {err_row:<28}")
-
-            # Stats (only count within content area)
-            num_predicted_errors = (pred_proba[:out_r, :out_c] < 0.5).sum()
-            print(f"Predicted errors: {num_predicted_errors}")
-
-    print("="*80 + "\n")
-
-
-def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
-    """Visualize predictions for color mode"""
+def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
+    """Visualize predictions for color prediction"""
     model.eval()
 
     print("\n" + "="*80)
@@ -2210,570 +1445,7 @@ def visualize_predictions_color(model: nn.Module, dataset: Dataset, device: torc
     print("="*80 + "\n")
 
 
-def visualize_counting_predictions(model: nn.Module, test_loader: DataLoader,
-                                    grid_size: int, device: torch.device,
-                                    num_samples: int = 4):
-    """
-    Visualize predictions for the counting experiment.
-    Shows input grid, expected output (3x3), and predicted output (3x3).
-    """
-    model.eval()
-
-    print(f"\n{'─'*80}")
-    print(f"SAMPLE PREDICTIONS (Grid {grid_size}x{grid_size} → Output 3x3)")
-    print(f"{'─'*80}")
-
-    # Get a batch of test data
-    batch = next(iter(test_loader))
-    input_grids, output_grids, targets, _ = batch
-
-    input_grids = input_grids.to(device)
-    output_grids = output_grids.to(device)
-
-    with torch.no_grad():
-        logits = model(input_grids, output_grids)
-        predictions = logits.argmax(dim=1)  # (B, H, W)
-
-    # Show up to num_samples examples
-    num_to_show = min(num_samples, input_grids.size(0))
-
-    for i in range(num_to_show):
-        inp = input_grids[i].cpu().numpy()
-        target = targets[i].cpu().numpy()
-        pred = predictions[i].cpu().numpy()
-
-        # Find actual content size for input (exclude padding)
-        inp_rows = inp.shape[0]
-        inp_cols = inp.shape[1]
-        # Find non-padded region
-        for r in range(inp_rows - 1, -1, -1):
-            if any(inp[r, :] != 0):
-                inp_rows = r + 1
-                break
-        for c in range(inp_cols - 1, -1, -1):
-            if any(inp[:inp_rows, c] != 0):
-                inp_cols = c + 1
-                break
-        inp_rows = max(inp_rows, grid_size)
-        inp_cols = max(inp_cols, grid_size)
-
-        # Output is always 3x3
-        out_rows, out_cols = 3, 3
-
-        # Count colors in input to show analysis
-        from collections import Counter
-        inp_flat = inp[:grid_size, :grid_size].flatten()
-        color_counts = Counter(inp_flat)
-        most_common = color_counts.most_common(3)
-
-        # Get expected and predicted winner colors
-        expected_color = target[0, 0]  # All same in target
-        predicted_color = pred[0, 0]  # Check prediction at (0,0)
-        is_correct = (pred[:out_rows, :out_cols] == target[:out_rows, :out_cols]).all()
-
-        status = "✓ CORRECT" if is_correct else "✗ WRONG"
-
-        print(f"\n[Example {i+1}] {status}")
-        print(f"  Top colors: {', '.join(f'{c}:{cnt}' for c, cnt in most_common)}")
-        print(f"  Expected: {expected_color}, Predicted: {predicted_color}")
-
-        # Print input grid (truncated if large)
-        print(f"\n  INPUT ({grid_size}x{grid_size}):")
-        max_display = min(grid_size, 10)  # Limit display for large grids
-        for r in range(max_display):
-            row_str = " ".join(f"{inp[r, c]}" for c in range(max_display))
-            suffix = " ..." if grid_size > 10 else ""
-            print(f"    {row_str}{suffix}")
-        if grid_size > 10:
-            print(f"    ... ({grid_size - 10} more rows)")
-
-        # Print output side by side: EXPECTED vs PREDICTED
-        print(f"\n  {'EXPECTED (3x3)':<20} {'PREDICTED (3x3)':<20}")
-        for r in range(out_rows):
-            exp_row = " ".join(f"{target[r, c]}" for c in range(out_cols))
-            pred_row = " ".join(f"{pred[r, c]}" for c in range(out_cols))
-            print(f"    {exp_row:<18} {pred_row:<18}")
-
-    print(f"\n{'─'*80}\n")
-
-
-# =============================================================================
-# Counting Experiment - Synthetic Puzzle Generation
-# =============================================================================
-
-def generate_counting_puzzle(grid_size: int, num_colors: int, rng: np.random.Generator,
-                              output_size: int = 3) -> Dict:
-    """
-    Generate a single 'most frequent color' puzzle example.
-
-    The winner color has exactly 1 more pixel than the runner-up (hardest case).
-    Output is always a fixed-size grid (default 3x3) filled with the winner color.
-    This decouples input complexity from output size.
-    """
-    # Pick num_colors random colors from 0-9
-    available_colors = list(range(10))
-    rng.shuffle(available_colors)
-    colors = available_colors[:num_colors]
-
-    total_pixels = grid_size * grid_size
-
-    # Distribute pixels with winner having exactly 1 more than runner-up
-    # Strategy: make counts as equal as possible, then give winner +1
-    base_count = total_pixels // num_colors
-    remainder = total_pixels % num_colors
-
-    # Start with base counts
-    counts = [base_count] * num_colors
-
-    # Distribute remainder evenly (but not to winner yet)
-    winner_idx = rng.integers(num_colors)
-    runner_up_idx = (winner_idx + 1) % num_colors
-
-    # Give remainder to non-winners first
-    extra_indices = [i for i in range(num_colors) if i != winner_idx]
-    for i in range(remainder):
-        counts[extra_indices[i % len(extra_indices)]] += 1
-
-    # Now ensure winner has exactly 1 more than the current max (runner-up)
-    current_max = max(counts[i] for i in range(num_colors) if i != winner_idx)
-    counts[winner_idx] = current_max + 1
-
-    # Find actual runner-up index (the one with current_max count)
-    runner_up_idx = None
-    for i in range(num_colors):
-        if i != winner_idx and counts[i] == current_max:
-            runner_up_idx = i
-            break
-
-    # Adjust total if we went over
-    current_total = sum(counts)
-    if current_total > total_pixels:
-        # Remove from non-winner, non-runner-up colors only
-        diff = current_total - total_pixels
-        for i in range(num_colors):
-            if i != winner_idx and i != runner_up_idx and diff > 0 and counts[i] > 1:
-                remove = min(diff, counts[i] - 1)
-                counts[i] -= remove
-                diff -= remove
-        # If still over (not enough other colors), we must accept larger margin
-        # This shouldn't happen with reasonable num_colors
-    elif current_total < total_pixels:
-        # Add to winner
-        counts[winner_idx] += total_pixels - current_total
-
-    # Build input grid
-    pixels = []
-    for color, count in zip(colors, counts):
-        pixels.extend([color] * count)
-
-    # Ensure exact size
-    while len(pixels) < total_pixels:
-        pixels.append(colors[winner_idx])
-    pixels = pixels[:total_pixels]
-
-    # Shuffle pixel positions
-    rng.shuffle(pixels)
-    input_grid = np.array(pixels).reshape(grid_size, grid_size).tolist()
-
-    # Output is all winner color (fixed size, default 3x3)
-    winner_color = colors[winner_idx]
-    output_grid = [[winner_color] * output_size for _ in range(output_size)]
-
-    return {"input": input_grid, "output": output_grid}
-
-
-def generate_counting_puzzles(grid_size: int, num_train: int, num_test: int,
-                               num_colors: int, seed: int = 42) -> Dict:
-    """
-    Generate synthetic puzzle dict matching ARC format.
-
-    Returns a dict with one puzzle containing train and test examples.
-    """
-    rng = np.random.default_rng(seed)
-
-    train_examples = [generate_counting_puzzle(grid_size, num_colors, rng)
-                      for _ in range(num_train)]
-    test_examples = [generate_counting_puzzle(grid_size, num_colors, rng)
-                     for _ in range(num_test)]
-
-    puzzle_id = f"counting_{grid_size}x{grid_size}"
-
-    return {
-        puzzle_id: {
-            "train": train_examples,
-            "test": test_examples
-        }
-    }
-
-
-def run_counting_experiment(args):
-    """
-    Run the counting experiment across multiple grid sizes.
-
-    For each grid size:
-    1. Generate synthetic 'most frequent color' puzzles
-    2. Train PixelErrorCNN from scratch
-    3. Evaluate on held-out test examples
-    4. Run ablation analysis
-    5. Collect and report results
-    """
-    print("=" * 80)
-    print("COUNTING EXPERIMENT: Most Frequent Color Task")
-    print("=" * 80)
-    print(f"Device: {DEVICE}")
-    print(f"Grid sizes to test: {args.counting_grid_sizes}")
-    print(f"Colors per grid: {args.counting_num_colors}")
-    print(f"Train examples per size: {args.counting_num_train}")
-    print(f"Test examples per size: {args.counting_num_test}")
-    print(f"Negatives per example: {args.counting_num_negatives}")
-    print(f"Epochs per size: {args.epochs}")
-    print(f"Winner margin: 1 pixel (hardest case)")
-    print("=" * 80)
-
-    # Force color mode for this experiment (we're predicting what color output should be)
-    args.mode = "color"
-    args.eval_on_test = True
-    args.ablation = True
-
-    # Collect results across all grid sizes
-    all_results = []
-
-    for grid_size in args.counting_grid_sizes:
-        print(f"\n{'='*80}")
-        print(f"GRID SIZE: {grid_size}x{grid_size}")
-        print(f"{'='*80}")
-
-        # Generate puzzles for this grid size
-        puzzles = generate_counting_puzzles(
-            grid_size=grid_size,
-            num_train=args.counting_num_train,
-            num_test=args.counting_num_test,
-            num_colors=args.counting_num_colors,
-            seed=args.seed + grid_size  # Different seed per size for variety
-        )
-
-        puzzle_id = list(puzzles.keys())[0]
-        puzzle = puzzles[puzzle_id]
-
-        print(f"Generated {len(puzzle['train'])} train, {len(puzzle['test'])} test examples")
-
-        # Verify puzzle correctness (sanity check)
-        sample = puzzle['train'][0]
-        input_flat = [c for row in sample['input'] for c in row]
-        output_color = sample['output'][0][0]
-        from collections import Counter
-        counts = Counter(input_flat)
-        most_common = counts.most_common(1)[0]
-        print(f"Sample puzzle: most frequent color = {most_common[0]} (count={most_common[1]}), output = {output_color}")
-
-        # Setup datasets
-        use_augment = not args.no_augment
-        dihedral_only = args.dihedral_only
-        color_only = args.color_only
-
-        # Create separate puzzle dicts for train and test
-        # CorrespondenceDataset pulls from "train" key, so we put our data there
-        train_puzzle = {puzzle_id: {"train": puzzle["train"]}}
-        test_puzzle = {puzzle_id: {"train": puzzle["test"]}}  # Put test in "train" key for loading
-
-        # For counting experiment: ONLY all_zeros samples
-        # Model sees (input, blank) and must predict the correct output
-        num_all_zeros = args.counting_num_negatives
-
-        train_dataset = CorrespondenceDataset(
-            puzzles=train_puzzle,
-            num_positives=0,
-            num_corrupted=0,
-            num_wrong_input=0,
-            num_mismatched_aug=0,
-            num_color_swap=0,
-            num_all_zeros=num_all_zeros,
-            num_constant_fill=0,
-            num_random_noise=0,
-            augment=use_augment,
-            dihedral_only=dihedral_only,
-            color_only=color_only,
-            mode=args.mode,
-            include_test=False
-        )
-
-        # For test: give model (input, all_zeros) and see if it predicts correct output
-        # This tests actual prediction ability, not just copying
-        test_dataset = CorrespondenceDataset(
-            puzzles=test_puzzle,
-            num_positives=0,  # Don't give correct answer!
-            num_corrupted=0,
-            num_wrong_input=0,
-            num_mismatched_aug=0,
-            num_color_swap=0,
-            num_all_zeros=1,  # Give blank output, model must predict correct color
-            num_constant_fill=0,
-            num_random_noise=0,
-            augment=False,  # No augmentation for test
-            dihedral_only=False,
-            color_only=False,
-            mode=args.mode,
-            include_test=False
-        )
-
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                                  shuffle=True, num_workers=args.num_workers)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                                 shuffle=False, num_workers=args.num_workers)
-
-        print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
-
-        # Create model
-        num_classes = NUM_COLORS if args.mode == "color" else 1
-        model = PixelErrorCNN(
-            hidden_dim=args.hidden_dim,
-            force_comparison=not args.no_force_comparison,
-            num_classes=num_classes,
-            use_attention=args.use_attention,
-            attention_type=args.attention_type,
-            attention_heads=args.attention_heads,
-            attention_layers=args.attention_layers,
-            no_skip=args.no_skip,
-            num_layers=args.num_layers,
-            single_conv=args.single_conv
-        ).to(DEVICE)
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
-
-        # Training loop
-        best_test_acc = 0
-        best_epoch = 0
-
-        for epoch in range(args.epochs):
-            model.train()
-            total_loss = 0
-            correct = 0
-            total = 0
-
-            for batch in train_loader:
-                # CorrespondenceDataset returns tuple: (input, output, target, mask) for color mode
-                input_grid, output_grid, target, _ = batch
-                input_grid = input_grid.to(DEVICE)
-                output_grid = output_grid.to(DEVICE)
-                target = target.to(DEVICE)
-
-                optimizer.zero_grad()
-                logits = model(input_grid, output_grid)
-
-                if args.mode == "color":
-                    # Cross-entropy for color prediction
-                    loss = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, NUM_COLORS),
-                                           target.reshape(-1).long())
-                    preds = logits.argmax(dim=1)
-                    correct += (preds == target).sum().item()
-                    total += target.numel()
-                else:
-                    # Binary cross-entropy
-                    loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), target)
-                    preds = (logits.squeeze(1) > 0).float()
-                    correct += (preds == target).sum().item()
-                    total += target.numel()
-
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-
-            scheduler.step()
-
-            # Evaluate on test set
-            model.eval()
-            test_correct = 0
-            test_total = 0
-            test_grid_correct = 0
-            test_grid_total = 0
-
-            with torch.no_grad():
-                for batch in test_loader:
-                    input_grid, output_grid, target, _ = batch
-                    input_grid = input_grid.to(DEVICE)
-                    output_grid = output_grid.to(DEVICE)
-                    target = target.to(DEVICE)
-
-                    logits = model(input_grid, output_grid)
-
-                    if args.mode == "color":
-                        preds = logits.argmax(dim=1)
-                        test_correct += (preds == target).sum().item()
-                        test_total += target.numel()
-                        # Grid-level accuracy (entire grid must be correct)
-                        grid_match = (preds == target).all(dim=(1, 2))
-                        test_grid_correct += grid_match.sum().item()
-                        test_grid_total += grid_match.size(0)
-                    else:
-                        preds = (logits.squeeze(1) > 0).float()
-                        test_correct += (preds == target).sum().item()
-                        test_total += target.numel()
-
-            train_acc = correct / total if total > 0 else 0
-            test_acc = test_correct / test_total if test_total > 0 else 0
-            test_grid_acc = test_grid_correct / test_grid_total if test_grid_total > 0 else 0
-
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
-                best_epoch = epoch + 1
-
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                print(f"  Epoch {epoch+1:3d}: Train={train_acc:.1%}, Test={test_acc:.1%}, GridAcc={test_grid_acc:.1%}")
-
-        print(f"\n  Best test accuracy: {best_test_acc:.1%} (epoch {best_epoch})")
-        print(f"  Final grid accuracy: {test_grid_acc:.1%}")
-
-        # Run ablation analysis
-        print(f"\n  Running ablation analysis...")
-        ablation_results = run_ablation_analysis(model, test_loader, args.mode)
-
-        # Visualize predictions
-        visualize_counting_predictions(model, test_loader, grid_size, DEVICE, num_samples=4)
-
-        # Store one sample for final summary visualization
-        sample_batch = next(iter(test_loader))
-        sample_input, sample_output, sample_target, _ = sample_batch
-        with torch.no_grad():
-            sample_logits = model(sample_input[:1].to(DEVICE), sample_output[:1].to(DEVICE))
-            sample_pred = sample_logits.argmax(dim=1)[0].cpu().numpy()
-        sample_viz = {
-            "input": sample_input[0].numpy(),
-            "target": sample_target[0].numpy(),
-            "pred": sample_pred
-        }
-
-        # Store results
-        result = {
-            "grid_size": grid_size,
-            "best_test_acc": best_test_acc,
-            "final_test_acc": test_acc,
-            "final_grid_acc": test_grid_acc,
-            "best_epoch": best_epoch,
-            "ablation": ablation_results,
-            "sample_viz": sample_viz
-        }
-        all_results.append(result)
-
-        # Print ablation summary (detailed output already printed by run_ablation_analysis)
-        # Just show a compact per-grid-size summary here
-        print(f"\n  Ablation Summary (drop when layer zeroed):")
-        for layer_name, layer_data in ablation_results["layers"].items():
-            if "error" not in layer_data:
-                grid_drop = layer_data["grid_drop"]
-                pixel_drop = layer_data["accuracy_drop"]
-                print(f"    {layer_name}: grid {grid_drop:+.1%}, pixel {pixel_drop:+.1%}")
-
-    # Final summary
-    print("\n" + "=" * 80)
-    print("COUNTING EXPERIMENT SUMMARY")
-    print("=" * 80)
-    print(f"{'Grid Size':<12} {'Best Acc':<12} {'Grid Acc':<12} {'Best Epoch':<12}")
-    print("-" * 48)
-
-    for r in all_results:
-        print(f"{r['grid_size']}x{r['grid_size']:<9} {r['best_test_acc']:<12.1%} {r['final_grid_acc']:<12.1%} {r['best_epoch']:<12}")
-
-    print("\n" + "=" * 80)
-    print("ABLATION SUMMARY BY GRID SIZE")
-    print("=" * 80)
-
-    # Get all layer names from first result (using short attr names for table)
-    if all_results and all_results[0]["ablation"].get("layers"):
-        # Get short layer names (attr_name) for compact display
-        first_layers = all_results[0]["ablation"]["layers"]
-        layer_info = [(name, data.get("attr_name", name)) for name, data in first_layers.items()
-                      if "error" not in data]
-
-        # Print header with short names
-        header = f"{'Grid':<8}"
-        for _, short_name in layer_info[:6]:  # Limit to first 6 layers for readability
-            header += f"{short_name:<12}"
-        print(header)
-        print("-" * (8 + 12 * min(6, len(layer_info))))
-
-        # Show grid accuracy drops
-        print("\nGrid Accuracy Drop:")
-        for r in all_results:
-            row = f"{r['grid_size']}x{r['grid_size']:<5}"
-            layers_data = r["ablation"].get("layers", {})
-            for full_name, short_name in layer_info[:6]:
-                layer_data = layers_data.get(full_name, {})
-                drop = layer_data.get("grid_drop", 0) if "error" not in layer_data else 0
-                row += f"{drop:+.1%}       "
-            print(row)
-
-        # Show pixel accuracy drops
-        print("\nPixel Accuracy Drop:")
-        for r in all_results:
-            row = f"{r['grid_size']}x{r['grid_size']:<5}"
-            layers_data = r["ablation"].get("layers", {})
-            for full_name, short_name in layer_info[:6]:
-                layer_data = layers_data.get(full_name, {})
-                drop = layer_data.get("accuracy_drop", 0) if "error" not in layer_data else 0
-                row += f"{drop:+.1%}       "
-            print(row)
-
-        # Also show baseline accuracy trend
-        print("\n" + "-" * 60)
-        print("Baseline Accuracy by Grid Size:")
-        for r in all_results:
-            baseline = r["ablation"].get("baseline", {})
-            pixel_acc = baseline.get("accuracy", 0)
-            grid_acc = baseline.get("grid_accuracy", 0)
-            print(f"  {r['grid_size']}x{r['grid_size']}: Pixel={pixel_acc:.1%}, Grid={grid_acc:.1%}")
-
-    # Final visualization: one sample from each grid size
-    print("\n" + "=" * 80)
-    print("SAMPLE PREDICTIONS BY GRID SIZE")
-    print("=" * 80)
-
-    for r in all_results:
-        grid_size = r["grid_size"]
-        viz = r["sample_viz"]
-        inp = viz["input"]
-        target = viz["target"]
-        pred = viz["pred"]
-
-        # Get expected and predicted winner colors
-        expected_color = target[0, 0]
-        predicted_color = pred[0, 0]
-        is_correct = (pred[:3, :3] == target[:3, :3]).all()
-        status = "✓" if is_correct else "✗"
-
-        # Count colors in input
-        from collections import Counter
-        inp_flat = inp[:grid_size, :grid_size].flatten()
-        color_counts = Counter(inp_flat)
-        top_colors = color_counts.most_common(3)
-
-        print(f"\n[{grid_size}x{grid_size}] {status} Expected: {expected_color}, Predicted: {predicted_color}")
-        print(f"  Top colors: {', '.join(f'{c}:{cnt}' for c, cnt in top_colors)}")
-
-        # Show input (compact for large grids)
-        max_display = min(grid_size, 8)
-        print(f"  Input ({grid_size}x{grid_size}):", end="")
-        if grid_size <= 8:
-            print()
-            for row in range(grid_size):
-                print(f"    {' '.join(str(inp[row, c]) for c in range(grid_size))}")
-        else:
-            print(f" (showing {max_display}x{max_display})")
-            for row in range(max_display):
-                print(f"    {' '.join(str(inp[row, c]) for c in range(max_display))} ...")
-
-        # Show expected vs predicted (3x3)
-        print(f"  Expected → Predicted:")
-        for row in range(3):
-            exp_row = ' '.join(str(target[row, c]) for c in range(3))
-            pred_row = ' '.join(str(pred[row, c]) for c in range(3))
-            print(f"    {exp_row}    {pred_row}")
-
-    print("\n" + "=" * 80)
-    print("Done!")
-
-
-def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
+def run_ablation_analysis(model, test_loader, verbose: bool = True):
     """
     Run layer-wise ablation using forward hooks (consistent with run_layer_ablation).
 
@@ -2783,7 +1455,6 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
     Args:
         model: The model to analyze
         test_loader: DataLoader for test data
-        mode: "color" or "binary"
         verbose: Whether to print detailed output
 
     Returns:
@@ -2791,7 +1462,7 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
     """
     model.eval()
 
-    def evaluate_loader(loader, device, mode):
+    def evaluate_loader(loader, device):
         """Evaluate model on a DataLoader, returning pixel and grid accuracy."""
         pixel_correct = 0
         pixel_total = 0
@@ -2806,11 +1477,7 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
                 target = target.to(device)
 
                 logits = model(input_grid, output_grid)
-
-                if mode == "color":
-                    preds = logits.argmax(dim=1)
-                else:
-                    preds = (logits.squeeze(1) > 0).float()
+                preds = logits.argmax(dim=1)
 
                 pixel_correct += (preds == target).sum().item()
                 pixel_total += target.numel()
@@ -2832,7 +1499,7 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
         print("Testing which layers are critical for this task...")
         print("Baseline = normal model, then we zero each layer's output one at a time.\n")
 
-    baseline_acc, baseline_grid_acc = evaluate_loader(test_loader, DEVICE, mode)
+    baseline_acc, baseline_grid_acc = evaluate_loader(test_loader, DEVICE)
 
     if verbose:
         print(f"BASELINE (no ablation):")
@@ -2912,7 +1579,7 @@ def run_ablation_analysis(model, test_loader, mode, verbose: bool = True):
         ablation_active["layer"] = attr_name
 
         try:
-            acc, grid_acc = evaluate_loader(test_loader, DEVICE, mode)
+            acc, grid_acc = evaluate_loader(test_loader, DEVICE)
 
             # Calculate drops from baseline
             acc_drop = baseline_acc - acc
@@ -3093,10 +1760,6 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn.pt")
     
-    # Mode selection
-    parser.add_argument("--mode", type=str, default="binary", choices=["binary", "color"],
-                        help="binary: detect errors (correct/incorrect), color: predict correct colors (0-9)")
-    
     # Architecture options
     parser.add_argument("--no-force-comparison", action="store_true",
                         help="Disable explicit comparison features (for ablation)")
@@ -3127,17 +1790,6 @@ def main():
     parser.add_argument("--recursive-iters", type=int, default=1,
                         help="Number of recursive iterations for evaluation (1 = no recursion)")
 
-    # Bottleneck attention for global reasoning
-    parser.add_argument("--use-attention", action="store_true",
-                        help="Add self-attention at U-Net bottleneck for global reasoning")
-    parser.add_argument("--attention-type", type=str, default="self",
-                        choices=["self", "cbam"],
-                        help="Type of attention: 'self' for multi-head self-attention (pairwise comparisons), "
-                             "'cbam' for channel+spatial attention (no pairwise comparisons)")
-    parser.add_argument("--attention-heads", type=int, default=8,
-                        help="Number of attention heads (default: 8)")
-    parser.add_argument("--attention-layers", type=int, default=1,
-                        help="Number of attention layers at bottleneck (default: 1)")
     parser.add_argument("--no-skip", action="store_true",
                         help="Remove skip connections - forces all info through bottleneck")
     parser.add_argument("--num-layers", type=int, default=3, choices=[0, 1, 2, 3],
@@ -3148,30 +1800,11 @@ def main():
     parser.add_argument("--kernel-size", type=int, default=3,
                         help="Kernel size for convolutional layers (default: 3). Use odd numbers (3, 5, 7, etc.)")
 
-    # Full resolution architecture (no downsampling)
-    parser.add_argument("--full-resolution", action="store_true",
-                        help="Use FullResolutionCNN instead of U-Net (no downsampling, dilated convs, attention at 30x30)")
-    
     # Layer-wise ablation analysis
     parser.add_argument("--ablation", action="store_true",
                         help="Run layer-wise ablation analysis after training. "
                              "Zeros each layer's output and measures accuracy drop. "
                              "Requires --eval-on-test to have test data to evaluate against.")
-
-    # Counting experiment mode
-    parser.add_argument("--counting-experiment", action="store_true",
-                        help="Run synthetic 'most frequent color' counting experiment across grid sizes")
-    parser.add_argument("--counting-grid-sizes", type=int, nargs="+",
-                        default=[3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30],
-                        help="Grid sizes to test in counting experiment")
-    parser.add_argument("--counting-num-colors", type=int, default=5,
-                        help="Number of distinct colors per grid in counting experiment")
-    parser.add_argument("--counting-num-train", type=int, default=100,
-                        help="Number of training examples per grid size")
-    parser.add_argument("--counting-num-test", type=int, default=20,
-                        help="Number of test examples per grid size")
-    parser.add_argument("--counting-num-negatives", type=int, default=8,
-                        help="Number of negative samples per example in counting experiment")
 
     args = parser.parse_args()
 
@@ -3179,16 +1812,9 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Handle counting experiment mode separately
-    if args.counting_experiment:
-        run_counting_experiment(args)
-        return
-
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
-    print(f"Mode: {args.mode.upper()}")
-    print(f"  - binary: Predict if each pixel is correct (1) or incorrect (0)")
-    print(f"  - color: Predict what color each pixel SHOULD be (0-9)")
+    print(f"Mode: COLOR (predict correct colors 0-9)")
     print(f"Force comparison: {not args.no_force_comparison}")
 
     # Determine augmentation mode
@@ -3335,7 +1961,6 @@ def main():
         augment=use_augment,
         dihedral_only=args.dihedral_only,
         color_only=args.color_only,
-        mode=args.mode,
         include_test=include_test_in_train,
     )
     val_dataset = CorrespondenceDataset(
@@ -3351,14 +1976,13 @@ def main():
         augment=use_augment,
         dihedral_only=args.dihedral_only,
         color_only=args.color_only,
-        mode=args.mode,
         include_test=include_test_in_train,
     )
-    
+
     # For --eval-on-test, create separate test evaluation dataset
     test_eval_dataset = None
     if args.eval_on_test:
-        test_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=True)
+        test_eval_dataset = TestEvalDataset(train_puzzles, test_only=True)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -3366,53 +1990,22 @@ def main():
     # Create model
     print("\nCreating model...")
     force_comparison = not args.no_force_comparison
-    num_classes = 10 if args.mode == "color" else 1
-    
-    if args.full_resolution:
-        # Full resolution architecture - no downsampling, dilated convs, attention at 30x30
-        print(f"Architecture: FullResolutionCNN (no downsampling, {args.kernel_size}x{args.kernel_size} kernels)")
-        model = FullResolutionCNN(
-            hidden_dim=args.hidden_dim,
-            force_comparison=force_comparison,
-            num_classes=num_classes,
-            attention_type=args.attention_type,
-            attention_heads=args.attention_heads,
-            attention_layers=args.attention_layers,
-            kernel_size=args.kernel_size
-        )
-    else:
-        # Standard U-Net architecture
-        conv_type = "single conv" if args.single_conv else "double conv"
-        print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers, {conv_type}, {args.kernel_size}x{args.kernel_size} kernels)")
-        model = PixelErrorCNN(
-            hidden_dim=args.hidden_dim,
-            force_comparison=force_comparison,
-            num_classes=num_classes,
-            use_attention=args.use_attention,
-            attention_type=args.attention_type,
-            attention_heads=args.attention_heads,
-            attention_layers=args.attention_layers,
-            no_skip=args.no_skip,
-            num_layers=args.num_layers,
-            single_conv=args.single_conv,
-            kernel_size=args.kernel_size
-        )
+    conv_type = "single conv" if args.single_conv else "double conv"
+    print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers, {conv_type}, {args.kernel_size}x{args.kernel_size} kernels)")
+    model = PixelErrorCNN(
+        hidden_dim=args.hidden_dim,
+        force_comparison=force_comparison,
+        no_skip=args.no_skip,
+        num_layers=args.num_layers,
+        single_conv=args.single_conv,
+        kernel_size=args.kernel_size
+    )
     model = model.to(DEVICE)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
-    print(f"Output classes: {num_classes} ({'color prediction' if num_classes == 10 else 'binary error detection'})")
-    if args.full_resolution:
-        if args.attention_type == "cbam":
-            print(f"Full-resolution attention: CBAM (channel + spatial, NO pairwise comparisons)")
-        else:
-            print(f"Full-resolution attention: Self-attention, {args.attention_layers} layer(s), {args.attention_heads} heads over 900 tokens")
-    elif args.use_attention:
-        if args.attention_type == "cbam":
-            print(f"Bottleneck attention: CBAM (channel + spatial, NO pairwise comparisons)")
-        else:
-            print(f"Bottleneck attention: Self-attention, {args.attention_layers} layer(s), {args.attention_heads} heads")
-    if args.no_skip and not args.full_resolution:
+    print(f"Output classes: 10 (color prediction)")
+    if args.no_skip:
         print("Skip connections: DISABLED (all info flows through bottleneck)")
 
     # Optimizer
@@ -3424,53 +2017,37 @@ def main():
 
     # Training
     print("\n" + "="*60)
-    print(f"Starting Training ({args.mode.upper()} mode)")
+    print("Starting Training (COLOR mode)")
     print("="*60)
 
     best_val_metric = 0.0
-    metric_name = "error_iou" if args.mode == "binary" else "color_accuracy"
 
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        if args.mode == "binary":
-            train_metrics = train_epoch_binary(model, train_loader, optimizer, DEVICE)
-            val_metrics = evaluate_binary(model, val_loader, DEVICE)
-            
-            print(f"  Train Loss: {train_metrics['loss']:.4f}, Pix Acc: {train_metrics['pixel_accuracy']:.2%}, "
-                  f"Err P/R: {train_metrics['error_precision']:.2%}/{train_metrics['error_recall']:.2%}, "
-                  f"IoU: {train_metrics['error_iou']:.2%}")
-            print(f"  Val   Loss: {val_metrics['loss']:.4f}, Pix Acc: {val_metrics['pixel_accuracy']:.2%}, "
-                  f"Err P/R: {val_metrics['error_precision']:.2%}/{val_metrics['error_recall']:.2%}, "
-                  f"IoU: {val_metrics['error_iou']:.2%}")
-            
-            current_metric = val_metrics['error_iou']
-        else:
-            train_metrics = train_epoch_color(model, train_loader, optimizer, DEVICE)
-            val_metrics = evaluate_color(model, val_loader, DEVICE)
-            
-            print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
-                  f"Error Color Acc: {train_metrics['error_color_accuracy']:.2%}")
-            print(f"  Val   Loss: {val_metrics['loss']:.4f}, Color Acc: {val_metrics['color_accuracy']:.2%}, "
-                  f"Error Color Acc: {val_metrics['error_color_accuracy']:.2%}, "
-                  f"Perfect: {val_metrics['perfect_rate']:.2%}")
-            
-            current_metric = val_metrics['color_accuracy']
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
+        val_metrics = evaluate(model, val_loader, DEVICE)
+
+        print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
+              f"Error Color Acc: {train_metrics['error_color_accuracy']:.2%}")
+        print(f"  Val   Loss: {val_metrics['loss']:.4f}, Color Acc: {val_metrics['color_accuracy']:.2%}, "
+              f"Error Color Acc: {val_metrics['error_color_accuracy']:.2%}, "
+              f"Perfect: {val_metrics['perfect_rate']:.2%}")
+
+        current_metric = val_metrics['color_accuracy']
 
         scheduler.step()
 
         if current_metric > best_val_metric:
             best_val_metric = current_metric
-            print(f"  [New best {metric_name}: {best_val_metric:.2%}]")
-            
+            print(f"  [New best color_accuracy: {best_val_metric:.2%}]")
+
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'args': vars(args),
                 'epoch': epoch,
-                f'best_val_{metric_name}': best_val_metric,
+                'best_val_color_accuracy': best_val_metric,
                 'force_comparison': force_comparison,
-                'mode': args.mode,
-                'num_classes': num_classes,
             }
             torch.save(checkpoint, args.save_path)
 
@@ -3478,14 +2055,11 @@ def main():
     print("\n" + "="*60)
     print("Training Complete")
     print("="*60)
-    print(f"Best {metric_name}: {best_val_metric:.2%}")
+    print(f"Best color_accuracy: {best_val_metric:.2%}")
     print(f"Checkpoint saved to: {args.save_path}")
 
     # Visualize on training data
-    if args.mode == "binary":
-        visualize_predictions_binary(model, val_dataset, DEVICE)
-    else:
-        visualize_predictions_color(model, val_dataset, DEVICE)
+    visualize_predictions(model, val_dataset, DEVICE)
 
     # =========================================================================
     # CRITICAL: Evaluate on held-out test examples
@@ -3503,8 +2077,8 @@ def main():
         model.eval()
         
         test_results = evaluate_test_examples(
-            model, test_eval_dataset, DEVICE, 
-            mode=args.mode, verbose=True, visualize=args.visualize,
+            model, test_eval_dataset, DEVICE,
+            verbose=True, visualize=args.visualize,
             recursive_iters=args.recursive_iters
         )
         
@@ -3529,10 +2103,10 @@ def main():
         # Also show comparison with training examples
         print("\n" + "â”€"*60)
         print("Comparison - Evaluating on TRAINING examples (sanity check):")
-        train_eval_dataset = TestEvalDataset(train_puzzles, mode=args.mode, test_only=False)
+        train_eval_dataset = TestEvalDataset(train_puzzles, test_only=False)
         train_results = evaluate_test_examples(
             model, train_eval_dataset, DEVICE,
-            mode=args.mode, verbose=True, visualize=False,  # Don't visualize training examples
+            verbose=True, visualize=False,  # Don't visualize training examples
             recursive_iters=args.recursive_iters
         )
         print(f"\nTRAINING SET RESULTS:")
@@ -3558,15 +2132,12 @@ def main():
         # =========================================================================
         if args.ablation:
             ablation_results = run_layer_ablation(
-                model, test_eval_dataset, DEVICE, mode=args.mode
+                model, test_eval_dataset, DEVICE
             )
 
     print("\nDone!")
-    if not args.eval_on_test:
-        print(f"\nRun the diagnostic to verify the CNN (binary mode only):")
-        print(f"  python diagnose_cnn.py --checkpoint {args.save_path}")
     print(f"\nTo test generalization on a single puzzle:")
-    print(f"  python train_pixel_error_cnn.py --single-puzzle PUZZLE_ID --mode color --eval-on-test")
+    print(f"  python train_pixel_error_cnn.py --single-puzzle PUZZLE_ID --eval-on-test")
 
 
 if __name__ == "__main__":
