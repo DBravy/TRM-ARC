@@ -24,7 +24,7 @@ import torch.nn as nn
 from flask import Flask, render_template, jsonify, request
 
 # Import from existing modules
-from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS, SpatialSelfAttention
+from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS, SpatialSelfAttention, CrossAttention
 from visualize_cnn import (
     ActivationCapture,
     get_layer_names_for_model,
@@ -340,6 +340,7 @@ def api_model_info():
         'force_comparison': getattr(model, 'force_comparison', False),
         'use_onehot': model.use_onehot,
         'use_attention': getattr(model, 'use_attention', False),
+        'use_cross_attention': getattr(model, 'use_cross_attention', False),
         'encoding': 'one-hot (11 ch/grid)' if model.use_onehot else 'learned embeddings (16 ch/grid)',
         'num_classes': model.num_classes,
         'layer_names': layer_names,
@@ -720,7 +721,73 @@ def compute_pixel_trace(
         })
 
     # Add attention visualization if model has attention
-    if getattr(model, 'use_attention', False) and model.attention is not None:
+    # Cross-attention: output pixels attend to INPUT pixels (more useful for ARC)
+    if getattr(model, 'use_cross_attention', False) and model.cross_attention is not None:
+        # Enable cross-attention capture and run inference again
+        model.cross_attention.capture_attention = True
+        with torch.no_grad():
+            _ = model(inp_tensor, candidate_tensor)
+
+        attn_weights = model.cross_attention.last_attention_weights  # (1, H*W, H*W)
+        model.cross_attention.capture_attention = False
+
+        if attn_weights is not None:
+            attn_np = attn_weights.squeeze(0).numpy()  # (900, 900)
+            H, W = GRID_SIZE, GRID_SIZE
+            pixel_idx = row * W + col
+
+            # For cross-attention: rows are OUTPUT pixels, cols are INPUT pixels
+            # Attention FROM this output pixel to all INPUT pixels
+            attn_from_pixel = attn_np[pixel_idx, :]  # (900,) - what input this output looks at
+            attn_from_grid = attn_from_pixel.reshape(H, W)
+
+            # Attention TO this pixel position from all OUTPUT pixels
+            attn_to_pixel = attn_np[:, pixel_idx]  # (900,) - which outputs look at this input position
+            attn_to_grid = attn_to_pixel.reshape(H, W)
+
+            # Top INPUT pixels this OUTPUT pixel attends to
+            top_from_indices = np.argsort(attn_from_pixel)[-10:][::-1]
+            top_attended = [
+                {
+                    'row': int(idx // W),
+                    'col': int(idx % W),
+                    'weight': float(attn_from_pixel[idx])
+                }
+                for idx in top_from_indices
+            ]
+
+            # Top OUTPUT pixels that attend to this INPUT position
+            top_to_indices = np.argsort(attn_to_pixel)[-10:][::-1]
+            top_attending = [
+                {
+                    'row': int(idx // W),
+                    'col': int(idx % W),
+                    'weight': float(attn_to_pixel[idx])
+                }
+                for idx in top_to_indices
+            ]
+
+            result['attention'] = {
+                'has_attention': True,
+                'attention_type': 'cross',  # Distinguish from self-attention
+                'attention_from_pixel': attn_from_grid.tolist(),  # This output pixel attends to these input pixels
+                'attention_to_pixel': attn_to_grid.tolist(),      # These output pixels attend to this input position
+                'top_attended': top_attended,   # Top 10 input pixels this output attends to
+                'top_attending': top_attending, # Top 10 output pixels that attend to this input position
+                'self_attention_weight': float(attn_from_pixel[pixel_idx]),  # Attention to same position in input
+                'stats': {
+                    'from_max': float(attn_from_pixel.max()),
+                    'from_mean': float(attn_from_pixel.mean()),
+                    'from_entropy': float(-np.sum(attn_from_pixel * np.log(attn_from_pixel + 1e-10))),
+                    'to_max': float(attn_to_pixel.max()),
+                    'to_mean': float(attn_to_pixel.mean()),
+                }
+            }
+        else:
+            result['attention'] = {'has_attention': False}
+
+    # Self-attention: pixels attend to each other after CNN processing
+    elif getattr(model, 'use_attention', False) and model.attention is not None:
         # Enable attention capture and run inference again
         model.attention.capture_attention = True
         with torch.no_grad():
@@ -766,6 +833,7 @@ def compute_pixel_trace(
 
             result['attention'] = {
                 'has_attention': True,
+                'attention_type': 'self',  # Distinguish from cross-attention
                 'attention_from_pixel': attn_from_grid.tolist(),  # This pixel attends to...
                 'attention_to_pixel': attn_to_grid.tolist(),      # Others attend to this pixel...
                 'top_attended': top_attended,   # Top 10 pixels this one attends to
@@ -779,6 +847,8 @@ def compute_pixel_trace(
                     'to_mean': float(attn_to_pixel.mean()),
                 }
             }
+        else:
+            result['attention'] = {'has_attention': False}
     else:
         result['attention'] = {'has_attention': False}
 
@@ -833,6 +903,7 @@ def api_pixel_trace(puzzle_id: str, example_idx: int, row: int, col: int):
             'force_comparison': getattr(model, 'force_comparison', False),
             'use_onehot': model.use_onehot,
             'use_attention': getattr(model, 'use_attention', False),
+            'use_cross_attention': getattr(model, 'use_cross_attention', False),
             'num_classes': model.num_classes
         }
         return jsonify(result)

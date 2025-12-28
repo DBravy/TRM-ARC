@@ -1156,11 +1156,17 @@ function createAttentionSection(trace) {
 
     const attn = trace.attention;
     const pixel = trace.pixel;
+    const isCrossAttention = attn.attention_type === 'cross';
+
+    const title = isCrossAttention ? 'Cross-Attention (Output → Input)' : 'Spatial Self-Attention';
+    const description = isCrossAttention
+        ? 'Output pixel queries input pixels for global context. Brighter = higher attention weight.'
+        : 'This pixel attends to all other pixels. Brighter = higher attention weight.';
 
     let html = `
-        <h4>Spatial Self-Attention</h4>
+        <h4>${title}</h4>
         <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
-            This pixel attends to all other pixels. Brighter = higher attention weight.
+            ${description}
         </p>
     `;
 
@@ -1180,9 +1186,10 @@ function createAttentionSection(trace) {
     html += `<div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">`;
 
     // "Attention FROM this pixel" heatmap
+    const fromLabel = isCrossAttention ? 'This output pixel queries input:' : 'This pixel attends to:';
     html += `
         <div>
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">This pixel attends to:</div>
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">${fromLabel}</div>
             <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
     `;
 
@@ -1202,9 +1209,10 @@ function createAttentionSection(trace) {
     html += `</div></div>`;
 
     // "Attention TO this pixel" heatmap
+    const toLabel = isCrossAttention ? 'Input queried by output pixels:' : 'Others attend to this pixel:';
     html += `
         <div>
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Others attend to this pixel:</div>
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">${toLabel}</div>
             <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
     `;
 
@@ -1225,9 +1233,10 @@ function createAttentionSection(trace) {
     html += `</div>`;
 
     // Top attended pixels
+    const topLabel = isCrossAttention ? 'Top 5 input pixels queried:' : 'Top 5 pixels this one attends to:';
     html += `
         <div style="margin-top: 15px;">
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Top 5 pixels this one attends to:</div>
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">${topLabel}</div>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
     `;
     for (let i = 0; i < Math.min(5, attn.top_attended.length); i++) {
@@ -1241,10 +1250,12 @@ function createAttentionSection(trace) {
     html += `</div></div>`;
 
     // Legend
+    const legendFrom = isCrossAttention ? 'Queries (orange)' : 'Attends to (orange)';
+    const legendTo = isCrossAttention ? 'Queried by (blue)' : 'Attended by (blue)';
     html += `
         <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> Attends to (orange)</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> Attended by (blue)</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> ${legendFrom}</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> ${legendTo}</span>
             <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
         </div>
     `;

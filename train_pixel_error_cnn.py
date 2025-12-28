@@ -328,6 +328,71 @@ class SpatialSelfAttention(nn.Module):
         return out.permute(0, 2, 1).view(B, C, H, W)
 
 
+class CrossAttention(nn.Module):
+    """
+    Cross-attention: output embeddings attend to input embeddings.
+
+    Each output pixel queries all input pixels to gather relevant information.
+    This allows the model to learn "what in the input is relevant for predicting
+    this output pixel?" before any convolutional processing.
+
+    Args:
+        dim: Feature dimension (embedding size)
+
+    Set capture_attention=True to store attention weights for visualization.
+    Access via .last_attention_weights after forward pass.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.scale = dim ** -0.5
+
+        # Q comes from output, K/V come from input
+        self.q_proj = nn.Linear(dim, dim)  # "What am I looking for?" (output)
+        self.k_proj = nn.Linear(dim, dim)  # "What's available?" (input)
+        self.v_proj = nn.Linear(dim, dim)  # "What to retrieve?" (input)
+
+        self.capture_attention = False
+        self.last_attention_weights = None  # (B, H*W, H*W) when captured
+
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query: Output embeddings (B, H, W, C) - queries come from here
+            key_value: Input embeddings (B, H, W, C) - keys and values come from here
+
+        Returns:
+            Attended output embeddings (B, H, W, C)
+        """
+        B, H, W, C = query.shape
+        N = H * W
+
+        # Flatten spatial dimensions
+        q_flat = query.view(B, N, C)      # (B, N, C)
+        kv_flat = key_value.view(B, N, C)  # (B, N, C)
+
+        # Project
+        q = self.q_proj(q_flat)   # (B, N, C) - from output
+        k = self.k_proj(kv_flat)  # (B, N, C) - from input
+        v = self.v_proj(kv_flat)  # (B, N, C) - from input
+
+        # Attention scores: each output pixel attends to all input pixels
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
+        attn = F.softmax(scores, dim=-1)
+
+        # Optionally store attention weights for visualization
+        if self.capture_attention:
+            self.last_attention_weights = attn.detach().cpu()
+
+        # Apply attention: gather information from input based on attention
+        attended = torch.bmm(attn, v)  # (B, N, C)
+
+        # Residual connection: output embedding + attended input info
+        out = q_flat + attended
+
+        return out.view(B, H, W, C)
+
+
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN for comparing input and output grids.
@@ -341,7 +406,7 @@ class PixelErrorCNN(nn.Module):
     def __init__(self, hidden_dim: int = 64,
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
                  kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
-                 use_attention: bool = False):
+                 use_attention: bool = False, use_cross_attention: bool = False):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -352,6 +417,7 @@ class PixelErrorCNN(nn.Module):
         self.use_onehot = use_onehot
         self.out_kernel_size = out_kernel_size
         self.use_attention = use_attention
+        self.use_cross_attention = use_cross_attention
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -361,6 +427,11 @@ class PixelErrorCNN(nn.Module):
             embed_dim = 16
             self.input_embed = nn.Embedding(NUM_COLORS, 16)
             self.output_embed = nn.Embedding(NUM_COLORS, 16)
+
+        self.embed_dim = embed_dim
+
+        # Cross-attention on embeddings (output attends to input)
+        self.cross_attention = CrossAttention(embed_dim) if use_cross_attention else None
 
         # Channel concatenation: embed_dim * 2 (inp, out)
         in_channels = embed_dim * 2
@@ -416,6 +487,11 @@ class PixelErrorCNN(nn.Module):
         else:
             inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
             out_emb = self.output_embed(output_grid)  # (B, 30, 30, 16)
+
+        # Apply cross-attention: output pixels attend to input pixels
+        # This happens BEFORE convolutions so global info is available early
+        if self.cross_attention is not None:
+            out_emb = self.cross_attention(query=out_emb, key_value=inp_emb)
 
         # Channel concatenation: input and output side by side in channel dim
         x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, 30, 30, 32) or (B, 30, 30, 22)
@@ -511,6 +587,7 @@ class PixelErrorCNN(nn.Module):
         use_onehot = args.get('use_onehot', False)
         out_kernel_size = args.get('out_kernel_size', 1)
         use_attention = args.get('use_attention', False)
+        use_cross_attention = args.get('use_cross_attention', False)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -520,7 +597,8 @@ class PixelErrorCNN(nn.Module):
             kernel_size=kernel_size,
             use_onehot=use_onehot,
             out_kernel_size=out_kernel_size,
-            use_attention=use_attention
+            use_attention=use_attention,
+            use_cross_attention=use_cross_attention
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1883,6 +1961,8 @@ def main():
                         help="Use one-hot + nonzero mask encoding (11 ch/grid) instead of learned embeddings (16 ch/grid)")
     parser.add_argument("--use-attention", action="store_true",
                         help="Add spatial self-attention before output layer (each pixel attends to all others)")
+    parser.add_argument("--use-cross-attention", action="store_true",
+                        help="Add cross-attention on embeddings: output pixels attend to input pixels before convolutions")
 
     # Layer-wise ablation analysis
     parser.add_argument("--ablation", action="store_true",
@@ -2084,7 +2164,8 @@ def main():
         kernel_size=args.kernel_size,
         use_onehot=args.use_onehot,
         out_kernel_size=args.out_kernel_size,
-        use_attention=args.use_attention
+        use_attention=args.use_attention,
+        use_cross_attention=args.use_cross_attention
     )
     model = model.to(DEVICE)
 
@@ -2095,6 +2176,8 @@ def main():
         print("Skip connections: DISABLED (all info flows through bottleneck)")
     if args.use_attention:
         print("Spatial self-attention: ENABLED (each pixel attends to all others)")
+    if args.use_cross_attention:
+        print("Cross-attention: ENABLED (output pixels attend to input pixels on embeddings)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
