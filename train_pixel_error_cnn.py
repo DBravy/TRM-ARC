@@ -287,7 +287,7 @@ class PixelErrorCNN(nn.Module):
 
     def __init__(self, hidden_dim: int = 64,
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
-                 kernel_size: int = 3, use_onehot: bool = False):
+                 kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -296,6 +296,7 @@ class PixelErrorCNN(nn.Module):
         self.conv_depth = conv_depth
         self.kernel_size = kernel_size
         self.use_onehot = use_onehot
+        self.out_kernel_size = out_kernel_size
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -338,7 +339,8 @@ class PixelErrorCNN(nn.Module):
                 self.up3 = Up(base_ch * 2, base_ch, conv_depth, kernel_size)
 
         # Output: 10 channels for color prediction
-        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=1, padding=0)
+        out_padding = (out_kernel_size - 1) // 2
+        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=out_kernel_size, padding=out_padding)
 
     def _encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         """Encode grid to (B, H, W, 11) one-hot + nonzero mask."""
@@ -1809,6 +1811,8 @@ def main():
                              "RF per block = depth*(kernel_size-1)+1. Default: 2 (5x5 RF with 3x3 kernels)")
     parser.add_argument("--kernel-size", type=int, default=3,
                         help="Kernel size for convolutional layers (default: 3). Use odd numbers (3, 5, 7, etc.)")
+    parser.add_argument("--out-kernel-size", type=int, default=1,
+                        help="Kernel size for output conv layer (default: 1). Use odd numbers (1, 3, 5, etc.)")
     parser.add_argument("--use-onehot", action="store_true",
                         help="Use one-hot + nonzero mask encoding (11 ch/grid) instead of learned embeddings (16 ch/grid)")
 
@@ -2010,7 +2014,8 @@ def main():
         num_layers=args.num_layers,
         conv_depth=args.conv_depth,
         kernel_size=args.kernel_size,
-        use_onehot=args.use_onehot
+        use_onehot=args.use_onehot,
+        out_kernel_size=args.out_kernel_size
     )
     model = model.to(DEVICE)
 
