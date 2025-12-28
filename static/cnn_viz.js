@@ -1172,7 +1172,7 @@ function createFinalCalculationSection(trace) {
                 </div>
                 <div class="calc-breakdown">
                     <div class="calc-line">
-                        <span class="calc-operator">dot product:</span> ${cls.dot_product.toFixed(4)}
+                        <span class="calc-operator">weighted sum:</span> ${cls.weighted_sum.toFixed(4)}
                     </div>
                     <div class="calc-line">
                         <span class="calc-operator">+ bias:</span> ${cls.bias.toFixed(4)}

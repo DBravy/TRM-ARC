@@ -277,10 +277,12 @@ class UpNoSkip(nn.Module):
 
 class PixelErrorCNN(nn.Module):
     """
-    U-Net style CNN for comparing input and output grids.
+    U-Net style CNN with SPATIAL (side-by-side) concatenation of input and output.
 
-    Concatenates input and output embeddings along the channel dimension,
-    allowing convolutions to see both grids at corresponding spatial positions.
+    Input grid is placed on the LEFT, output grid on the RIGHT, creating a
+    (B, embed_dim, 30, 60) tensor that the U-Net processes spatially.
+
+    The model predicts colors only for the OUTPUT half (right 30 columns).
 
     Predicts what color each pixel SHOULD be (0-9).
     """
@@ -306,8 +308,8 @@ class PixelErrorCNN(nn.Module):
             self.input_embed = nn.Embedding(NUM_COLORS, 16)
             self.output_embed = nn.Embedding(NUM_COLORS, 16)
 
-        # Channel concatenation: embed_dim * 2 (inp, out)
-        in_channels = embed_dim * 2
+        # Spatial concatenation: just embed_dim channels, width is doubled
+        in_channels = embed_dim
 
         base_ch = hidden_dim
 
@@ -338,7 +340,7 @@ class PixelErrorCNN(nn.Module):
                 self.up3 = Up(base_ch * 2, base_ch, conv_depth, kernel_size)
 
         # Output: 10 channels for color prediction
-        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=1, padding=0)
+        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=3, padding=1)
 
     def _encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         """Encode grid to (B, H, W, 11) one-hot + nonzero mask."""
@@ -357,10 +359,12 @@ class PixelErrorCNN(nn.Module):
             inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
             out_emb = self.output_embed(output_grid)  # (B, 30, 30, 16)
 
-        # Channel concatenation: input and output side by side in channel dim
-        x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, 30, 30, 32) or (B, 30, 30, 22)
-
-        x = x.permute(0, 3, 1, 2).contiguous()
+        # Spatial concatenation: input on left, output on right
+        # First permute to (B, C, H, W) format
+        inp_emb = inp_emb.permute(0, 3, 1, 2).contiguous()  # (B, 16, 30, 30)
+        out_emb = out_emb.permute(0, 3, 1, 2).contiguous()  # (B, 16, 30, 30)
+        # Concatenate along width dimension (dim=3)
+        x = torch.cat([inp_emb, out_emb], dim=3)  # (B, 16, 30, 60)
 
         # U-Net forward - encoder
         x1 = self.inc(x)
@@ -408,8 +412,10 @@ class PixelErrorCNN(nn.Module):
             else:  # num_layers == 1
                 x = self.up3(bottleneck, x1)
 
-        logits = self.outc(x)
-        return logits  # (B, 10, H, W) for color prediction
+        logits = self.outc(x)  # (B, 10, 30, 60) for spatial concat
+        # Extract only the output half (right 30 columns)
+        logits = logits[:, :, :, GRID_SIZE:]  # (B, 10, 30, 30)
+        return logits  # (B, 10, 30, 30) for color prediction
 
     def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
         """Return softmax probabilities for color prediction"""
@@ -1827,6 +1833,7 @@ def main():
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
     print(f"Mode: COLOR (predict correct colors 0-9)")
+    print(f"Architecture: Spatial concatenation (input|output side-by-side)")
 
     # Determine augmentation mode
     if args.no_augment:

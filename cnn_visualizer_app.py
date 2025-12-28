@@ -324,10 +324,10 @@ def api_model_info():
         'checkpoint': checkpoint_path,
         'num_layers': model.num_layers,
         'hidden_dim': hidden_dim,
-        'single_conv': model.single_conv,
+        'conv_depth': model.conv_depth,
+        'kernel_size': model.kernel_size,
         'force_comparison': model.force_comparison,
         'num_classes': model.num_classes,
-        'use_attention': model.use_attention,
         'layer_names': layer_names,
         'conv_layers': {
             name: {
@@ -527,18 +527,13 @@ def compute_pixel_trace(
     candidate_tensor = torch.zeros_like(inp_tensor).to(device)
 
     # Determine receptive field size based on model architecture
-    # Get kernel size from the first conv layer
-    if hasattr(model.inc, 'conv'):
-        kernel_size = model.inc.conv[0].kernel_size[0]  # Assumes square kernels
-    else:
-        kernel_size = model.inc[0].kernel_size[0]
+    # Get kernel size and conv depth from model
+    kernel_size = model.kernel_size
+    conv_depth = model.conv_depth
 
-    # For DoubleConv (two convs stacked), effective RF expands
-    # RF = k + (k-1) for two stacked convs of size k
-    if model.single_conv:
-        rf_size = kernel_size
-    else:
-        rf_size = kernel_size + (kernel_size - 1)  # e.g., 3+2=5 for k=3, 5+4=9 for k=5
+    # RF = conv_depth * (kernel_size - 1) + 1
+    # e.g., depth=2, k=3: 2*2+1=5, depth=3, k=3: 3*2+1=7, depth=4, k=3: 4*2+1=9
+    rf_size = conv_depth * (kernel_size - 1) + 1
     rf_half = rf_size // 2
 
     # Calculate receptive field bounds (clamped to grid boundaries)
@@ -587,17 +582,32 @@ def compute_pixel_trace(
         # Pass through inc layer
         inc_output = model.inc(x)  # (1, hidden_dim, 30, 30)
 
-        # Extract feature vector at the target position
-        feature_vector = inc_output[0, :, row, col].cpu().numpy()  # (hidden_dim,)
-        hidden_dim = feature_vector.shape[0]
-
         # Get outc layer weights and bias
-        outc_weight = model.outc.weight.data.cpu().numpy()  # (num_classes, hidden_dim, 1, 1)
-        outc_weight = outc_weight.squeeze(-1).squeeze(-1)  # (num_classes, hidden_dim)
+        outc_weight = model.outc.weight.data.cpu().numpy()  # (num_classes, hidden_dim, kH, kW)
         outc_bias = model.outc.bias.data.cpu().numpy() if model.outc.bias is not None else np.zeros(model.num_classes)
 
-        # Compute logits manually for this pixel
-        logits_manual = outc_weight @ feature_vector + outc_bias  # (num_classes,)
+        # Get kernel size from the weight shape
+        kH, kW = outc_weight.shape[2], outc_weight.shape[3]
+        pad_h, pad_w = kH // 2, kW // 2
+
+        # Extract the patch of features needed for this pixel's output
+        # For a 3x3 kernel with padding=1, we need a 3x3 patch centered at (row, col)
+        inc_output_np = inc_output[0].cpu().numpy()  # (hidden_dim, 30, 30)
+        H, W = inc_output_np.shape[1], inc_output_np.shape[2]
+
+        # Pad the feature map to handle edge cases
+        inc_output_padded = np.pad(inc_output_np, ((0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode='constant')
+
+        # Extract the patch (accounting for the padding offset)
+        feature_patch = inc_output_padded[:, row:row + kH, col:col + kW]  # (hidden_dim, kH, kW)
+
+        # Compute logits manually for this pixel using convolution formula
+        # logits[c] = sum over (c_in, kh, kw) of weight[c, c_in, kh, kw] * feature_patch[c_in, kh, kw] + bias[c]
+        logits_manual = np.einsum('oihw,ihw->o', outc_weight, feature_patch) + outc_bias  # (num_classes,)
+
+        # For feature_vector, we'll use the center of the patch for display purposes
+        feature_vector = inc_output_np[:, row, col]  # (hidden_dim,)
+        hidden_dim = feature_vector.shape[0]
 
         # Get actual model output for verification
         logits_full = model(inp_tensor, candidate_tensor)  # (1, num_classes, 30, 30)
@@ -651,11 +661,12 @@ def compute_pixel_trace(
                 'std': float(feature_vector.std())
             },
             # Per-feature contributions: how each feature dim contributes to each color's logit
-            # contribution[color][dim] = feature_vector[dim] * outc_weight[color][dim]
-            'contributions': (outc_weight * feature_vector).tolist(),  # (num_classes, hidden_dim)
+            # For 3x3 kernels, we sum contributions across spatial dimensions
+            'contributions': np.einsum('oihw,ihw->oi', outc_weight, feature_patch).tolist(),  # (num_classes, hidden_dim)
         },
         'output_layer': {
             'weights_shape': list(outc_weight.shape),
+            'kernel_size': [kH, kW],
             'per_class_calculation': []
         },
         'prediction': {
@@ -673,16 +684,17 @@ def compute_pixel_trace(
 
     # Add per-class calculation breakdown
     for c in range(model.num_classes):
-        weight_vec = outc_weight[c]
-        dot_product = float(np.dot(weight_vec, feature_vector))
+        weight_tensor = outc_weight[c]  # (hidden_dim, kH, kW)
+        # Compute the weighted sum across the feature patch
+        weighted_sum = float(np.sum(weight_tensor * feature_patch))
         bias_val = float(outc_bias[c])
-        logit = dot_product + bias_val
+        logit = weighted_sum + bias_val
 
         result['output_layer']['per_class_calculation'].append({
             'color': c,
             'color_name': result['prediction']['color_names'][c],
-            'weight_vector': weight_vec.tolist(),
-            'dot_product': dot_product,
+            'weight_shape': list(weight_tensor.shape),
+            'weighted_sum': weighted_sum,
             'bias': bias_val,
             'logit': logit,
             'probability': float(probs[c])
@@ -734,7 +746,8 @@ def api_pixel_trace(puzzle_id: str, example_idx: int, row: int, col: int):
         result['example_idx'] = example_idx
         result['model_info'] = {
             'num_layers': model.num_layers,
-            'single_conv': model.single_conv,
+            'conv_depth': model.conv_depth,
+            'kernel_size': model.kernel_size,
             'force_comparison': model.force_comparison,
             'num_classes': model.num_classes
         }
