@@ -954,7 +954,7 @@ def train_step(model: GlimpseModel,
     """
     Single training step for one example.
 
-    Implements the full training procedure with truncation at first mistake.
+    Trains on all stages (grid size + all regions) regardless of correctness.
 
     Args:
         model: The GlimpseModel
@@ -1017,23 +1017,7 @@ def train_step(model: GlimpseModel,
     baseline_loss = F.mse_loss(baseline, baseline_target)
     total_baseline_loss = total_baseline_loss + baseline_loss
 
-    # Truncate at first mistake: if size wrong, don't train region stages
-    if not size_correct:
-        full_loss = total_loss + reinforce_weight * total_reinforce_loss + total_baseline_loss
-        full_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
-
-        return {
-            'loss': total_loss.item(),
-            'reinforce_loss': total_reinforce_loss.item(),
-            'baseline_loss': total_baseline_loss.item(),
-            'size_correct': 0.0,
-            'regions_correct': 0.0,
-            'total_regions': get_total_regions(true_width, true_height),
-        }
-
-    # Stage 2: Region prediction
+    # Stage 2: Region prediction (always train all regions)
     h1, c1, h2, c2 = result['h1'], result['c1'], result['h2'], result['c2']
 
     total_regions = get_total_regions(true_width, true_height)
@@ -1073,10 +1057,6 @@ def train_step(model: GlimpseModel,
         baseline_loss = F.mse_loss(baseline, baseline_target)
         total_baseline_loss = total_baseline_loss + baseline_loss
 
-        # Truncate at first region mistake
-        if not region_correct:
-            break
-
     # Final loss and backprop
     full_loss = total_loss + reinforce_weight * total_reinforce_loss + total_baseline_loss
     full_loss.backward()
@@ -1087,7 +1067,7 @@ def train_step(model: GlimpseModel,
         'loss': total_loss.item(),
         'reinforce_loss': total_reinforce_loss.item(),
         'baseline_loss': total_baseline_loss.item(),
-        'size_correct': 1.0,
+        'size_correct': 1.0 if size_correct else 0.0,
         'regions_correct': float(regions_correct),
         'total_regions': float(total_regions),
     }
@@ -1340,7 +1320,7 @@ def main():
     # Model arguments
     parser.add_argument("--hidden-size", type=int, default=512,
                         help="LSTM hidden size")
-    parser.add_argument("--glimpse-size", type=int, default=256,
+    parser.add_argument("--glimpse-size", type=int, default=64,
                         help="Glimpse feature size")
     parser.add_argument("--num-glimpses", type=int, default=5,
                         help="Number of glimpses per stage")
