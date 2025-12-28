@@ -275,6 +275,59 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
+class SpatialSelfAttention(nn.Module):
+    """
+    Single-head spatial self-attention over pixels with learned Q/K/V projections.
+    Each pixel attends to all other pixels in the feature map.
+
+    Args:
+        dim: Feature dimension (number of channels)
+
+    Set capture_attention=True to store attention weights for visualization.
+    Access via .last_attention_weights after forward pass.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.scale = dim ** -0.5
+
+        # Learned Q/K/V projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+
+        self.capture_attention = False
+        self.last_attention_weights = None  # (B, H*W, H*W) when captured
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+
+        # Reshape to (B, N, C)
+        x_flat = x.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
+
+        # Project to Q, K, V
+        q = self.q_proj(x_flat)  # (B, N, C) - "what am I looking for?"
+        k = self.k_proj(x_flat)  # (B, N, C) - "what do I have to offer?"
+        v = self.v_proj(x_flat)  # (B, N, C) - "what info to pass along?"
+
+        # Attention scores
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
+        attn = F.softmax(scores, dim=-1)
+
+        # Optionally store attention weights for visualization
+        if self.capture_attention:
+            self.last_attention_weights = attn.detach().cpu()
+
+        # Apply attention to values
+        attended = torch.bmm(attn, v)  # (B, N, C)
+
+        # Residual connection
+        out = x_flat + attended
+
+        return out.permute(0, 2, 1).view(B, C, H, W)
+
+
 class PixelErrorCNN(nn.Module):
     """
     U-Net style CNN for comparing input and output grids.
@@ -287,7 +340,8 @@ class PixelErrorCNN(nn.Module):
 
     def __init__(self, hidden_dim: int = 64,
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
-                 kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1):
+                 kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
+                 use_attention: bool = False):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -297,6 +351,7 @@ class PixelErrorCNN(nn.Module):
         self.kernel_size = kernel_size
         self.use_onehot = use_onehot
         self.out_kernel_size = out_kernel_size
+        self.use_attention = use_attention
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -341,6 +396,9 @@ class PixelErrorCNN(nn.Module):
         # Output: 10 channels for color prediction
         out_padding = (out_kernel_size - 1) // 2
         self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=out_kernel_size, padding=out_padding)
+
+        # Optional spatial self-attention before output
+        self.attention = SpatialSelfAttention(base_ch) if use_attention else None
 
     def _encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         """Encode grid to (B, H, W, 11) one-hot + nonzero mask."""
@@ -410,6 +468,10 @@ class PixelErrorCNN(nn.Module):
             else:  # num_layers == 1
                 x = self.up3(bottleneck, x1)
 
+        # Apply spatial self-attention if enabled
+        if self.attention is not None:
+            x = self.attention(x)
+
         logits = self.outc(x)
         return logits  # (B, 10, H, W) for color prediction
 
@@ -447,6 +509,8 @@ class PixelErrorCNN(nn.Module):
                 conv_depth = 2
 
         use_onehot = args.get('use_onehot', False)
+        out_kernel_size = args.get('out_kernel_size', 1)
+        use_attention = args.get('use_attention', False)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -454,7 +518,9 @@ class PixelErrorCNN(nn.Module):
             num_layers=num_layers,
             conv_depth=conv_depth,
             kernel_size=kernel_size,
-            use_onehot=use_onehot
+            use_onehot=use_onehot,
+            out_kernel_size=out_kernel_size,
+            use_attention=use_attention
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1815,6 +1881,8 @@ def main():
                         help="Kernel size for output conv layer (default: 1). Use odd numbers (1, 3, 5, etc.)")
     parser.add_argument("--use-onehot", action="store_true",
                         help="Use one-hot + nonzero mask encoding (11 ch/grid) instead of learned embeddings (16 ch/grid)")
+    parser.add_argument("--use-attention", action="store_true",
+                        help="Add spatial self-attention before output layer (each pixel attends to all others)")
 
     # Layer-wise ablation analysis
     parser.add_argument("--ablation", action="store_true",
@@ -2015,7 +2083,8 @@ def main():
         conv_depth=args.conv_depth,
         kernel_size=args.kernel_size,
         use_onehot=args.use_onehot,
-        out_kernel_size=args.out_kernel_size
+        out_kernel_size=args.out_kernel_size,
+        use_attention=args.use_attention
     )
     model = model.to(DEVICE)
 
@@ -2024,6 +2093,8 @@ def main():
     print(f"Output classes: 10 (color prediction)")
     if args.no_skip:
         print("Skip connections: DISABLED (all info flows through bottleneck)")
+    if args.use_attention:
+        print("Spatial self-attention: ENABLED (each pixel attends to all others)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)

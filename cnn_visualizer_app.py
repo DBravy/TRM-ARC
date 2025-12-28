@@ -24,7 +24,7 @@ import torch.nn as nn
 from flask import Flask, render_template, jsonify, request
 
 # Import from existing modules
-from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS
+from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS, SpatialSelfAttention
 from visualize_cnn import (
     ActivationCapture,
     get_layer_names_for_model,
@@ -79,8 +79,8 @@ def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
     """
     Compute effective kernel response for each of the 10 ARC colors.
 
-    The model uses 16-dim embeddings for each color. The first conv layer receives
-    64 input channels: [inp_emb(16), out_emb(16), diff(16), prod(16)].
+    For embedding models: Uses 16-dim learned embeddings for each color.
+    For one-hot models: Uses fixed 11-dim one-hot + nonzero mask encoding.
 
     For each color, we compute the "effective kernel" - the kernel's response
     when that color is present in both input and output (correct match).
@@ -88,13 +88,10 @@ def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
     Returns:
         Dict with 'kernels' (10 x out_ch x 3 x 3), 'num_filters', and metadata
     """
-    inp_embed = model.input_embed.weight.detach()  # (10, 16)
-    out_embed = model.output_embed.weight.detach()  # (10, 16)
-
     # Get first conv layer kernel
     if hasattr(model.inc, 'conv'):
         # DoubleConv or SingleConv case
-        kernel = model.inc.conv[0].weight.detach()  # (out_ch, 64, 3, 3)
+        kernel = model.inc.conv[0].weight.detach()  # (out_ch, in_ch, 3, 3)
     else:
         kernel = model.inc[0].weight.detach()
 
@@ -102,18 +99,27 @@ def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
 
     responses = []
     for c in range(NUM_COLORS):
-        ie = inp_embed[c]  # (16,)
-        oe = out_embed[c]  # (16,)
-
-        # When input color == output color (correct match)
-        diff = ie - oe  # Should be near 0 for same embedding
-        prod = ie * oe  # Element-wise product
-
-        # Combine embeddings in same order as model forward pass
-        combined = torch.cat([ie, oe, diff, prod])  # (64,)
+        if model.use_onehot:
+            # One-hot encoding: 10 one-hot + 1 nonzero mask = 11 dims per grid
+            # Input encoding
+            ie = torch.zeros(11, device=kernel.device)
+            ie[c] = 1.0  # one-hot
+            ie[10] = 1.0 if c > 0 else 0.0  # nonzero mask
+            # Output encoding (same for matching colors)
+            oe = ie.clone()
+            # Combined: [input(11), output(11)] = 22 channels
+            combined = torch.cat([ie, oe])  # (22,)
+        else:
+            # Learned embeddings
+            inp_embed = model.input_embed.weight.detach()  # (10, 16)
+            out_embed = model.output_embed.weight.detach()  # (10, 16)
+            ie = inp_embed[c]  # (16,)
+            oe = out_embed[c]  # (16,)
+            # Combined: [input(16), output(16)] = 32 channels
+            combined = torch.cat([ie, oe])  # (32,)
 
         # Compute weighted sum across input channels
-        # kernel: (out_ch, 64, 3, 3), combined: (64,)
+        # kernel: (out_ch, in_ch, 3, 3), combined: (in_ch,)
         # Result: (out_ch, 3, 3) - effective kernel for this color
         effective = (kernel * combined.view(1, -1, 1, 1)).sum(dim=1)
         responses.append(effective.cpu().numpy())
@@ -124,7 +130,8 @@ def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
         'kernels': responses.tolist(),
         'num_filters': out_ch,
         'kernel_size': [kH, kW],
-        'colors': ARC_COLORS
+        'colors': ARC_COLORS,
+        'encoding': 'onehot' if model.use_onehot else 'embedding'
     }
 
 
@@ -271,8 +278,12 @@ def capture_layer_flow(
 
     # Also get embedding visualization (show expected output embeddings for comparison)
     with torch.no_grad():
-        inp_emb = model.input_embed(inp_tensor).squeeze(0).cpu().numpy()  # (30, 30, 16)
-        out_emb = model.output_embed(expected_tensor).squeeze(0).cpu().numpy()  # (30, 30, 16)
+        if model.use_onehot:
+            inp_emb = model._encode_grid(inp_tensor).squeeze(0).cpu().numpy()  # (30, 30, 11)
+            out_emb = model._encode_grid(expected_tensor).squeeze(0).cpu().numpy()  # (30, 30, 11)
+        else:
+            inp_emb = model.input_embed(inp_tensor).squeeze(0).cpu().numpy()  # (30, 30, 16)
+            out_emb = model.output_embed(expected_tensor).squeeze(0).cpu().numpy()  # (30, 30, 16)
 
     # What candidate was used for inference
     candidate_grid = candidate_tensor.squeeze(0).cpu().numpy()
@@ -326,7 +337,10 @@ def api_model_info():
         'hidden_dim': hidden_dim,
         'conv_depth': model.conv_depth,
         'kernel_size': model.kernel_size,
-        'force_comparison': model.force_comparison,
+        'force_comparison': getattr(model, 'force_comparison', False),
+        'use_onehot': model.use_onehot,
+        'use_attention': getattr(model, 'use_attention', False),
+        'encoding': 'one-hot (11 ch/grid)' if model.use_onehot else 'learned embeddings (16 ch/grid)',
         'num_classes': model.num_classes,
         'layer_names': layer_names,
         'conv_layers': {
@@ -452,13 +466,24 @@ def api_compare_colors():
     """
     Return visualization of how the model compares different color pairs.
 
-    Shows the embedding difference/product for each pair of input/output colors.
+    For embedding models: Shows learned embedding difference/product for each pair.
+    For one-hot models: Shows fixed one-hot encoding comparisons.
     """
     if model is None:
         return jsonify({'error': 'Model not loaded'}), 500
 
-    inp_embed = model.input_embed.weight.detach().cpu().numpy()  # (10, 16)
-    out_embed = model.output_embed.weight.detach().cpu().numpy()  # (10, 16)
+    if model.use_onehot:
+        # One-hot encoding: fixed 11-dim vectors (10 one-hot + 1 nonzero mask)
+        inp_embed = np.zeros((NUM_COLORS, 11), dtype=np.float32)
+        out_embed = np.zeros((NUM_COLORS, 11), dtype=np.float32)
+        for c in range(NUM_COLORS):
+            inp_embed[c, c] = 1.0  # one-hot
+            inp_embed[c, 10] = 1.0 if c > 0 else 0.0  # nonzero mask
+            out_embed[c, c] = 1.0
+            out_embed[c, 10] = 1.0 if c > 0 else 0.0
+    else:
+        inp_embed = model.input_embed.weight.detach().cpu().numpy()  # (10, 16)
+        out_embed = model.output_embed.weight.detach().cpu().numpy()  # (10, 16)
 
     # Compute pairwise comparisons
     comparisons = {}
@@ -482,7 +507,8 @@ def api_compare_colors():
     return jsonify({
         'comparisons': comparisons,
         'input_embed': inp_embed.tolist(),
-        'output_embed': out_embed.tolist()
+        'output_embed': out_embed.tolist(),
+        'encoding': 'onehot' if model.use_onehot else 'embedding'
     })
 
 
@@ -549,33 +575,26 @@ def compute_pixel_trace(
     # Get colors present in receptive field
     input_colors_in_rf = sorted(set(inp_pad[rf_row_start:rf_row_end, rf_col_start:rf_col_end].flatten().tolist()))
 
-    # Get embedding vectors for the center pixel
+    # Get embedding/encoding vectors for the center pixel
     with torch.no_grad():
-        # Embeddings for the entire grid
-        inp_emb_full = model.input_embed(inp_tensor)  # (1, 30, 30, 16)
-        out_emb_full = model.output_embed(candidate_tensor)  # (1, 30, 30, 16)
+        # Embeddings for the entire grid (or one-hot encodings)
+        if model.use_onehot:
+            inp_emb_full = model._encode_grid(inp_tensor)  # (1, 30, 30, 11)
+            out_emb_full = model._encode_grid(candidate_tensor)  # (1, 30, 30, 11)
+        else:
+            inp_emb_full = model.input_embed(inp_tensor)  # (1, 30, 30, 16)
+            out_emb_full = model.output_embed(candidate_tensor)  # (1, 30, 30, 16)
 
         # Extract embedding at the target position
-        inp_emb_pixel = inp_emb_full[0, row, col].cpu().numpy()  # (16,)
-        out_emb_pixel = out_emb_full[0, row, col].cpu().numpy()  # (16,)
-
-        # Compute comparison features
-        diff_emb = inp_emb_pixel - out_emb_pixel
-        prod_emb = inp_emb_pixel * out_emb_pixel
+        inp_emb_pixel = inp_emb_full[0, row, col].cpu().numpy()
+        out_emb_pixel = out_emb_full[0, row, col].cpu().numpy()
 
         # Build combined input (same as forward pass)
-        if model.force_comparison:
-            combined = np.concatenate([inp_emb_pixel, out_emb_pixel, diff_emb, prod_emb])  # (64,)
-        else:
-            combined = np.concatenate([inp_emb_pixel, out_emb_pixel])  # (32,)
+        # Current model just concatenates [inp, out], no diff/prod
+        combined = np.concatenate([inp_emb_pixel, out_emb_pixel])
 
         # Run forward pass through inc layer to get feature vector
-        if model.force_comparison:
-            x = torch.cat([inp_emb_full, out_emb_full,
-                          inp_emb_full - out_emb_full,
-                          inp_emb_full * out_emb_full], dim=-1)
-        else:
-            x = torch.cat([inp_emb_full, out_emb_full], dim=-1)
+        x = torch.cat([inp_emb_full, out_emb_full], dim=-1)
 
         x = x.permute(0, 3, 1, 2).contiguous()  # (1, C, 30, 30)
 
@@ -647,9 +666,9 @@ def compute_pixel_trace(
         'embeddings': {
             'input_embedding': inp_emb_pixel.tolist(),
             'candidate_embedding': out_emb_pixel.tolist(),
-            'difference': diff_emb.tolist(),
-            'product': prod_emb.tolist(),
-            'combined_input': combined.tolist()
+            'combined_input': combined.tolist(),
+            'encoding_type': 'onehot' if model.use_onehot else 'learned',
+            'embed_dim': 11 if model.use_onehot else 16
         },
         'feature_vector': {
             'values': feature_vector.tolist(),
@@ -700,6 +719,69 @@ def compute_pixel_trace(
             'probability': float(probs[c])
         })
 
+    # Add attention visualization if model has attention
+    if getattr(model, 'use_attention', False) and model.attention is not None:
+        # Enable attention capture and run inference again
+        model.attention.capture_attention = True
+        with torch.no_grad():
+            _ = model(inp_tensor, candidate_tensor)
+
+        attn_weights = model.attention.last_attention_weights  # (1, H*W, H*W)
+        model.attention.capture_attention = False
+
+        if attn_weights is not None:
+            attn_np = attn_weights.squeeze(0).numpy()  # (900, 900)
+            H, W = GRID_SIZE, GRID_SIZE
+            pixel_idx = row * W + col
+
+            # Attention FROM this pixel to all others
+            attn_from_pixel = attn_np[pixel_idx, :]  # (900,)
+            attn_from_grid = attn_from_pixel.reshape(H, W)
+
+            # Attention TO this pixel from all others
+            attn_to_pixel = attn_np[:, pixel_idx]  # (900,)
+            attn_to_grid = attn_to_pixel.reshape(H, W)
+
+            # Top pixels this pixel attends to
+            top_from_indices = np.argsort(attn_from_pixel)[-10:][::-1]
+            top_attended = [
+                {
+                    'row': int(idx // W),
+                    'col': int(idx % W),
+                    'weight': float(attn_from_pixel[idx])
+                }
+                for idx in top_from_indices
+            ]
+
+            # Top pixels that attend to this pixel
+            top_to_indices = np.argsort(attn_to_pixel)[-10:][::-1]
+            top_attending = [
+                {
+                    'row': int(idx // W),
+                    'col': int(idx % W),
+                    'weight': float(attn_to_pixel[idx])
+                }
+                for idx in top_to_indices
+            ]
+
+            result['attention'] = {
+                'has_attention': True,
+                'attention_from_pixel': attn_from_grid.tolist(),  # This pixel attends to...
+                'attention_to_pixel': attn_to_grid.tolist(),      # Others attend to this pixel...
+                'top_attended': top_attended,   # Top 10 pixels this one attends to
+                'top_attending': top_attending, # Top 10 pixels that attend to this one
+                'self_attention_weight': float(attn_from_pixel[pixel_idx]),  # Attention to self
+                'stats': {
+                    'from_max': float(attn_from_pixel.max()),
+                    'from_mean': float(attn_from_pixel.mean()),
+                    'from_entropy': float(-np.sum(attn_from_pixel * np.log(attn_from_pixel + 1e-10))),
+                    'to_max': float(attn_to_pixel.max()),
+                    'to_mean': float(attn_to_pixel.mean()),
+                }
+            }
+    else:
+        result['attention'] = {'has_attention': False}
+
     return result
 
 
@@ -748,9 +830,171 @@ def api_pixel_trace(puzzle_id: str, example_idx: int, row: int, col: int):
             'num_layers': model.num_layers,
             'conv_depth': model.conv_depth,
             'kernel_size': model.kernel_size,
-            'force_comparison': model.force_comparison,
+            'force_comparison': getattr(model, 'force_comparison', False),
+            'use_onehot': model.use_onehot,
+            'use_attention': getattr(model, 'use_attention', False),
             'num_classes': model.num_classes
         }
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# Attention Visualization
+# =============================================================================
+
+def capture_attention_weights(
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    selected_pixel: Optional[Tuple[int, int]] = None
+) -> Dict:
+    """
+    Capture attention weights for visualization.
+
+    Args:
+        input_grid: Input puzzle grid (H, W) with values 0-9
+        output_grid: Expected output puzzle grid (H, W) with values 0-9
+        selected_pixel: Optional (row, col) to get attention FROM this pixel to all others
+
+    Returns:
+        Dict with attention weights and metadata
+    """
+    if not getattr(model, 'use_attention', False) or model.attention is None:
+        return {'error': 'Model does not have attention enabled', 'has_attention': False}
+
+    # Enable attention capture
+    model.attention.capture_attention = True
+
+    # Pad grids and convert to tensors
+    inp_pad = pad_to_grid_size(input_grid)
+    out_pad = pad_to_grid_size(output_grid)
+
+    inp_tensor = torch.from_numpy(inp_pad).long().unsqueeze(0).to(device)
+    # Use zeros as candidate (standard test mode)
+    candidate_tensor = torch.zeros_like(inp_tensor).to(device)
+
+    # Run inference to capture attention
+    with torch.no_grad():
+        logits = model(inp_tensor, candidate_tensor)
+        prediction = logits.argmax(dim=1).squeeze(0).cpu().numpy()
+
+    # Get attention weights
+    attn_weights = model.attention.last_attention_weights  # (1, H*W, H*W)
+    model.attention.capture_attention = False
+
+    if attn_weights is None:
+        return {'error': 'Failed to capture attention weights', 'has_attention': True}
+
+    attn_np = attn_weights.squeeze(0).numpy()  # (900, 900) for 30x30 grid
+    H, W = GRID_SIZE, GRID_SIZE
+    N = H * W  # 900
+
+    result = {
+        'has_attention': True,
+        'grid_size': [H, W],
+        'num_pixels': N,
+        'input_grid': inp_pad.tolist(),
+        'output_grid': out_pad.tolist(),
+        'prediction': prediction.tolist(),
+        'input_shape': list(input_grid.shape),
+        'output_shape': list(output_grid.shape),
+    }
+
+    # If a specific pixel is selected, return attention FROM that pixel
+    if selected_pixel is not None:
+        row, col = selected_pixel
+        if 0 <= row < H and 0 <= col < W:
+            pixel_idx = row * W + col
+            # Attention from selected pixel to all other pixels
+            attn_from_pixel = attn_np[pixel_idx, :]  # (900,)
+            # Reshape to grid for visualization
+            attn_grid = attn_from_pixel.reshape(H, W)
+            result['selected_pixel'] = {'row': row, 'col': col}
+            result['attention_from_pixel'] = attn_grid.tolist()
+            # Also include which pixels this pixel attends to most (top 10)
+            top_indices = np.argsort(attn_from_pixel)[-10:][::-1]
+            result['top_attended'] = [
+                {
+                    'row': int(idx // W),
+                    'col': int(idx % W),
+                    'weight': float(attn_from_pixel[idx])
+                }
+                for idx in top_indices
+            ]
+    else:
+        # Return summary statistics (full matrix is too large: 900x900)
+        # Compute mean attention per pixel (how much each pixel attends on average)
+        mean_attn_from = attn_np.mean(axis=1).reshape(H, W)  # avg attention FROM each pixel
+        mean_attn_to = attn_np.mean(axis=0).reshape(H, W)    # avg attention TO each pixel
+        max_attn_from = attn_np.max(axis=1).reshape(H, W)    # max attention FROM each pixel
+        max_attn_to = attn_np.max(axis=0).reshape(H, W)      # max attention TO each pixel
+
+        result['attention_summary'] = {
+            'mean_from': mean_attn_from.tolist(),
+            'mean_to': mean_attn_to.tolist(),
+            'max_from': max_attn_from.tolist(),
+            'max_to': max_attn_to.tolist(),
+        }
+
+        # Entropy of attention distribution (high entropy = uniform, low = focused)
+        entropy = -np.sum(attn_np * np.log(attn_np + 1e-10), axis=1).reshape(H, W)
+        result['attention_summary']['entropy'] = entropy.tolist()
+
+    return result
+
+
+@app.route('/api/attention/<puzzle_id>/<int:example_idx>')
+def api_attention(puzzle_id: str, example_idx: int):
+    """
+    Get attention weights visualization for a specific puzzle example.
+
+    Query params:
+        row, col: Optional pixel coordinates to show attention FROM that pixel
+    """
+    if model is None or puzzles is None:
+        return jsonify({'error': 'Model or puzzles not loaded'}), 500
+
+    if not getattr(model, 'use_attention', False):
+        return jsonify({
+            'error': 'Model does not have attention enabled',
+            'has_attention': False
+        }), 400
+
+    if puzzle_id not in puzzles:
+        return jsonify({'error': f'Puzzle {puzzle_id} not found'}), 404
+
+    puzzle = puzzles[puzzle_id]
+    train_examples = puzzle.get('train', [])
+    test_examples = puzzle.get('test', [])
+
+    # Determine which example to use
+    if example_idx < len(train_examples):
+        example = train_examples[example_idx]
+        split = 'train'
+    elif example_idx < len(train_examples) + len(test_examples):
+        example = test_examples[example_idx - len(train_examples)]
+        split = 'test'
+    else:
+        return jsonify({'error': f'Example index {example_idx} out of range'}), 404
+
+    input_grid = np.array(example['input'], dtype=np.uint8)
+    output_grid = np.array(example.get('output', example['input']), dtype=np.uint8)
+
+    # Check for selected pixel in query params
+    selected_pixel = None
+    row = request.args.get('row', type=int)
+    col = request.args.get('col', type=int)
+    if row is not None and col is not None:
+        selected_pixel = (row, col)
+
+    try:
+        result = capture_attention_weights(input_grid, output_grid, selected_pixel)
+        result['puzzle_id'] = puzzle_id
+        result['example_idx'] = example_idx
+        result['split'] = split
         return jsonify(result)
     except Exception as e:
         import traceback

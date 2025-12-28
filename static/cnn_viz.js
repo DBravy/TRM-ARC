@@ -284,8 +284,8 @@ async function loadModelInfo() {
                 <div class="info-value">${modelInfo.use_attention ? 'Yes' : 'No'}</div>
             </div>
             <div class="info-item">
-                <div class="info-label">Comparison</div>
-                <div class="info-value">${modelInfo.force_comparison ? 'Forced' : 'Basic'}</div>
+                <div class="info-label">Encoding</div>
+                <div class="info-value">${modelInfo.use_onehot ? 'One-Hot' : 'Learned'}</div>
             </div>
         `;
     } catch (err) {
@@ -852,7 +852,12 @@ function renderPixelTrace(trace) {
     // 4. Feature Vector Section
     grid.appendChild(createFeatureVectorSection(trace));
 
-    // 5. Final Calculation Section
+    // 5. Attention Section (if model has attention)
+    if (trace.attention && trace.attention.has_attention) {
+        grid.appendChild(createAttentionSection(trace));
+    }
+
+    // 6. Final Calculation Section
     grid.appendChild(createFinalCalculationSection(trace));
 
     // 6. Prediction Summary Section
@@ -987,15 +992,19 @@ function createEmbeddingsSection(trace) {
 
     const emb = trace.embeddings;
 
+    const isOnehot = emb.encoding_type === 'onehot';
+    const embedDim = emb.embed_dim || (isOnehot ? 11 : 16);
+
     let html = `
-        <h4>Embedding Vectors (16-dim each)</h4>
+        <h4>${isOnehot ? 'One-Hot Encoding' : 'Embedding Vectors'} (${embedDim}-dim each)</h4>
         <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
-            Learned vector representations for the colors at this position.
+            ${isOnehot ? 'Fixed one-hot + nonzero mask encoding for colors.' : 'Learned vector representations for the colors at this position.'}
         </p>
     `;
 
     // Helper to render embedding as colored cells
     function renderEmbedding(values, label) {
+        if (!values) return '';
         const maxAbs = Math.max(...values.map(Math.abs)) || 1;
         let embHtml = `<div style="margin-bottom: 8px;">
             <span style="font-size: 0.8em; color: #aaa;">${label}:</span>
@@ -1009,10 +1018,16 @@ function createEmbeddingsSection(trace) {
         return embHtml;
     }
 
-    html += renderEmbedding(emb.input_embedding, 'Input Emb');
-    html += renderEmbedding(emb.candidate_embedding, 'Candidate Emb');
-    html += renderEmbedding(emb.difference, 'Difference');
-    html += renderEmbedding(emb.product, 'Product');
+    html += renderEmbedding(emb.input_embedding, 'Input');
+    html += renderEmbedding(emb.candidate_embedding, 'Candidate');
+
+    // Only show difference/product if they exist (older models with force_comparison)
+    if (emb.difference) {
+        html += renderEmbedding(emb.difference, 'Difference');
+    }
+    if (emb.product) {
+        html += renderEmbedding(emb.product, 'Product');
+    }
 
     html += `
         <div style="margin-top: 10px; font-size: 0.8em; color: #888;">
@@ -1128,6 +1143,109 @@ function createFeatureVectorSection(trace) {
             <span style="color: #b2182b;">+</span>
             <span style="margin-left: 10px;">✓ = predicted</span>
             <span>◎ = expected</span>
+        </div>
+    `;
+
+    section.innerHTML = html;
+    return section;
+}
+
+function createAttentionSection(trace) {
+    const section = document.createElement('div');
+    section.className = 'trace-section';
+
+    const attn = trace.attention;
+    const pixel = trace.pixel;
+
+    let html = `
+        <h4>Spatial Self-Attention</h4>
+        <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
+            This pixel attends to all other pixels. Brighter = higher attention weight.
+        </p>
+    `;
+
+    // Self-attention weight
+    html += `
+        <div class="trace-row">
+            <span class="trace-label">Self-attention weight</span>
+            <span class="trace-value">${(attn.self_attention_weight * 100).toFixed(2)}%</span>
+        </div>
+        <div class="trace-row">
+            <span class="trace-label">Attention entropy</span>
+            <span class="trace-value">${attn.stats.from_entropy.toFixed(2)} (higher = more uniform)</span>
+        </div>
+    `;
+
+    // Attention heatmaps side by side
+    html += `<div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">`;
+
+    // "Attention FROM this pixel" heatmap
+    html += `
+        <div>
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">This pixel attends to:</div>
+            <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
+    `;
+
+    const fromGrid = attn.attention_from_pixel;
+    const maxFrom = attn.stats.from_max;
+    for (let r = 0; r < 30; r++) {
+        for (let c = 0; c < 30; c++) {
+            const weight = fromGrid[r][c];
+            const normalized = weight / maxFrom;
+            const intensity = Math.floor(normalized * 255);
+            const isSelected = (r === pixel.row && c === pixel.col);
+            const border = isSelected ? 'border: 1px solid #ff0;' : '';
+            html += `<div style="width: 8px; height: 8px; background: rgb(${intensity}, ${Math.floor(intensity*0.5)}, 0); ${border}"
+                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
+        }
+    }
+    html += `</div></div>`;
+
+    // "Attention TO this pixel" heatmap
+    html += `
+        <div>
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Others attend to this pixel:</div>
+            <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
+    `;
+
+    const toGrid = attn.attention_to_pixel;
+    const maxTo = attn.stats.to_max;
+    for (let r = 0; r < 30; r++) {
+        for (let c = 0; c < 30; c++) {
+            const weight = toGrid[r][c];
+            const normalized = weight / maxTo;
+            const intensity = Math.floor(normalized * 255);
+            const isSelected = (r === pixel.row && c === pixel.col);
+            const border = isSelected ? 'border: 1px solid #ff0;' : '';
+            html += `<div style="width: 8px; height: 8px; background: rgb(0, ${Math.floor(intensity*0.5)}, ${intensity}); ${border}"
+                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
+        }
+    }
+    html += `</div></div>`;
+    html += `</div>`;
+
+    // Top attended pixels
+    html += `
+        <div style="margin-top: 15px;">
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Top 5 pixels this one attends to:</div>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+    `;
+    for (let i = 0; i < Math.min(5, attn.top_attended.length); i++) {
+        const p = attn.top_attended[i];
+        html += `
+            <div style="padding: 4px 8px; background: #1a2a3a; border-radius: 4px; font-size: 0.8em;">
+                (${p.row}, ${p.col}): <span style="color: #f90;">${(p.weight * 100).toFixed(1)}%</span>
+            </div>
+        `;
+    }
+    html += `</div></div>`;
+
+    // Legend
+    html += `
+        <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> Attends to (orange)</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> Attended by (blue)</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
         </div>
     `;
 
