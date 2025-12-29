@@ -956,6 +956,41 @@ class PixelErrorCNN(nn.Module):
         widths = output['width_logits'].argmax(dim=1) + 1
         return heights, widths
 
+    def predict_size_from_input(self, input_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict output size from input grid only (no output grid needed).
+
+        This is the method to use at inference time when you don't have the output yet.
+        Size prediction only depends on the input grid via the IR encoder.
+
+        Args:
+            input_grid: (B, H, W) integer grid
+
+        Returns:
+            heights: (B,) predicted heights (1-30)
+            widths: (B,) predicted widths (1-30)
+        """
+        if not self.predict_size:
+            raise RuntimeError("Model was not initialized with predict_size=True")
+        if self.ir_encoder is None:
+            raise RuntimeError("Size prediction requires an IR encoder")
+
+        # Encode input with IR encoder
+        inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+        inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+        ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
+        ir_features = ir_features.permute(0, 3, 1, 2).contiguous()  # (B, out_dim, H, W)
+
+        # Global pool and predict size
+        pooled = self.size_pool(ir_features).squeeze(-1).squeeze(-1)  # (B, ir_dim)
+        trunk_out = self.size_trunk(pooled)
+        height_logits = self.height_head(trunk_out)
+        width_logits = self.width_head(trunk_out)
+
+        heights = height_logits.argmax(dim=1) + 1  # Convert 0-29 to 1-30
+        widths = width_logits.argmax(dim=1) + 1
+        return heights, widths
+
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
         checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
@@ -1396,15 +1431,21 @@ class TestEvalDataset(Dataset):
 
 def visualize_prediction(
     input_grid: np.ndarray,
-    target_grid: np.ndarray, 
+    target_grid: np.ndarray,
     pred_grid: np.ndarray,
     inp_h: int,
     inp_w: int,
-    out_h: int, 
+    out_h: int,
     out_w: int,
-    puzzle_id: str
+    puzzle_id: str,
+    pred_size: Tuple[int, int] = None
 ):
-    """Visualize input, target output, and prediction stacked vertically."""
+    """Visualize input, target output, and prediction stacked vertically.
+
+    Args:
+        pred_size: Optional (pred_h, pred_w) tuple. If provided, shows predicted size
+                   and uses it to crop the prediction display.
+    """
     # Color codes for terminal (ANSI) - 256 color mode for better visibility
     COLORS = [
         '\033[48;5;0m',    # 0: black
@@ -1419,41 +1460,71 @@ def visualize_prediction(
         '\033[48;5;88m',   # 9: maroon
     ]
     RESET = '\033[0m'
-    
+
+    # Determine display dimensions for prediction
+    if pred_size is not None:
+        disp_h, disp_w = pred_size
+        size_correct = (disp_h == out_h and disp_w == out_w)
+    else:
+        disp_h, disp_w = out_h, out_w
+        size_correct = True
+
     # Extract actual regions using provided dimensions
     inp = input_grid[:inp_h, :inp_w]
     tgt = target_grid[:out_h, :out_w]
-    pred = pred_grid[:out_h, :out_w]
-    
-    # Calculate errors
-    errors = (pred != tgt).sum()
-    total = out_h * out_w
+    pred = pred_grid[:disp_h, :disp_w]  # Use predicted size for display
+
+    # Calculate errors in overlapping region
+    compare_h, compare_w = min(disp_h, out_h), min(disp_w, out_w)
+    errors = (pred_grid[:compare_h, :compare_w] != target_grid[:compare_h, :compare_w]).sum()
+    is_perfect = (errors == 0) and size_correct
     
     print(f"\n{'â•'*50}")
-    if errors == 0:
-        print(f"\033[92mâœ“ PERFECT: {puzzle_id}\033[0m")
+    if is_perfect:
+        print(f"\033[92m+ PERFECT: {puzzle_id}\033[0m")
     else:
-        print(f"\033[91mâœ— {puzzle_id}: {errors}/{total} errors ({100*errors/total:.1f}% wrong)\033[0m")
-    print(f"  Input: {inp_h}Ã—{inp_w} â†’ Output: {out_h}Ã—{out_w}")
+        print(f"\033[91mx {puzzle_id}: {errors}/{compare_h*compare_w} pixel errors\033[0m")
+
+    # Show size info
+    if pred_size is not None:
+        if size_correct:
+            print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w} \033[92m(size correct)\033[0m")
+        else:
+            print(f"  Input: {inp_h}x{inp_w} -> True: {out_h}x{out_w}, \033[91mPred: {disp_h}x{disp_w} (size wrong)\033[0m")
+    else:
+        print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w}")
     print(f"{'â•'*50}")
     
-    def print_grid(grid, label, rows, cols, highlight_errors=False, target=None):
+    def print_grid(grid, label, rows, cols, highlight_errors=False, target=None, mark_outside=False, true_rows=None, true_cols=None):
         print(f"\n{label}:")
         for r in range(rows):
             row_str = "  "
             for c in range(cols):
                 val = grid[r, c]
-                if highlight_errors and target is not None and grid[r, c] != target[r, c]:
+                # Check if outside true target region (size mismatch - extra pixels)
+                outside = mark_outside and true_rows is not None and true_cols is not None and (r >= true_rows or c >= true_cols)
+                if outside:
+                    # Yellow background for extra pixels
+                    row_str += f"\033[43m\033[30m{val}\033[0m "
+                elif highlight_errors and target is not None and r < target.shape[0] and c < target.shape[1] and grid[r, c] != target[r, c]:
                     # White text on red background for errors
                     row_str += f"\033[41m\033[97m{val}\033[0m "
                 else:
                     row_str += f"{COLORS[val]}{val}{RESET} "
             print(row_str)
-    
+
     # Print grids stacked
     print_grid(inp, "INPUT", inp_h, inp_w)
     print_grid(tgt, "TARGET", out_h, out_w)
-    print_grid(pred, "PREDICTION (errors in red)", out_h, out_w, highlight_errors=True, target=tgt)
+
+    # For prediction, show with predicted size and highlight errors/extra pixels
+    pred_label = "PREDICTION"
+    if pred_size is not None and not size_correct:
+        pred_label += f" ({disp_h}x{disp_w}, errors=red, extra=yellow)"
+    else:
+        pred_label += " (errors in red)"
+    print_grid(pred, pred_label, disp_h, disp_w, highlight_errors=True, target=tgt,
+               mark_outside=(not size_correct), true_rows=out_h, true_cols=out_w)
     
     print()
 
@@ -1472,27 +1543,55 @@ def evaluate_test_examples(
 
     With recursive_iters > 1, we feed the model's output back as the candidate
     and iterate, tracking accuracy at each step.
+
+    If model.predict_size is True, uses predicted size to constrain pixel predictions.
     """
     model.eval()
-    
+
+    # Check if model predicts size
+    uses_size_prediction = getattr(model, 'predict_size', False)
+
     total_pixels = 0
     total_correct = 0
     total_examples = 0
     perfect_examples = 0
-    
+
+    # Size prediction stats (when using predicted size)
+    size_height_correct = 0
+    size_width_correct = 0
+    size_both_correct = 0
+
     # Track per-iteration stats
     iter_stats = {i: {"correct": 0, "total": 0} for i in range(recursive_iters)}
-    
+
     results = []
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             input_grid, output_grid, dims, puzzle_id = dataset[i]
-            inp_h, inp_w, out_h, out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
-            
+            inp_h, inp_w, true_out_h, true_out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
+
             inp_t = input_grid.unsqueeze(0).to(device)
             target_colors = output_grid.numpy()
-            
+
+            # Predict output size if model supports it
+            if uses_size_prediction:
+                pred_h, pred_w = model.predict_size_from_input(inp_t)
+                pred_h, pred_w = pred_h.item(), pred_w.item()
+
+                # Track size prediction accuracy
+                h_correct = (pred_h == true_out_h)
+                w_correct = (pred_w == true_out_w)
+                size_height_correct += int(h_correct)
+                size_width_correct += int(w_correct)
+                size_both_correct += int(h_correct and w_correct)
+
+                # Use predicted size for evaluation (constraining pixel predictions)
+                eval_h, eval_w = pred_h, pred_w
+            else:
+                pred_h, pred_w = None, None
+                eval_h, eval_w = true_out_h, true_out_w
+
             # Start with blank candidate
             candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
 
@@ -1504,13 +1603,16 @@ def evaluate_test_examples(
                 logits = output['pixel_logits'] if isinstance(output, dict) else output  # (1, 10, H, W)
                 pred_colors = logits.argmax(dim=1)  # (1, H, W)
 
-                # Track accuracy at this iteration
+                # Track accuracy at this iteration using PREDICTED size for cropping
                 pred_np = pred_colors[0].cpu().numpy()
-                pred_region = pred_np[:out_h, :out_w]
-                target_region = target_colors[:out_h, :out_w]
+                pred_region = pred_np[:eval_h, :eval_w]
+
+                # For accuracy, we need to compare against target at the SAME region
+                # If predicted size differs from true size, this naturally penalizes wrong size predictions
+                target_region = target_colors[:eval_h, :eval_w]
 
                 correct = (pred_region == target_region).sum()
-                total = out_h * out_w
+                total = eval_h * eval_w
 
                 iter_stats[iter_idx]["correct"] += correct
                 iter_stats[iter_idx]["total"] += total
@@ -1519,7 +1621,7 @@ def evaluate_test_examples(
                 candidate = pred_colors.long()
 
             # Final results use last iteration
-            is_perfect = (correct == total)
+            is_perfect = (correct == total) and (eval_h == true_out_h) and (eval_w == true_out_w)
 
             # Visualize final result
             if visualize:
@@ -1528,8 +1630,9 @@ def evaluate_test_examples(
                     target_colors,
                     pred_np,
                     inp_h, inp_w,
-                    out_h, out_w,
-                    puzzle_id
+                    true_out_h, true_out_w,
+                    puzzle_id,
+                    pred_size=(pred_h, pred_w) if uses_size_prediction else None
                 )
 
             total_correct += correct
@@ -1537,18 +1640,26 @@ def evaluate_test_examples(
             total_examples += 1
             if is_perfect:
                 perfect_examples += 1
-            
+
             results.append({
                 'puzzle_id': puzzle_id,
                 'correct': correct,
                 'total': total,
                 'accuracy': correct / total,
-                'perfect': is_perfect
+                'perfect': is_perfect,
+                'pred_h': pred_h,
+                'pred_w': pred_w,
+                'true_h': true_out_h,
+                'true_w': true_out_w,
             })
-            
+
             if verbose and not visualize:
-                status = "âœ“ PERFECT" if is_perfect else f"âœ— {correct}/{total} ({100*correct/total:.1f}%)"
-                print(f"  Example {i+1}: {puzzle_id} - {status}")
+                size_info = ""
+                if uses_size_prediction:
+                    size_match = "✓" if (pred_h == true_out_h and pred_w == true_out_w) else "✗"
+                    size_info = f" [size: {pred_h}×{pred_w} vs {true_out_h}×{true_out_w} {size_match}]"
+                status = "✓ PERFECT" if is_perfect else f"✗ {correct}/{total} ({100*correct/total:.1f}%)"
+                print(f"  Example {i+1}: {puzzle_id} - {status}{size_info}")
     
     overall_accuracy = total_correct / max(total_pixels, 1)
     perfect_rate = perfect_examples / max(total_examples, 1)
@@ -1569,7 +1680,7 @@ def evaluate_test_examples(
             print(f"  Iteration {iter_idx}: {100*iter_acc:.2f}%{delta}")
         print(f"{'─'*60}")
     
-    return {
+    result = {
         'pixel_accuracy': overall_accuracy,
         'perfect_rate': perfect_rate,
         'total_examples': total_examples,
@@ -1577,6 +1688,19 @@ def evaluate_test_examples(
         'results': results,
         'iter_stats': iter_stats if recursive_iters > 1 else None,
     }
+
+    # Add size prediction stats if applicable
+    if uses_size_prediction and total_examples > 0:
+        result['size_height_accuracy'] = size_height_correct / total_examples
+        result['size_width_accuracy'] = size_width_correct / total_examples
+        result['size_both_accuracy'] = size_both_correct / total_examples
+        if verbose:
+            print(f"\nSize Prediction Accuracy:")
+            print(f"  Height: {size_height_correct}/{total_examples} ({100*size_height_correct/total_examples:.1f}%)")
+            print(f"  Width:  {size_width_correct}/{total_examples} ({100*size_width_correct/total_examples:.1f}%)")
+            print(f"  Both:   {size_both_correct}/{total_examples} ({100*size_both_correct/total_examples:.1f}%)")
+
+    return result
 
 
 # =============================================================================
