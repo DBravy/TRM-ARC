@@ -1528,6 +1528,8 @@ def main():
         print(f"  Encoding: learned embeddings (16 channels)")
     if args.no_skip:
         print(f"  Skip connections: DISABLED")
+    if args.predict_size:
+        print(f"  Size prediction: ENABLED (weight={args.size_weight}, hidden={args.size_hidden_dim})")
 
     print(f"Num negatives: {args.num_negatives}")
     print(f"Negative type: {args.negative_type}")
@@ -1590,6 +1592,10 @@ def main():
             ir_num_layers=args.ir_num_layers,
             ir_kernel_size=args.ir_kernel_size,
             freeze_ir=args.freeze_ir,
+            # Size prediction options
+            predict_size=args.predict_size,
+            size_weight=args.size_weight,
+            size_hidden_dim=args.size_hidden_dim,
         )
         train_time = time.time() - start_time
 

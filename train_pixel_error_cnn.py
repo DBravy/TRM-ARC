@@ -1499,7 +1499,9 @@ def evaluate_test_examples(
             # Recursive iteration
             for iter_idx in range(recursive_iters):
                 # Predict colors from (input, current_candidate)
-                logits = model(inp_t, candidate)  # (1, 10, H, W)
+                output = model(inp_t, candidate)
+                # Handle dict output when predict_size=True
+                logits = output['pixel_logits'] if isinstance(output, dict) else output  # (1, 10, H, W)
                 pred_colors = logits.argmax(dim=1)  # (1, H, W)
 
                 # Track accuracy at this iteration
@@ -2314,12 +2316,13 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
 
         with torch.no_grad():
             for batch in loader:
-                input_grid, output_grid, target, _ = batch
+                input_grid, output_grid, target, _, _ = batch
                 input_grid = input_grid.to(device)
                 output_grid = output_grid.to(device)
                 target = target.to(device)
 
-                logits = model(input_grid, output_grid)
+                output = model(input_grid, output_grid)
+                logits = output['pixel_logits'] if isinstance(output, dict) else output
                 preds = logits.argmax(dim=1)
 
                 pixel_correct += (preds == target).sum().item()
