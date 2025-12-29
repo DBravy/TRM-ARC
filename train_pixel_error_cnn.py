@@ -1067,8 +1067,8 @@ class CorrespondenceDataset(Dataset):
     Sample types:
     1. POSITIVE: (input, output) with SAME augmentation applied to both
     2. NEGATIVE - corrupted: (input, corrupted_output)
-    3. NEGATIVE - wrong input: (wrong_input, correct_output) â† CRITICAL
-    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) â† CRITICAL
+    3. NEGATIVE - wrong input: (wrong_input, correct_output) - CRITICAL
+    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) - CRITICAL
     5. NEGATIVE - all_zeros: output is all zeros (blank)
     6. NEGATIVE - constant_fill: output is all one color (1-9)
     7. NEGATIVE - random_noise: output is random values
@@ -1479,21 +1479,21 @@ def visualize_prediction(
     errors = (pred_grid[:compare_h, :compare_w] != target_grid[:compare_h, :compare_w]).sum()
     is_perfect = (errors == 0) and size_correct
     
-    print(f"\n{'â•'*50}")
+    print(f"\n{'='*50}")
     if is_perfect:
-        print(f"\033[92m+ PERFECT: {puzzle_id}\033[0m")
+        print(f"[PERFECT] {puzzle_id}")
     else:
-        print(f"\033[91mx {puzzle_id}: {errors}/{compare_h*compare_w} pixel errors\033[0m")
+        print(f"[ERRORS: {errors}/{compare_h*compare_w}] {puzzle_id}")
 
     # Show size info
     if pred_size is not None:
         if size_correct:
-            print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w} \033[92m(size correct)\033[0m")
+            print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w} (size correct)")
         else:
-            print(f"  Input: {inp_h}x{inp_w} -> True: {out_h}x{out_w}, \033[91mPred: {disp_h}x{disp_w} (size wrong)\033[0m")
+            print(f"  Input: {inp_h}x{inp_w} -> True: {out_h}x{out_w}, Pred: {disp_h}x{disp_w} (SIZE WRONG)")
     else:
         print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w}")
-    print(f"{'â•'*50}")
+    print(f"{'='*50}")
     
     def print_grid(grid, label, rows, cols, highlight_errors=False, target=None, mark_outside=False, true_rows=None, true_cols=None):
         print(f"\n{label}:")
@@ -1666,7 +1666,7 @@ def evaluate_test_examples(
     
     # Print per-iteration accuracy if recursive
     if recursive_iters > 1 and verbose:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print("ACCURACY BY ITERATION:")
         for iter_idx in range(recursive_iters):
             iter_correct = iter_stats[iter_idx]["correct"]
@@ -1678,7 +1678,7 @@ def evaluate_test_examples(
                 diff = iter_acc - prev_acc
                 delta = f" ({'+' if diff >= 0 else ''}{100*diff:.2f}%)"
             print(f"  Iteration {iter_idx}: {100*iter_acc:.2f}%{delta}")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
     
     result = {
         'pixel_accuracy': overall_accuracy,
@@ -1740,7 +1740,7 @@ def run_layer_ablation(
     print(f"BASELINE (no ablation):")
     print(f"  Pixel Accuracy: {baseline_acc:.2%}")
     print(f"  Perfect Rate:   {baseline_perfect:.2%}")
-    print(f"{'─'*70}\n")
+    print(f"{'-'*70}\n")
 
     # PixelErrorCNN (U-Net) layers - build based on num_layers
     encoder_layers = [
@@ -1878,17 +1878,17 @@ def run_layer_ablation(
         print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
     
     # Interpretation
-    print("\n" + "─"*70)
+    print("\n" + "-"*70)
     print("INTERPRETATION:")
     
     critical_layers = [name for name, res in sorted_layers if res["accuracy_drop"] > 0.3]
     if critical_layers:
-        print(f"  • Critical layers: {', '.join(critical_layers)}")
+        print(f"  * Critical layers: {', '.join(critical_layers)}")
         print(f"    These layers store essential transformation knowledge.")
     
     minimal_layers = [name for name, res in sorted_layers if res["accuracy_drop"] < 0.02]
     if minimal_layers:
-        print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+        print(f"  * Minimal-impact layers: {', '.join(minimal_layers)}")
         print(f"    These layers may be redundant or store non-essential features.")
     
     # Check if attention matters
@@ -1897,13 +1897,13 @@ def run_layer_ablation(
     if attention_results:
         attn_drop = max(res["accuracy_drop"] for res in attention_results)
         if attn_drop > 0.1:
-            print(f"  • Attention is important (drop: {attn_drop:+.2%})")
+            print(f"  * Attention is important (drop: {attn_drop:+.2%})")
             print(f"    The transformation likely requires global/relational reasoning.")
         else:
-            print(f"  • Attention has minimal impact (drop: {attn_drop:+.2%})")
+            print(f"  * Attention has minimal impact (drop: {attn_drop:+.2%})")
             print(f"    The transformation may be primarily local/convolutional.")
     
-    print("─"*70 + "\n")
+    print("-"*70 + "\n")
     
     return {
         "baseline": {"accuracy": baseline_acc, "perfect_rate": baseline_perfect},
@@ -2428,9 +2428,9 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
         if count == 0:
             continue
 
-        print(f"\n{'â”€'*80}")
+        print(f"\n{'-'*80}")
         print(f"Sample Type: {sample_type.upper()}")
-        print(f"{'â”€'*80}")
+        print(f"{'-'*80}")
 
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
@@ -2598,7 +2598,7 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
         print(f"BASELINE (no ablation):")
         print(f"  Pixel Accuracy: {baseline_acc:.2%}")
         print(f"  Grid Accuracy:  {baseline_grid_acc:.2%}")
-        print(f"{'─'*70}\n")
+        print(f"{'-'*70}\n")
 
     # Define layer groups based on architecture (similar to run_layer_ablation)
     layer_groups = {
@@ -2756,7 +2756,7 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
             print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} pixel drop")
 
         # Interpretation
-        print("\n" + "─"*70)
+        print("\n" + "-"*70)
         print("INTERPRETATION:")
 
         # Critical thresholds
@@ -2764,16 +2764,16 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
         pixel_critical = [name for name, res in sorted_by_pixel if res["accuracy_drop"] > 0.3]
 
         if grid_critical:
-            print(f"  • Grid-critical (>30% drop): {', '.join(grid_critical)}")
+            print(f"  * Grid-critical (>30% drop): {', '.join(grid_critical)}")
 
         if pixel_critical:
-            print(f"  • Pixel-critical (>30% drop): {', '.join(pixel_critical)}")
+            print(f"  * Pixel-critical (>30% drop): {', '.join(pixel_critical)}")
 
         # Minimal impact (both metrics)
         minimal_layers = [name for name, res in sorted_by_grid
                         if res["grid_drop"] < 0.02 and res["accuracy_drop"] < 0.02]
         if minimal_layers:
-            print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+            print(f"  * Minimal-impact layers: {', '.join(minimal_layers)}")
 
         # Check encoder vs decoder balance
         encoder_grid_drops = [res["grid_drop"] for _, res in ablation_results.items()
@@ -2785,11 +2785,11 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
             avg_encoder = sum(encoder_grid_drops) / len(encoder_grid_drops)
             avg_decoder = sum(decoder_grid_drops) / len(decoder_grid_drops)
             if avg_encoder > avg_decoder * 1.5:
-                print(f"  • Encoder-heavy (grid): avg {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
+                print(f"  * Encoder-heavy (grid): avg {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
             elif avg_decoder > avg_encoder * 1.5:
-                print(f"  • Decoder-heavy (grid): avg {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
+                print(f"  * Decoder-heavy (grid): avg {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
 
-        print("─"*70 + "\n")
+        print("-"*70 + "\n")
 
     return {
         "baseline": {"accuracy": baseline_acc, "grid_accuracy": baseline_grid_acc},
