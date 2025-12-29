@@ -195,7 +195,7 @@ class SinglePuzzleDataset(Dataset):
     """
     Dataset for a single puzzle's training examples.
     Matches CorrespondenceDataset from train_pixel_error_cnn.py
-    
+
     Includes all sample types:
     - positive: correct candidate
     - corrupted: some pixels wrong
@@ -203,10 +203,10 @@ class SinglePuzzleDataset(Dataset):
     - mismatched_aug: different augmentations
     - all_zeros, constant_fill, random_noise, color_swap
     """
-    
+
     def __init__(
-        self, 
-        puzzle: Dict, 
+        self,
+        puzzle: Dict,
         num_positives: int = 2,
         num_corrupted: int = 3,
         num_wrong_input: int = 1,
@@ -216,6 +216,8 @@ class SinglePuzzleDataset(Dataset):
         num_random_noise: int = 1,
         num_color_swap: int = 1,
         dihedral_only: bool = True,
+        color_only: bool = False,
+        no_augment: bool = False,
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
@@ -226,34 +228,49 @@ class SinglePuzzleDataset(Dataset):
         self.num_random_noise = num_random_noise
         self.num_color_swap = num_color_swap
         self.dihedral_only = dihedral_only
-        
+        self.color_only = color_only
+        self.no_augment = no_augment
+
         self.samples_per_example = (
             num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
             num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
         )
-        
+
         self.examples = []
         for example in puzzle.get("train", []):
             inp = np.array(example["input"], dtype=np.uint8)
             out = np.array(example["output"], dtype=np.uint8)
             self.examples.append((inp, out))
-    
+
     def __len__(self):
         return len(self.examples) * self.samples_per_example
-    
+
     def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
         h, w = grid.shape
         padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
         padded[:h, :w] = grid
         return padded
-    
+
     def _get_augmentation(self):
-        trans_id = random.randint(0, 7)
-        if self.dihedral_only:
+        """Get augmentation params based on augment settings."""
+        if self.no_augment:
+            # No augmentation at all
+            return 0, np.arange(10, dtype=np.uint8)
+        elif self.dihedral_only:
+            # Random dihedral transform, identity color mapping
+            trans_id = random.randint(0, 7)
             color_map = np.arange(10, dtype=np.uint8)
-        else:
+            return trans_id, color_map
+        elif self.color_only:
+            # Identity dihedral transform, random color mapping
+            trans_id = 0
             color_map = random_color_permutation()
-        return trans_id, color_map
+            return trans_id, color_map
+        else:
+            # Full augmentation
+            trans_id = random.randint(0, 7)
+            color_map = random_color_permutation()
+            return trans_id, color_map
     
     def _get_different_example(self, exclude_idx: int):
         idx = random.randint(0, len(self.examples) - 1)
@@ -383,6 +400,8 @@ class MultiPuzzleDataset(Dataset):
         num_color_swap: int = 1,
         auto_augment: bool = True,
         dihedral_only: bool = True,  # fallback if auto_augment=False
+        color_only: bool = False,
+        no_augment: bool = False,
     ):
         self.num_positives = num_positives
         self.num_corrupted = num_corrupted
@@ -392,6 +411,8 @@ class MultiPuzzleDataset(Dataset):
         self.num_constant_fill = num_constant_fill
         self.num_random_noise = num_random_noise
         self.num_color_swap = num_color_swap
+        self.color_only = color_only
+        self.no_augment = no_augment
 
         self.samples_per_example = (
             num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
@@ -434,12 +455,25 @@ class MultiPuzzleDataset(Dataset):
         return padded
 
     def _get_augmentation(self, dihedral_only: bool):
-        trans_id = random.randint(0, 7)
-        if dihedral_only:
+        """Get augmentation params based on augment settings."""
+        if self.no_augment:
+            # No augmentation at all
+            return 0, np.arange(10, dtype=np.uint8)
+        elif dihedral_only:
+            # Random dihedral transform, identity color mapping
+            trans_id = random.randint(0, 7)
             color_map = np.arange(10, dtype=np.uint8)
-        else:
+            return trans_id, color_map
+        elif self.color_only:
+            # Identity dihedral transform, random color mapping
+            trans_id = 0
             color_map = random_color_permutation()
-        return trans_id, color_map
+            return trans_id, color_map
+        else:
+            # Full augmentation
+            trans_id = random.randint(0, 7)
+            color_map = random_color_permutation()
+            return trans_id, color_map
 
     def _get_different_example(self, puzzle_id: str, exclude_idx: int):
         """Get a different example from the same puzzle for wrong_input samples."""
@@ -705,7 +739,25 @@ def train_on_all_puzzles(
     num_negatives: int = 8,
     auto_augment: bool = True,
     dihedral_only: bool = True,
+    color_only: bool = False,
+    no_augment: bool = False,
     verbose: bool = False,
+    # Architecture options
+    num_layers: int = 3,
+    conv_depth: int = 2,
+    kernel_size: int = 3,
+    out_kernel_size: int = 1,
+    no_skip: bool = False,
+    use_onehot: bool = False,
+    use_attention: bool = False,
+    use_cross_attention: bool = False,
+    ir_checkpoint: str = None,
+    use_untrained_ir: bool = False,
+    ir_hidden_dim: int = 128,
+    ir_out_dim: int = 64,
+    ir_num_layers: int = 3,
+    ir_kernel_size: int = 3,
+    freeze_ir: bool = True,
 ) -> nn.Module:
     """Train a single CNN on ALL puzzles' training examples together.
 
@@ -735,6 +787,8 @@ def train_on_all_puzzles(
         num_color_swap=num_color_swap,
         auto_augment=auto_augment,
         dihedral_only=dihedral_only,
+        color_only=color_only,
+        no_augment=no_augment,
     )
 
     print(f"Multi-puzzle dataset: {len(dataset.examples)} training examples from {len(dataset.puzzle_examples)} puzzles")
@@ -742,7 +796,26 @@ def train_on_all_puzzles(
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-    model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
+    # Create model with all architecture options
+    model = PixelErrorCNN(
+        hidden_dim=hidden_dim,
+        no_skip=no_skip,
+        num_layers=num_layers,
+        conv_depth=conv_depth,
+        kernel_size=kernel_size,
+        use_onehot=use_onehot,
+        out_kernel_size=out_kernel_size,
+        use_attention=use_attention,
+        use_cross_attention=use_cross_attention,
+        ir_checkpoint=ir_checkpoint,
+        use_untrained_ir=use_untrained_ir,
+        ir_hidden_dim=ir_hidden_dim,
+        ir_out_dim=ir_out_dim,
+        ir_num_layers=ir_num_layers,
+        ir_kernel_size=ir_kernel_size,
+        freeze_ir=freeze_ir,
+    ).to(DEVICE)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
 
@@ -1018,54 +1091,108 @@ def evaluate_puzzle(
     hidden_dim: int,
     num_negatives: int,
     dihedral_only: bool,
+    color_only: bool = False,
+    no_augment: bool = False,
     negative_type: str = "mixed",
     visualize: bool = False,
     verbose: bool = False,
-    auto_augment: bool = False,  # NEW
+    auto_augment: bool = False,
+    # Architecture options (matching train_pixel_error_cnn.py)
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    num_layers: int = 3,
+    conv_depth: int = 2,
+    kernel_size: int = 3,
+    out_kernel_size: int = 1,
+    no_skip: bool = False,
+    use_onehot: bool = False,
+    use_attention: bool = False,
+    use_cross_attention: bool = False,
+    ir_checkpoint: str = None,
+    use_untrained_ir: bool = False,
+    ir_hidden_dim: int = 128,
+    ir_out_dim: int = 64,
+    ir_num_layers: int = 3,
+    ir_kernel_size: int = 3,
+    freeze_ir: bool = True,
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
-    
+
     num_train = len(puzzle.get("train", []))
     test_examples = puzzle.get("test", [])
     num_test = sum(1 for ex in test_examples if "output" in ex)
-    
+
     if num_train == 0:
         return PuzzleResult(puzzle_id, 0, 0, 0, 0, 0, False, "no_train")
     if num_test == 0:
         return PuzzleResult(puzzle_id, num_train, 0, 0, 0, 0, False, "no_test_outputs")
-    
-    # NEW: Auto-detect augmentation strategy
+
+    # Auto-detect augmentation strategy
     if auto_augment:
         palette_analysis = analyze_puzzle_palettes(puzzle)
         use_dihedral_only = (palette_analysis["recommendation"] == "dihedral_only")
+        use_color_only = False
+        use_no_augment = False
         augmentation_reason = palette_analysis["reason"]
         augmentation_used = "dihedral_only" if use_dihedral_only else "full"
-        
+
         if verbose:
             print(f"  Palette analysis: {augmentation_used} ({augmentation_reason})")
             print(f"    Identical combined palettes: {palette_analysis['identical_combined_palettes']}")
             print(f"    Colors preserved: {palette_analysis['colors_preserved']}")
     else:
         use_dihedral_only = dihedral_only
-        augmentation_used = "dihedral_only" if dihedral_only else "full"
+        use_color_only = color_only
+        use_no_augment = no_augment
+        if no_augment:
+            augmentation_used = "none"
+        elif dihedral_only:
+            augmentation_used = "dihedral_only"
+        elif color_only:
+            augmentation_used = "color_only"
+        else:
+            augmentation_used = "full"
         augmentation_reason = "manual"
-    
+
     start = time.time()
     model = train_on_puzzle(
-        puzzle, epochs=epochs, hidden_dim=hidden_dim,
-        num_negatives=num_negatives, dihedral_only=use_dihedral_only,
+        puzzle,
+        epochs=epochs,
+        hidden_dim=hidden_dim,
+        lr=lr,
+        batch_size=batch_size,
+        num_negatives=num_negatives,
+        dihedral_only=use_dihedral_only,
+        color_only=use_color_only,
+        no_augment=use_no_augment,
         negative_type=negative_type,
-        verbose=verbose
+        verbose=verbose,
+        # Architecture options
+        num_layers=num_layers,
+        conv_depth=conv_depth,
+        kernel_size=kernel_size,
+        out_kernel_size=out_kernel_size,
+        no_skip=no_skip,
+        use_onehot=use_onehot,
+        use_attention=use_attention,
+        use_cross_attention=use_cross_attention,
+        ir_checkpoint=ir_checkpoint,
+        use_untrained_ir=use_untrained_ir,
+        ir_hidden_dim=ir_hidden_dim,
+        ir_out_dim=ir_out_dim,
+        ir_num_layers=ir_num_layers,
+        ir_kernel_size=ir_kernel_size,
+        freeze_ir=freeze_ir,
     )
     train_time = time.time() - start
-    
-    eval_results = evaluate_on_test(model, puzzle, puzzle_id=puzzle_id, 
+
+    eval_results = evaluate_on_test(model, puzzle, puzzle_id=puzzle_id,
                                      candidate_mode="zeros", visualize=visualize)
-    
+
     if "error" in eval_results:
-        return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False, 
+        return PuzzleResult(puzzle_id, num_train, num_test, train_time, 0, 0, False,
                            eval_results["error"], augmentation_used, augmentation_reason)
-    
+
     return PuzzleResult(
         puzzle_id=puzzle_id,
         num_train=num_train,
@@ -1322,10 +1449,30 @@ def main():
             puzzles,
             epochs=args.epochs,
             hidden_dim=args.hidden_dim,
+            lr=args.lr,
+            batch_size=args.batch_size,
             num_negatives=args.num_negatives,
             auto_augment=args.auto_augment,
             dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+            no_augment=args.no_augment,
             verbose=args.verbose,
+            # Architecture options
+            num_layers=args.num_layers,
+            conv_depth=args.conv_depth,
+            kernel_size=args.kernel_size,
+            out_kernel_size=args.out_kernel_size,
+            no_skip=args.no_skip,
+            use_onehot=args.use_onehot,
+            use_attention=args.use_attention,
+            use_cross_attention=args.use_cross_attention,
+            ir_checkpoint=args.ir_checkpoint,
+            use_untrained_ir=args.use_untrained_ir,
+            ir_hidden_dim=args.ir_hidden_dim,
+            ir_out_dim=args.ir_out_dim,
+            ir_num_layers=args.ir_num_layers,
+            ir_kernel_size=args.ir_kernel_size,
+            freeze_ir=args.freeze_ir,
         )
         train_time = time.time() - start_time
 
@@ -1411,10 +1558,30 @@ def main():
                 hidden_dim=args.hidden_dim,
                 num_negatives=args.num_negatives,
                 dihedral_only=args.dihedral_only,
+                color_only=args.color_only,
+                no_augment=args.no_augment,
                 negative_type=args.negative_type,
                 visualize=args.visualize,
                 verbose=args.verbose,
                 auto_augment=args.auto_augment,
+                # Architecture options
+                lr=args.lr,
+                batch_size=args.batch_size,
+                num_layers=args.num_layers,
+                conv_depth=args.conv_depth,
+                kernel_size=args.kernel_size,
+                out_kernel_size=args.out_kernel_size,
+                no_skip=args.no_skip,
+                use_onehot=args.use_onehot,
+                use_attention=args.use_attention,
+                use_cross_attention=args.use_cross_attention,
+                ir_checkpoint=args.ir_checkpoint,
+                use_untrained_ir=args.use_untrained_ir,
+                ir_hidden_dim=args.ir_hidden_dim,
+                ir_out_dim=args.ir_out_dim,
+                ir_num_layers=args.ir_num_layers,
+                ir_kernel_size=args.ir_kernel_size,
+                freeze_ir=args.freeze_ir,
             )
             results.append(result)
 

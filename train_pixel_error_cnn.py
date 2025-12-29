@@ -333,6 +333,22 @@ class IREncoder(nn.Module):
         state_dict = {k.replace('encoder.', ''): v
                       for k, v in ckpt['model_state_dict'].items()
                       if k.startswith('encoder.')}
+
+        # Handle old checkpoint format (conv1, bn1, ...) vs new format (convs.0, bns.0, ...)
+        if 'conv1.weight' in state_dict and 'convs.0.weight' not in state_dict:
+            # Map old keys to new keys
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                new_key = key
+                # Map convN -> convs.(N-1) for N in 1,2,3
+                for i in range(1, 4):
+                    new_key = new_key.replace(f'conv{i}.', f'convs.{i-1}.')
+                    new_key = new_key.replace(f'bn{i}.', f'bns.{i-1}.')
+                # Map conv4 -> proj (the final projection layer)
+                new_key = new_key.replace('conv4.', 'proj.')
+                new_state_dict[new_key] = value
+            state_dict = new_state_dict
+
         encoder.load_state_dict(state_dict)
         return encoder
 
