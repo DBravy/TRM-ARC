@@ -277,37 +277,52 @@ class UpNoSkip(nn.Module):
 
 class IREncoder(nn.Module):
     """
-    Instance Recognition encoder - produces 64-dim features per pixel.
+    Instance Recognition encoder - produces features per pixel.
 
-    This matches the architecture from ir_checkpoints/test.pt:
+    Default architecture matches ir_checkpoints/test.pt:
     - conv1: (10, 128, 3x3) with BatchNorm + ReLU
     - conv2: (128, 128, 3x3) with BatchNorm + ReLU
     - conv3: (128, 128, 3x3) with BatchNorm + ReLU
-    - conv4: (128, 64, 1x1) - final projection to 64 features
+    - conv4: (128, 64, 1x1) - final projection to out_dim features
+
+    Args:
+        hidden_dim: Number of channels in hidden conv layers (default: 128)
+        out_dim: Output feature dimension per pixel (default: 64)
+        num_layers: Number of 3x3 conv layers before projection (default: 3)
+        kernel_size: Kernel size for conv layers (default: 3)
     """
 
-    def __init__(self):
+    def __init__(self, hidden_dim: int = 128, out_dim: int = 64,
+                 num_layers: int = 3, kernel_size: int = 3):
         super().__init__()
-        self.conv1 = nn.Conv2d(10, 128, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(128)
-        self.conv2 = nn.Conv2d(128, 128, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 64, 1)
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        padding = (kernel_size - 1) // 2
+
+        # Build conv layers dynamically
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(num_layers):
+            in_ch = 10 if i == 0 else hidden_dim
+            self.convs.append(nn.Conv2d(in_ch, hidden_dim, kernel_size, padding=padding))
+            self.bns.append(nn.BatchNorm2d(hidden_dim))
+
+        # Final 1x1 projection to output dimension
+        self.proj = nn.Conv2d(hidden_dim, out_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: One-hot encoded grid (B, 10, H, W)
         Returns:
-            Features (B, H, W, 64)
+            Features (B, H, W, out_dim)
         """
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = self.conv4(x)  # (B, 64, H, W)
-        return x.permute(0, 2, 3, 1)  # (B, H, W, 64)
+        for conv, bn in zip(self.convs, self.bns):
+            x = F.relu(bn(conv(x)))
+        x = self.proj(x)  # (B, out_dim, H, W)
+        return x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, out_dim)
 
     @classmethod
     def from_checkpoint(cls, path: str, device=None):
@@ -351,7 +366,7 @@ class SpatialSelfAttention(nn.Module):
         N = H * W
 
         # Reshape to (B, N, C)
-        x_flat = x.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
+        x_flat = x.reshape(B, C, N).permute(0, 2, 1)  # (B, N, C)
 
         # Project to Q, K, V
         q = self.q_proj(x_flat)  # (B, N, C) - "what am I looking for?"
@@ -372,7 +387,7 @@ class SpatialSelfAttention(nn.Module):
         # Residual connection
         out = x_flat + attended
 
-        return out.permute(0, 2, 1).view(B, C, H, W)
+        return out.permute(0, 2, 1).reshape(B, C, H, W)
 
 
 class CrossAttention(nn.Module):
@@ -426,8 +441,8 @@ class CrossAttention(nn.Module):
         N = H * W
 
         # Flatten spatial dimensions
-        q_flat = query.view(B, N, C_q)       # (B, N, query_dim)
-        kv_flat = key_value.view(B, N, C_kv)  # (B, N, kv_dim)
+        q_flat = query.reshape(B, N, C_q)       # (B, N, query_dim)
+        kv_flat = key_value.reshape(B, N, C_kv)  # (B, N, kv_dim)
 
         # Project to proj_dim
         q = self.q_proj(q_flat)   # (B, N, proj_dim) - from output
@@ -451,7 +466,7 @@ class CrossAttention(nn.Module):
         # Residual connection: output embedding + attended input info
         out = q_flat + attended  # (B, N, query_dim)
 
-        return out.view(B, H, W, self.query_dim)
+        return out.reshape(B, H, W, self.query_dim)
 
 
 class PixelErrorCNN(nn.Module):
@@ -468,7 +483,10 @@ class PixelErrorCNN(nn.Module):
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
                  kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
                  use_attention: bool = False, use_cross_attention: bool = False,
-                 ir_checkpoint: str = None, freeze_ir: bool = True):
+                 ir_checkpoint: str = None, use_untrained_ir: bool = False,
+                 ir_hidden_dim: int = 128, ir_out_dim: int = 64,
+                 ir_num_layers: int = 3, ir_kernel_size: int = 3,
+                 freeze_ir: bool = True):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -481,6 +499,11 @@ class PixelErrorCNN(nn.Module):
         self.use_attention = use_attention
         self.use_cross_attention = use_cross_attention
         self.ir_checkpoint = ir_checkpoint
+        self.use_untrained_ir = use_untrained_ir
+        self.ir_hidden_dim = ir_hidden_dim
+        self.ir_out_dim = ir_out_dim
+        self.ir_num_layers = ir_num_layers
+        self.ir_kernel_size = ir_kernel_size
         self.freeze_ir = freeze_ir
 
         if use_onehot:
@@ -496,15 +519,31 @@ class PixelErrorCNN(nn.Module):
 
         # Instance Recognition encoder for cross-attention (optional)
         self.ir_encoder = None
-        if use_cross_attention and ir_checkpoint:
-            self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
-            if freeze_ir:
+        self.ir_self_attention = None
+        if use_cross_attention and (ir_checkpoint or use_untrained_ir):
+            if ir_checkpoint:
+                self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                ir_feature_dim = 64  # Pretrained checkpoint uses 64
+            else:
+                # Use randomly initialized IR encoder (for ablation study)
+                self.ir_encoder = IREncoder(
+                    hidden_dim=ir_hidden_dim,
+                    out_dim=ir_out_dim,
+                    num_layers=ir_num_layers,
+                    kernel_size=ir_kernel_size
+                )
+                ir_feature_dim = ir_out_dim
+            if freeze_ir and ir_checkpoint:
+                # Only freeze if using pretrained weights
                 for p in self.ir_encoder.parameters():
                     p.requires_grad = False
-            # Cross-attention: query_dim=embed_dim (16 or 11), kv_dim=64 (IR output)
+            # Self-attention on IR features before cross-attention
+            # All input pixels attend to each other before being queried by output
+            self.ir_self_attention = SpatialSelfAttention(ir_feature_dim)
+            # Cross-attention: query_dim=embed_dim (16 or 11), kv_dim=ir_feature_dim
             self.cross_attention = CrossAttention(
                 query_dim=embed_dim,
-                kv_dim=64,
+                kv_dim=ir_feature_dim,
                 proj_dim=embed_dim  # Project to embedding dimension
             )
         elif use_cross_attention:
@@ -572,8 +611,13 @@ class PixelErrorCNN(nn.Module):
             if self.ir_encoder is not None:
                 # Use IR encoder for input features (keys/values)
                 inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
-                inp_onehot = inp_onehot.permute(0, 3, 1, 2)  # (B, 10, H, W)
+                inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
                 ir_features = self.ir_encoder(inp_onehot)    # (B, H, W, 64)
+                # Apply self-attention so all input pixels can attend to each other
+                # before being queried by output pixels in cross-attention
+                ir_features = ir_features.permute(0, 3, 1, 2).contiguous()  # (B, 64, H, W)
+                ir_features = self.ir_self_attention(ir_features)  # (B, 64, H, W)
+                ir_features = ir_features.permute(0, 2, 3, 1).contiguous()  # (B, H, W, 64)
                 out_emb = self.cross_attention(query=out_emb, key_value=ir_features)
             else:
                 # Original behavior - use same embedding type for input
@@ -685,6 +729,11 @@ class PixelErrorCNN(nn.Module):
         use_attention = args.get('use_attention', False)
         use_cross_attention = args.get('use_cross_attention', False)
         ir_checkpoint = args.get('ir_checkpoint', None)
+        use_untrained_ir = args.get('use_untrained_ir', False)
+        ir_hidden_dim = args.get('ir_hidden_dim', 128)
+        ir_out_dim = args.get('ir_out_dim', 64)
+        ir_num_layers = args.get('ir_num_layers', 3)
+        ir_kernel_size = args.get('ir_kernel_size', 3)
         freeze_ir = args.get('freeze_ir', True)
 
         model = cls(
@@ -698,6 +747,11 @@ class PixelErrorCNN(nn.Module):
             use_attention=use_attention,
             use_cross_attention=use_cross_attention,
             ir_checkpoint=ir_checkpoint,
+            use_untrained_ir=use_untrained_ir,
+            ir_hidden_dim=ir_hidden_dim,
+            ir_out_dim=ir_out_dim,
+            ir_num_layers=ir_num_layers,
+            ir_kernel_size=ir_kernel_size,
             freeze_ir=freeze_ir
         )
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -2065,6 +2119,16 @@ def main():
                         help="Add cross-attention on embeddings: output pixels attend to input pixels before convolutions")
     parser.add_argument("--ir-checkpoint", type=str, default=None,
                         help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
+    parser.add_argument("--use-untrained-ir", action="store_true",
+                        help="Use randomly initialized IR encoder instead of pretrained (for ablation study)")
+    parser.add_argument("--ir-hidden-dim", type=int, default=128,
+                        help="Hidden dimension for untrained IR encoder (default: 128)")
+    parser.add_argument("--ir-out-dim", type=int, default=64,
+                        help="Output feature dimension for untrained IR encoder (default: 64)")
+    parser.add_argument("--ir-num-layers", type=int, default=3,
+                        help="Number of conv layers in untrained IR encoder (default: 3)")
+    parser.add_argument("--ir-kernel-size", type=int, default=3,
+                        help="Kernel size for untrained IR encoder (default: 3)")
     parser.add_argument("--freeze-ir", action="store_true", default=True,
                         help="Freeze IR encoder weights during training (default: True)")
     parser.add_argument("--no-freeze-ir", dest="freeze_ir", action="store_false",
@@ -2273,6 +2337,11 @@ def main():
         use_attention=args.use_attention,
         use_cross_attention=args.use_cross_attention,
         ir_checkpoint=args.ir_checkpoint,
+        use_untrained_ir=args.use_untrained_ir,
+        ir_hidden_dim=args.ir_hidden_dim,
+        ir_out_dim=args.ir_out_dim,
+        ir_num_layers=args.ir_num_layers,
+        ir_kernel_size=args.ir_kernel_size,
         freeze_ir=args.freeze_ir
     )
     model = model.to(DEVICE)
@@ -2287,7 +2356,11 @@ def main():
     if args.use_cross_attention:
         if args.ir_checkpoint:
             freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
-            print(f"Cross-attention: ENABLED with IR encoder ({freeze_str}) from {args.ir_checkpoint}")
+            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}) from {args.ir_checkpoint}")
+        elif args.use_untrained_ir:
+            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init, for ablation)")
+            print(f"  IR encoder config: hidden={args.ir_hidden_dim}, out={args.ir_out_dim}, "
+                  f"layers={args.ir_num_layers}, kernel={args.ir_kernel_size}x{args.ir_kernel_size}")
         else:
             print("Cross-attention: ENABLED (output pixels attend to input pixels on embeddings)")
 
@@ -2329,7 +2402,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'args': vars(args),
                 'epoch': epoch,
-                'best_val_color_accuracy': best_val_metric,
+                'best_val_metric': best_val_metric,
             }
             torch.save(checkpoint, args.save_path)
 
@@ -2352,38 +2425,38 @@ def main():
         print("="*60)
         print("These examples were NOT seen during training (even with augmentation).")
         print("This tests if the CNN learned the actual transformation RULE.\n")
-        
+
         # Load best model
         checkpoint = torch.load(args.save_path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        
+
         test_results = evaluate_test_examples(
             model, test_eval_dataset, DEVICE,
             verbose=True, visualize=args.visualize,
             recursive_iters=args.recursive_iters
         )
-        
-        print(f"\n{'â”€'*60}")
+
+        print(f"\n{'-'*60}")
         print(f"TEST SET RESULTS:")
         print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
         print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
-        print(f"{'â”€'*60}")
-        
+        print(f"{'-'*60}")
+
         if test_results['perfect_rate'] == 1.0:
-            print("\nðŸŽ‰ PERFECT GENERALIZATION! The CNN learned the transformation rule!")
+            print("\nPERFECT GENERALIZATION! The CNN learned the transformation rule!")
             print("   This suggests the CNN can solve this puzzle from training examples alone.")
         elif test_results['pixel_accuracy'] > 0.95:
-            print("\nâœ“ Strong generalization - CNN learned most of the rule.")
+            print("\nStrong generalization - CNN learned most of the rule.")
             print("  Minor errors may be edge cases or noise.")
         elif test_results['pixel_accuracy'] > 0.8:
             print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
         else:
-            print("\nâœ— Poor generalization - CNN may have memorized training examples.")
+            print("\nPoor generalization - CNN may have memorized training examples.")
             print("  The transformation rule was not learned.")
-        
+
         # Also show comparison with training examples
-        print("\n" + "â”€"*60)
+        print("\n" + "-"*60)
         print("Comparison - Evaluating on TRAINING examples (sanity check):")
         train_eval_dataset = TestEvalDataset(train_puzzles, test_only=False)
         train_results = evaluate_test_examples(
@@ -2391,24 +2464,27 @@ def main():
             verbose=True, visualize=False,  # Don't visualize training examples
             recursive_iters=args.recursive_iters
         )
-        print(f"\nTRAINING SET RESULTS:")
-        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
-        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
-        
         # Summary comparison
         print("\n" + "="*60)
         print("GENERALIZATION SUMMARY")
         print("="*60)
+
+        print(f"\nTRAINING SET RESULTS:")
+        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
+        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
+
+        print(f"\nComparison:")
         print(f"  Training examples: {train_results['pixel_accuracy']:.2%} accuracy, {train_results['perfect_rate']:.2%} perfect")
         print(f"  Test examples:     {test_results['pixel_accuracy']:.2%} accuracy, {test_results['perfect_rate']:.2%} perfect")
         gap = train_results['pixel_accuracy'] - test_results['pixel_accuracy']
+
         if gap > 0.1:
             print(f"  Gap: {gap:.2%} - significant overfitting to training examples")
         elif gap > 0.02:
             print(f"  Gap: {gap:.2%} - mild overfitting")
         else:
             print(f"  Gap: {gap:.2%} - good generalization!")
-        
+
         # =========================================================================
         # LAYER-WISE ABLATION ANALYSIS
         # =========================================================================

@@ -16,6 +16,13 @@ Usage:
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100 --max-puzzles 50
     python eval_cnn_generalization.py --auto-augment  # NEW: automatic detection
+    python eval_cnn_generalization.py --eval-only  # Only evaluate on evaluation puzzles (not training)
+
+    # Full example matching train_pixel_error_cnn.py options:
+    python eval_cnn_generalization.py --epochs 100 --num-negatives 200 --negative-type all_zeros \\
+        --num-layers 0 --hidden-dim 8 --kernel-size 3 --conv-depth 3 --out-kernel-size 3 \\
+        --dihedral-only --use-cross-attention --use-onehot --use-untrained-ir \\
+        --ir-hidden-dim 32 --ir-out-dim 32 --ir-num-layers 3 --eval-only --visualize
 """
 
 import argparse
@@ -32,6 +39,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+# Import model and utilities from train_pixel_error_cnn.py
+from train_pixel_error_cnn import (
+    PixelErrorCNN,
+    dihedral_transform,
+    random_color_permutation,
+    apply_augmentation,
+    get_random_augmentation,
+    corrupt_output,
+    corrupt_single_pixel,
+    corrupt_few_pixels,
+    generate_all_zeros,
+    generate_constant_fill,
+    generate_random_noise,
+    generate_color_swap,
+)
 
 # Determine device
 if torch.cuda.is_available():
@@ -147,190 +170,21 @@ def analyze_puzzle_palettes(puzzle: Dict) -> Dict:
 
 
 # =============================================================================
-# Model (copied from train_pixel_error_cnn.py for standalone use)
+# Model imported from train_pixel_error_cnn.py
 # =============================================================================
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Down(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.pool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_ch, out_ch)
-        )
-
-    def forward(self, x):
-        return self.pool_conv(x)
-
-
-class Up(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_ch, out_ch)
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        diff_h = x2.size(2) - x1.size(2)
-        diff_w = x2.size(3) - x1.size(3)
-        x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2,
-                       diff_h // 2, diff_h - diff_h // 2])
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-
-class PixelErrorCNN(nn.Module):
-    def __init__(self, hidden_dim: int = 64, num_classes: int = 10):
-        super().__init__()
-        self.num_classes = num_classes
-        
-        self.input_embed = nn.Embedding(NUM_COLORS, 16)
-        self.output_embed = nn.Embedding(NUM_COLORS, 16)
-        
-        in_channels = 64  # force_comparison=True: 16+16+16+16
-        base_ch = hidden_dim
-
-        self.inc = DoubleConv(in_channels, base_ch)
-        self.down1 = Down(base_ch, base_ch * 2)
-        self.down2 = Down(base_ch * 2, base_ch * 4)
-        self.down3 = Down(base_ch * 4, base_ch * 8)
-        self.up1 = Up(base_ch * 8, base_ch * 4)
-        self.up2 = Up(base_ch * 4, base_ch * 2)
-        self.up3 = Up(base_ch * 2, base_ch)
-        self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
-
-    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        inp_emb = self.input_embed(input_grid)
-        out_emb = self.output_embed(output_grid)
-        
-        diff = inp_emb - out_emb
-        prod = inp_emb * out_emb
-        x = torch.cat([inp_emb, out_emb, diff, prod], dim=-1)
-        x = x.permute(0, 3, 1, 2).contiguous()
-
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x = self.up1(x4, x3)
-        x = self.up2(x, x2)
-        x = self.up3(x, x1)
-        return self.outc(x)
-
-    def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        return self.forward(input_grid, output_grid).argmax(dim=1)
+# PixelErrorCNN and related utilities are imported at top of file
 
 
 # =============================================================================
-# Augmentation
+# Augmentation - imported from train_pixel_error_cnn.py
 # =============================================================================
-
-def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
-    if tid == 0: return arr
-    elif tid == 1: return np.rot90(arr, k=1)
-    elif tid == 2: return np.rot90(arr, k=2)
-    elif tid == 3: return np.rot90(arr, k=3)
-    elif tid == 4: return np.fliplr(arr)
-    elif tid == 5: return np.flipud(arr)
-    elif tid == 6: return arr.T
-    elif tid == 7: return np.fliplr(np.rot90(arr, k=1))
-    return arr
-
-
-def random_color_permutation() -> np.ndarray:
-    return np.concatenate([
-        np.array([0], dtype=np.uint8),
-        np.random.permutation(np.arange(1, 10, dtype=np.uint8))
-    ])
+# dihedral_transform, random_color_permutation, apply_augmentation, etc. imported at top
 
 
 # =============================================================================
-# Corruption utilities (matching train_pixel_error_cnn.py)
+# Corruption utilities - imported from train_pixel_error_cnn.py
 # =============================================================================
-
-def corrupt_single_pixel(grid: np.ndarray) -> np.ndarray:
-    result = grid.copy()
-    h, w = grid.shape
-    r, c = random.randint(0, h-1), random.randint(0, w-1)
-    current = result[r, c]
-    new_color = random.choice([x for x in range(10) if x != current])
-    result[r, c] = new_color
-    return result
-
-
-def corrupt_few_pixels(grid: np.ndarray, num_pixels: int = None) -> np.ndarray:
-    result = grid.copy()
-    if num_pixels is None:
-        num_pixels = random.randint(2, 5)
-    h, w = grid.shape
-    for _ in range(num_pixels):
-        r, c = random.randint(0, h-1), random.randint(0, w-1)
-        current = result[r, c]
-        new_color = random.choice([x for x in range(10) if x != current])
-        result[r, c] = new_color
-    return result
-
-
-def corrupt_output(grid: np.ndarray) -> np.ndarray:
-    if random.random() < 0.7:
-        return corrupt_single_pixel(grid)
-    else:
-        return corrupt_few_pixels(grid)
-
-
-def generate_all_zeros(grid: np.ndarray) -> np.ndarray:
-    return np.zeros_like(grid)
-
-
-def generate_constant_fill(grid: np.ndarray) -> np.ndarray:
-    color = random.randint(1, 9)
-    return np.full_like(grid, color)
-
-
-def generate_random_noise(grid: np.ndarray) -> np.ndarray:
-    return np.random.randint(0, 10, size=grid.shape, dtype=np.uint8)
-
-
-def generate_color_swap(grid: np.ndarray) -> np.ndarray:
-    result = grid.copy()
-    unique_colors = np.unique(grid)
-    non_zero_colors = unique_colors[unique_colors > 0]
-    
-    if len(non_zero_colors) == 0:
-        color_from = 0
-        color_to = random.randint(1, 9)
-    else:
-        color_from = random.choice(non_zero_colors)
-        available_colors = [c for c in range(10) if c != color_from]
-        color_to = random.choice(available_colors)
-    
-    if random.random() < 0.5:
-        result[grid == color_from] = color_to
-    else:
-        swap_locations = np.argwhere(grid == color_from)
-        if len(swap_locations) > 0:
-            ratio = random.choice([0.25, 0.33, 0.5, 0.67, 0.75])
-            num_to_swap = max(1, int(len(swap_locations) * ratio))
-            indices_to_swap = random.sample(range(len(swap_locations)), num_to_swap)
-            for idx in indices_to_swap:
-                r, c = swap_locations[idx]
-                result[r, c] = color_to
-    return result
+# corrupt_output, generate_all_zeros, generate_constant_fill, etc. imported at top
 
 
 # =============================================================================
@@ -710,22 +564,42 @@ def train_on_puzzle(
     batch_size: int = 32,
     num_negatives: int = 8,
     dihedral_only: bool = True,
+    color_only: bool = False,
+    no_augment: bool = False,
     negative_type: str = "mixed",
     verbose: bool = False,
+    # Architecture options (matching train_pixel_error_cnn.py)
+    num_layers: int = 3,
+    conv_depth: int = 2,
+    kernel_size: int = 3,
+    out_kernel_size: int = 1,
+    no_skip: bool = False,
+    use_onehot: bool = False,
+    use_attention: bool = False,
+    use_cross_attention: bool = False,
+    ir_checkpoint: str = None,
+    use_untrained_ir: bool = False,
+    ir_hidden_dim: int = 128,
+    ir_out_dim: int = 64,
+    ir_num_layers: int = 3,
+    ir_kernel_size: int = 3,
+    freeze_ir: bool = True,
 ) -> nn.Module:
     """Train a CNN on a single puzzle's training examples.
-    
+
     Uses full augmentation strategy matching train_pixel_error_cnn.py:
     - Positive samples (correct candidate)
     - Corrupted samples
     - Wrong input samples
     - Mismatched augmentation samples
     - Degenerate outputs (zeros, constant, noise, color_swap)
+
+    Architecture options are passed through to PixelErrorCNN.
     """
-    
+
     # Distribute negatives based on negative_type
     num_positives = max(1, num_negatives // 4)
-    
+
     if negative_type == "mixed":
         num_corrupted = max(1, int(num_negatives * 0.35))
         num_wrong_input = max(1, int(num_negatives * 0.15))
@@ -744,7 +618,7 @@ def train_on_puzzle(
         num_all_zeros = 0
         num_constant_fill = 0
         num_random_noise = 0
-        
+
         if negative_type == "all_zeros":
             num_all_zeros = num_negatives
         elif negative_type == "corrupted":
@@ -759,7 +633,7 @@ def train_on_puzzle(
             num_wrong_input = num_negatives
         elif negative_type == "mismatched_aug":
             num_mismatched_aug = num_negatives
-    
+
     dataset = SinglePuzzleDataset(
         puzzle,
         num_positives=num_positives,
@@ -771,13 +645,34 @@ def train_on_puzzle(
         num_random_noise=num_random_noise,
         num_color_swap=num_color_swap,
         dihedral_only=dihedral_only,
+        color_only=color_only,
+        no_augment=no_augment,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-    model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
+
+    # Create model with all architecture options
+    model = PixelErrorCNN(
+        hidden_dim=hidden_dim,
+        no_skip=no_skip,
+        num_layers=num_layers,
+        conv_depth=conv_depth,
+        kernel_size=kernel_size,
+        use_onehot=use_onehot,
+        out_kernel_size=out_kernel_size,
+        use_attention=use_attention,
+        use_cross_attention=use_cross_attention,
+        ir_checkpoint=ir_checkpoint,
+        use_untrained_ir=use_untrained_ir,
+        ir_hidden_dim=ir_hidden_dim,
+        ir_out_dim=ir_out_dim,
+        ir_num_layers=ir_num_layers,
+        ir_kernel_size=ir_kernel_size,
+        freeze_ir=freeze_ir,
+    ).to(DEVICE)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
-    
+
     model.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -785,16 +680,16 @@ def train_on_puzzle(
             inp = inp.to(DEVICE)
             candidate = candidate.to(DEVICE)
             target = target.to(DEVICE)
-            
+
             optimizer.zero_grad()
             logits = model(inp, candidate)
             loss = F.cross_entropy(logits, target)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        
+
         scheduler.step()
-        
+
         if verbose and (epoch + 1) % 20 == 0:
             print(f"    Epoch {epoch+1}: loss={total_loss/len(loader):.4f}")
 
@@ -1188,24 +1083,58 @@ def evaluate_puzzle(
 # Main
 # =============================================================================
 
-def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined") -> Dict:
+def load_puzzles(
+    dataset_name: str,
+    data_root: str = "kaggle/combined",
+    eval_only: bool = False,
+    training_only: bool = False,
+) -> Dict:
+    """
+    Load ARC puzzles from disk.
+
+    Args:
+        dataset_name: "arc-agi-1" or "arc-agi-2"
+        data_root: Path to data directory
+        eval_only: If True, only load evaluation puzzles (400 puzzles for benchmarking)
+        training_only: If True, only load training puzzles (400 puzzles for development)
+
+    Returns:
+        Dictionary mapping puzzle_id -> puzzle data
+    """
     config = {
-        "arc-agi-1": {"subsets": ["training", "evaluation"]},
-        "arc-agi-2": {"subsets": ["training2", "evaluation2"]},
+        "arc-agi-1": {
+            "training": "training",
+            "evaluation": "evaluation",
+        },
+        "arc-agi-2": {
+            "training": "training2",
+            "evaluation": "evaluation2",
+        },
     }
-    
+
+    # Determine which subsets to load
+    if eval_only and training_only:
+        raise ValueError("Cannot specify both --eval-only and --training-only")
+    elif eval_only:
+        subsets = [config[dataset_name]["evaluation"]]
+    elif training_only:
+        subsets = [config[dataset_name]["training"]]
+    else:
+        subsets = [config[dataset_name]["training"], config[dataset_name]["evaluation"]]
+
     all_puzzles = {}
-    
-    for subset in config[dataset_name]["subsets"]:
+
+    for subset in subsets:
         challenges_path = f"{data_root}/arc-agi_{subset}_challenges.json"
         solutions_path = f"{data_root}/arc-agi_{subset}_solutions.json"
-        
+
         if not os.path.exists(challenges_path):
+            print(f"Warning: {challenges_path} not found")
             continue
-        
+
         with open(challenges_path) as f:
             puzzles = json.load(f)
-        
+
         if os.path.exists(solutions_path):
             with open(solutions_path) as f:
                 solutions = json.load(f)
@@ -1214,57 +1143,158 @@ def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined") -> Dict:
                     for i, sol in enumerate(solutions[pid]):
                         if i < len(puzzles[pid]["test"]):
                             puzzles[pid]["test"][i]["output"] = sol
-        
+
         all_puzzles.update(puzzles)
-    
+        print(f"Loaded {len(puzzles)} puzzles from {subset}")
+
     return all_puzzles
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CNN generalization across ARC puzzles")
+
+    # Dataset options
     parser.add_argument("--dataset", type=str, default="arc-agi-1", choices=["arc-agi-1", "arc-agi-2"])
     parser.add_argument("--data-root", type=str, default="kaggle/combined")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Only evaluate on evaluation puzzles (400 puzzles, for benchmarking)")
+    parser.add_argument("--training-only", action="store_true",
+                        help="Only evaluate on training puzzles (400 puzzles, for development)")
+    parser.add_argument("--max-puzzles", type=int, default=None,
+                        help="Max puzzles to evaluate (for quick testing)")
+
+    # Training options
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--num-negatives", type=int, default=8, 
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--num-negatives", type=int, default=8,
                         help="Negatives per example (distributed across corruption types)")
-    parser.add_argument("--max-puzzles", type=int, default=None, help="Max puzzles to evaluate (for quick testing)")
-    parser.add_argument("--dihedral-only", action="store_true", help="Only dihedral augmentation (no color permutation)")
-    parser.add_argument("--auto-augment", action="store_true",
-                        help="NEW: Automatically detect color semantics and choose augmentation strategy")
-    parser.add_argument("--multi-puzzle", action="store_true",
-                        help="Train single CNN on all puzzles together (vs per-puzzle training)")
     parser.add_argument("--negative-type", type=str, default="mixed",
-                        choices=["mixed", "all_zeros", "corrupted", "random_noise", 
+                        choices=["mixed", "all_zeros", "corrupted", "random_noise",
                                  "constant_fill", "color_swap", "wrong_input", "mismatched_aug"],
                         help="Type of negatives: mixed=all types (default), or single type for ablation")
+
+    # Architecture options (matching train_pixel_error_cnn.py)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--num-layers", type=int, default=3, choices=[0, 1, 2, 3],
+                        help="Number of encoder/decoder layers (0-3). 0 = just inc+outc, no down/up. Default: 3")
+    parser.add_argument("--conv-depth", type=int, default=2,
+                        help="Number of conv layers per block (1=single, 2=double, 3=triple, etc.). Default: 2")
+    parser.add_argument("--kernel-size", type=int, default=3,
+                        help="Kernel size for convolutional layers (default: 3)")
+    parser.add_argument("--out-kernel-size", type=int, default=1,
+                        help="Kernel size for output conv layer (default: 1)")
+    parser.add_argument("--no-skip", action="store_true",
+                        help="Remove skip connections - forces all info through bottleneck")
+    parser.add_argument("--use-onehot", action="store_true",
+                        help="Use one-hot + nonzero mask encoding (11 ch/grid) instead of learned embeddings (16 ch/grid)")
+    parser.add_argument("--use-attention", action="store_true",
+                        help="Add spatial self-attention before output layer")
+    parser.add_argument("--use-cross-attention", action="store_true",
+                        help="Add cross-attention: output pixels attend to input pixels before convolutions")
+
+    # IR (Instance Recognition) encoder options
+    parser.add_argument("--ir-checkpoint", type=str, default=None,
+                        help="Path to pretrained IR encoder checkpoint (requires --use-cross-attention)")
+    parser.add_argument("--use-untrained-ir", action="store_true",
+                        help="Use randomly initialized IR encoder instead of pretrained")
+    parser.add_argument("--ir-hidden-dim", type=int, default=128,
+                        help="Hidden dimension for untrained IR encoder (default: 128)")
+    parser.add_argument("--ir-out-dim", type=int, default=64,
+                        help="Output feature dimension for untrained IR encoder (default: 64)")
+    parser.add_argument("--ir-num-layers", type=int, default=3,
+                        help="Number of conv layers in untrained IR encoder (default: 3)")
+    parser.add_argument("--ir-kernel-size", type=int, default=3,
+                        help="Kernel size for untrained IR encoder (default: 3)")
+    parser.add_argument("--freeze-ir", action="store_true", default=True,
+                        help="Freeze IR encoder weights during training (default: True)")
+    parser.add_argument("--no-freeze-ir", dest="freeze_ir", action="store_false",
+                        help="Allow IR encoder weights to be fine-tuned")
+
+    # Augmentation options
+    parser.add_argument("--dihedral-only", action="store_true",
+                        help="Only dihedral augmentation (no color permutation)")
+    parser.add_argument("--color-only", action="store_true",
+                        help="Only color permutation augmentation (no rotations/flips)")
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Disable all augmentation")
+    parser.add_argument("--auto-augment", action="store_true",
+                        help="Automatically detect color semantics and choose augmentation strategy")
+
+    # Evaluation modes
+    parser.add_argument("--multi-puzzle", action="store_true",
+                        help="Train single CNN on all puzzles together (vs per-puzzle training)")
+
+    # Other options
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--visualize", action="store_true", 
+    parser.add_argument("--visualize", action="store_true",
                         help="Show visual comparison of predictions vs targets")
     parser.add_argument("--output", type=str, default="cnn_generalization_results.json")
+
     args = parser.parse_args()
-    
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    
+
+    # Validate augmentation options
+    aug_flags = [args.dihedral_only, args.color_only, args.no_augment]
+    if sum(aug_flags) > 1:
+        print("Error: Can only specify one of --dihedral-only, --color-only, --no-augment")
+        return
+
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
+    if args.eval_only:
+        print(f"Subset: EVALUATION ONLY (400 puzzles for benchmarking)")
+    elif args.training_only:
+        print(f"Subset: TRAINING ONLY (400 puzzles for development)")
+    else:
+        print(f"Subset: ALL (training + evaluation)")
     print(f"Training mode: {'MULTI-PUZZLE (single CNN for all)' if args.multi_puzzle else 'PER-PUZZLE (one CNN each)'}")
     print(f"Epochs: {args.epochs}")
 
+    # Print augmentation mode
     if args.auto_augment:
         print(f"Augmentation: AUTO (palette-based detection)")
+    elif args.no_augment:
+        print(f"Augmentation: NONE")
+    elif args.dihedral_only:
+        print(f"Augmentation: dihedral-only (rotations/flips)")
+    elif args.color_only:
+        print(f"Augmentation: color-only (permutations)")
     else:
-        print(f"Augmentation: {'dihedral-only' if args.dihedral_only else 'full'}")
+        print(f"Augmentation: full (dihedral + color)")
+
+    # Print architecture
+    print(f"Architecture: layers={args.num_layers}, hidden={args.hidden_dim}, "
+          f"conv_depth={args.conv_depth}, kernel={args.kernel_size}")
+    if args.use_cross_attention:
+        if args.use_untrained_ir:
+            print(f"  Cross-attention: untrained IR encoder (hidden={args.ir_hidden_dim}, "
+                  f"out={args.ir_out_dim}, layers={args.ir_num_layers})")
+        elif args.ir_checkpoint:
+            print(f"  Cross-attention: pretrained IR encoder from {args.ir_checkpoint}")
+        else:
+            print(f"  Cross-attention: same embeddings for Q/K/V")
+    if args.use_onehot:
+        print(f"  Encoding: one-hot + nonzero mask (11 channels)")
+    else:
+        print(f"  Encoding: learned embeddings (16 channels)")
+    if args.no_skip:
+        print(f"  Skip connections: DISABLED")
 
     print(f"Num negatives: {args.num_negatives}")
     print(f"Negative type: {args.negative_type}")
     print(f"Evaluation: Blank candidate (model must generate from scratch)")
-    
+
     # Load puzzles
-    puzzles = load_puzzles(args.dataset, args.data_root)
+    puzzles = load_puzzles(
+        args.dataset, args.data_root,
+        eval_only=args.eval_only,
+        training_only=args.training_only
+    )
     puzzle_ids = list(puzzles.keys())
 
     # Filter to puzzles with test outputs
