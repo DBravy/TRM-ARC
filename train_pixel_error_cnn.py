@@ -1911,6 +1911,63 @@ def run_layer_ablation(
     }
 
 
+def create_output_region_mask(output_dims: torch.Tensor, grid_size: int = GRID_SIZE) -> torch.Tensor:
+    """
+    Create a mask that is 1.0 for the actual output region and 0.0 for padding.
+
+    Args:
+        output_dims: (B, 2) tensor with (height, width) for each sample
+        grid_size: Size of the padded grid (default: 30)
+
+    Returns:
+        mask: (B, grid_size, grid_size) tensor with 1.0 in content region, 0.0 in padding
+    """
+    batch_size = output_dims.size(0)
+    device = output_dims.device
+
+    # Create coordinate grids
+    rows = torch.arange(grid_size, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, H)
+    cols = torch.arange(grid_size, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, W)
+
+    # Get heights and widths for each sample
+    heights = output_dims[:, 0].unsqueeze(1)  # (B, 1)
+    widths = output_dims[:, 1].unsqueeze(1)   # (B, 1)
+
+    # Create row and column masks
+    row_mask = (rows < heights).float()  # (B, H)
+    col_mask = (cols < widths).float()   # (B, W)
+
+    # Combine to get 2D mask: outer product
+    mask = row_mask.unsqueeze(2) * col_mask.unsqueeze(1)  # (B, H, W)
+
+    return mask
+
+
+def masked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cross-entropy loss only on masked (content) pixels.
+
+    Args:
+        logits: (B, C, H, W) prediction logits
+        targets: (B, H, W) target class indices
+        mask: (B, H, W) binary mask (1.0 for content, 0.0 for padding)
+
+    Returns:
+        Scalar loss averaged over masked pixels
+    """
+    # Compute per-pixel loss
+    per_pixel_loss = F.cross_entropy(logits, targets, reduction='none')  # (B, H, W)
+
+    # Apply mask and compute mean over content pixels only
+    masked_loss = per_pixel_loss * mask
+    num_content_pixels = mask.sum()
+
+    if num_content_pixels > 0:
+        return masked_loss.sum() / num_content_pixels
+    else:
+        return masked_loss.sum()  # Fallback (shouldn't happen)
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -1946,14 +2003,17 @@ def train_epoch(
 
         output = model(input_grid, output_grid)
 
+        # Create mask for actual output region (excludes padding)
+        content_mask = create_output_region_mask(output_dims)
+
         # Handle both dict (with size) and tensor (pixel only) outputs
         if isinstance(output, dict):
             pixel_logits = output['pixel_logits']
             height_logits = output['height_logits']
             width_logits = output['width_logits']
 
-            # Pixel loss
-            pixel_loss = F.cross_entropy(pixel_logits, target_colors)
+            # Pixel loss - MASKED to only compute on actual output region
+            pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
 
             # Size loss (convert sizes 1-30 to classes 0-29)
             target_h = output_dims[:, 0] - 1
@@ -1965,7 +2025,8 @@ def train_epoch(
             loss = pixel_loss + size_weight * size_loss
         else:
             pixel_logits = output
-            pixel_loss = F.cross_entropy(pixel_logits, target_colors)
+            # Pixel loss - MASKED to only compute on actual output region
+            pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
             loss = pixel_loss
             size_loss = torch.tensor(0.0)
 
@@ -1975,14 +2036,16 @@ def train_epoch(
         with torch.no_grad():
             pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
 
-            # Overall color accuracy
-            correct = (pred_colors == target_colors).sum().item()
-            total = target_colors.numel()
+            # Overall color accuracy - only on content pixels (not padding)
+            content_mask_bool = content_mask.bool()
+            correct = ((pred_colors == target_colors) & content_mask_bool).sum().item()
+            total = content_mask.sum().item()
             total_color_correct += correct
             total_pixels += total
 
             # Accuracy on error pixels only (pixels where output != target)
-            error_mask = (pixel_mask == 0)  # pixels that are wrong
+            # Also restrict to content region
+            error_mask = (pixel_mask == 0) & content_mask_bool  # pixels that are wrong AND in content
             if error_mask.sum() > 0:
                 error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
                 total_error_color_correct += error_correct
@@ -2060,13 +2123,17 @@ def evaluate(
 
             output = model(input_grid, output_grid)
 
+            # Create mask for actual output region (excludes padding)
+            content_mask = create_output_region_mask(output_dims)
+
             # Handle both dict (with size) and tensor (pixel only) outputs
             if isinstance(output, dict):
                 pixel_logits = output['pixel_logits']
                 height_logits = output['height_logits']
                 width_logits = output['width_logits']
 
-                pixel_loss = F.cross_entropy(pixel_logits, target_colors)
+                # Pixel loss - MASKED to only compute on actual output region
+                pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
 
                 target_h = output_dims[:, 0] - 1
                 target_w = output_dims[:, 1] - 1
@@ -2084,27 +2151,32 @@ def evaluate(
                 total_size_loss += size_loss.item()
             else:
                 pixel_logits = output
-                pixel_loss = F.cross_entropy(pixel_logits, target_colors)
+                # Pixel loss - MASKED to only compute on actual output region
+                pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
                 loss = pixel_loss
 
             pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
 
-            # Overall color accuracy
-            correct = (pred_colors == target_colors).sum().item()
-            total = target_colors.numel()
+            # Overall color accuracy - only on content pixels (not padding)
+            content_mask_bool = content_mask.bool()
+            correct = ((pred_colors == target_colors) & content_mask_bool).sum().item()
+            total = content_mask.sum().item()
             total_color_correct += correct
             total_pixels += total
 
-            # Accuracy on error pixels only
-            error_mask = (pixel_mask == 0)
+            # Accuracy on error pixels only - also restrict to content region
+            error_mask = (pixel_mask == 0) & content_mask_bool
             if error_mask.sum() > 0:
                 error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
                 total_error_color_correct += error_correct
                 total_error_pixels += error_mask.sum().item()
 
-            # Perfect predictions (all pixels correct)
-            batch_perfect = (pred_colors == target_colors).all(dim=-1).all(dim=-1).sum().item()
-            total_perfect += batch_perfect
+            # Perfect predictions (all content pixels correct)
+            # Check per-sample if all content pixels are correct
+            for b in range(input_grid.size(0)):
+                h, w = output_dims[b, 0].item(), output_dims[b, 1].item()
+                if (pred_colors[b, :h, :w] == target_colors[b, :h, :w]).all():
+                    total_perfect += 1
             total_samples += input_grid.size(0)
 
             total_loss += loss.item()
@@ -2317,11 +2389,19 @@ def _find_grid_bounds(grid: np.ndarray, max_size: int = 30) -> Tuple[int, int]:
 
 
 def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
-    """Visualize predictions for color prediction"""
+    """Visualize predictions for color prediction.
+
+    If model.predict_size=True, uses predicted size to constrain pixel predictions.
+    """
     model.eval()
+
+    # Check if model predicts size
+    uses_size_prediction = getattr(model, 'predict_size', False)
 
     print("\n" + "="*80)
     print("Sample Predictions (Color Mode - Color Prediction)")
+    if uses_size_prediction:
+        print("(Using PREDICTED size for pixel prediction region)")
     print("="*80)
 
     # Get samples of each type with their counts
@@ -2369,6 +2449,13 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
             with torch.no_grad():
                 pred_colors = model.predict_colors(inp_t, out_t)[0].cpu().numpy()
 
+                # Get predicted size if model supports it
+                if uses_size_prediction:
+                    pred_h, pred_w = model.predict_size_from_input(inp_t)
+                    pred_h, pred_w = pred_h.item(), pred_w.item()
+                else:
+                    pred_h, pred_w = None, None
+
             input_np = input_grid.numpy()
             output_np = output_grid.numpy()
             target_np = target_colors.numpy()
@@ -2380,35 +2467,71 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
 
             # Also check target bounds (may differ from output for corrupted samples)
             tgt_r, tgt_c = _find_grid_bounds(target_np)
-            out_r = max(out_r, tgt_r)
-            out_c = max(out_c, tgt_c)
+            true_out_r = max(out_r, tgt_r)
+            true_out_c = max(out_c, tgt_c)
 
             # For all-zeros output, use mask to find content region
-            if out_r == 1 and out_c == 1:
+            if true_out_r == 1 and true_out_c == 1:
                 error_positions = np.where(mask_np == 0)
                 if len(error_positions[0]) > 0:
-                    out_r = min(error_positions[0].max() + 1, 30)
-                    out_c = min(error_positions[1].max() + 1, 30)
+                    true_out_r = min(error_positions[0].max() + 1, 30)
+                    true_out_c = min(error_positions[1].max() + 1, 30)
 
-            num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
-            num_correct_preds = int((pred_colors[:out_r, :out_c] == target_np[:out_r, :out_c]).sum())
-            total_pixels = out_r * out_c
+            # Use predicted size if available, otherwise use true size
+            if uses_size_prediction and pred_h is not None:
+                disp_r, disp_c = pred_h, pred_w
+                size_correct = (pred_h == true_out_r and pred_w == true_out_c)
+            else:
+                disp_r, disp_c = true_out_r, true_out_c
+                size_correct = True
 
-            print(f"\nInput: {inp_r}Ã—{inp_c} â†’ Output: {out_r}Ã—{out_c}")
-            print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
+            # Calculate accuracy within the predicted/display region
+            compare_r, compare_c = min(disp_r, true_out_r), min(disp_c, true_out_c)
+            num_errors = int((mask_np[:true_out_r, :true_out_c] == 0).sum())
+            num_correct_preds = int((pred_colors[:compare_r, :compare_c] == target_np[:compare_r, :compare_c]).sum())
+
+            # Print size info
+            if uses_size_prediction:
+                if size_correct:
+                    print(f"\nInput: {inp_r}x{inp_c} -> Output: {true_out_r}x{true_out_c} \033[92m(size correct)\033[0m")
+                else:
+                    print(f"\nInput: {inp_r}x{inp_c} -> True: {true_out_r}x{true_out_c}, \033[91mPred: {pred_h}x{pred_w} (size wrong)\033[0m")
+            else:
+                print(f"\nInput: {inp_r}x{inp_c} -> Output: {true_out_r}x{true_out_c}")
+            print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{compare_r*compare_c}")
 
             # Print INPUT separately with its own dimensions
-            print(f"\nINPUT ({inp_r}Ã—{inp_c}):")
+            print(f"\nINPUT ({inp_r}x{inp_c}):")
             for r in range(inp_r):
                 inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
                 print(f"  {inp_row}")
 
-            # Print OUTPUT, TARGET, PREDICTED with output dimensions
-            print(f"\n{'OUTPUT':<25} {'TARGET':<25} {'PREDICTED':<25}")
-            for r in range(out_r):
-                out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
-                tgt_row = " ".join(f"{target_np[r, c]}" for c in range(out_c))
-                pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(out_c))
+            # Print OUTPUT, TARGET, PREDICTED
+            # OUTPUT and TARGET use true size, PREDICTED uses predicted size (if size prediction enabled)
+            max_r = max(true_out_r, disp_r)
+
+            pred_label = f"PREDICTED ({disp_r}x{disp_c})" if uses_size_prediction else "PREDICTED"
+            print(f"\n{'OUTPUT':<25} {'TARGET':<25} {pred_label:<25}")
+
+            for r in range(max_r):
+                # OUTPUT column (true size)
+                if r < true_out_r:
+                    out_row = " ".join(f"{output_np[r, c]}" for c in range(true_out_c))
+                else:
+                    out_row = ""
+
+                # TARGET column (true size)
+                if r < true_out_r:
+                    tgt_row = " ".join(f"{target_np[r, c]}" for c in range(true_out_c))
+                else:
+                    tgt_row = ""
+
+                # PREDICTED column (predicted size)
+                if r < disp_r:
+                    pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(disp_c))
+                else:
+                    pred_row = ""
+
                 print(f"  {out_row:<23} {tgt_row:<23} {pred_row:<23}")
 
     print("="*80 + "\n")

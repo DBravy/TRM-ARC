@@ -105,9 +105,19 @@ function showTab(tabName) {
 function renderArcGrid(grid, container, cellSize = 15, options = {}) {
     container.innerHTML = '';
 
-    const rows = grid.length;
-    const cols = grid[0] ? grid[0].length : 0;
-    const { clickable = false, onCellClick = null, highlightBounds = null } = options;
+    const fullRows = grid.length;
+    const fullCols = grid[0] ? grid[0].length : 0;
+    const {
+        clickable = false,
+        onCellClick = null,
+        highlightBounds = null,
+        cropHeight = null,  // Crop to this height (null = show full grid)
+        cropWidth = null    // Crop to this width (null = show full grid)
+    } = options;
+
+    // Use cropped dimensions if specified
+    const rows = cropHeight !== null ? Math.min(cropHeight, fullRows) : fullRows;
+    const cols = cropWidth !== null ? Math.min(cropWidth, fullCols) : fullCols;
 
     const gridEl = document.createElement('div');
     gridEl.className = 'arc-grid';
@@ -287,6 +297,10 @@ async function loadModelInfo() {
                 <div class="info-label">Encoding</div>
                 <div class="info-value">${modelInfo.use_onehot ? 'One-Hot' : 'Learned'}</div>
             </div>
+            <div class="info-item">
+                <div class="info-label">Size Pred</div>
+                <div class="info-value" style="color: ${modelInfo.predict_size ? '#2ECC40' : '#888'};">${modelInfo.predict_size ? 'Yes' : 'No'}</div>
+            </div>
         `;
     } catch (err) {
         console.error('Failed to load model info:', err);
@@ -432,9 +446,18 @@ async function loadPuzzlePreview(puzzleId) {
         if (puzzle.train && puzzle.train.length > 0) {
             const ex = puzzle.train[0];
 
+            // Get actual dimensions
+            const inputH = ex.input.length;
+            const inputW = ex.input[0] ? ex.input[0].length : 0;
+            const outputH = ex.output.length;
+            const outputW = ex.output[0] ? ex.output[0].length : 0;
+
             const inputContainer = document.createElement('div');
             inputContainer.className = 'arc-grid-container';
-            renderArcGrid(ex.input, inputContainer, 8);
+            renderArcGrid(ex.input, inputContainer, 8, {
+                cropHeight: inputH,
+                cropWidth: inputW
+            });
 
             const arrow = document.createElement('span');
             arrow.textContent = '\u2192';
@@ -442,7 +465,10 @@ async function loadPuzzlePreview(puzzleId) {
 
             const outputContainer = document.createElement('div');
             outputContainer.className = 'arc-grid-container';
-            renderArcGrid(ex.output, outputContainer, 8);
+            renderArcGrid(ex.output, outputContainer, 8, {
+                cropHeight: outputH,
+                cropWidth: outputW
+            });
 
             container.appendChild(inputContainer);
             container.appendChild(arrow);
@@ -581,49 +607,76 @@ function renderIOPanel() {
         container.appendChild(note);
     }
 
-    // Input grid
+    // Get actual output size
+    const actualH = flowData.output_shape[0];
+    const actualW = flowData.output_shape[1];
+
+    // Get predicted size if available
+    const hasSizePrediction = flowData.has_size_prediction || false;
+    const predH = flowData.predicted_height || actualH;
+    const predW = flowData.predicted_width || actualW;
+
+    // Input grid (cropped to actual input size)
     const inputDiv = document.createElement('div');
     inputDiv.className = 'arc-grid-container';
     const inputLabel = document.createElement('div');
     inputLabel.className = 'grid-label';
     inputLabel.textContent = `Input (${flowData.input_shape[0]}x${flowData.input_shape[1]})`;
     inputDiv.appendChild(inputLabel);
-    renderArcGrid(flowData.input_grid, inputDiv, 12);
+    renderArcGrid(flowData.input_grid, inputDiv, 12, {
+        cropHeight: flowData.input_shape[0],
+        cropWidth: flowData.input_shape[1]
+    });
     container.appendChild(inputDiv);
 
-    // Expected output grid
+    // Expected output grid (cropped to actual output size)
     const outputDiv = document.createElement('div');
     outputDiv.className = 'arc-grid-container';
     const outputLabel = document.createElement('div');
     outputLabel.className = 'grid-label';
-    outputLabel.textContent = `Expected (${flowData.output_shape[0]}x${flowData.output_shape[1]})`;
+    outputLabel.textContent = `Expected (${actualH}x${actualW})`;
     outputDiv.appendChild(outputLabel);
-    renderArcGrid(flowData.output_grid, outputDiv, 12);
+    renderArcGrid(flowData.output_grid, outputDiv, 12, {
+        cropHeight: actualH,
+        cropWidth: actualW
+    });
     container.appendChild(outputDiv);
 
-    // Prediction grid (clickable for pixel trace)
+    // Prediction grid - crop to predicted size if model has size prediction, else actual size
     const predDiv = document.createElement('div');
     predDiv.className = 'arc-grid-container';
     const predLabel = document.createElement('div');
     predLabel.className = 'grid-label';
-    predLabel.innerHTML = 'Prediction <span style="font-size: 0.8em; color: #00d4ff;">(click to trace)</span>';
+
+    if (hasSizePrediction) {
+        // Show predicted size with correctness indicator
+        const sizeCorrect = (predH === actualH && predW === actualW);
+        const sizeColor = sizeCorrect ? '#2ECC40' : '#FF851B';
+        predLabel.innerHTML = `Prediction <span style="color: ${sizeColor};">(${predH}x${predW})</span> <span style="font-size: 0.8em; color: #00d4ff;">(click to trace)</span>`;
+    } else {
+        predLabel.innerHTML = `Prediction (${actualH}x${actualW}) <span style="font-size: 0.8em; color: #00d4ff;">(click to trace)</span>`;
+    }
     predDiv.appendChild(predLabel);
+
+    // Crop prediction to predicted size (model's output) or actual size
+    const displayH = hasSizePrediction ? predH : actualH;
+    const displayW = hasSizePrediction ? predW : actualW;
     renderArcGrid(flowData.prediction, predDiv, 12, {
         clickable: true,
-        onCellClick: handlePixelClick
+        onCellClick: handlePixelClick,
+        cropHeight: displayH,
+        cropWidth: displayW
     });
     container.appendChild(predDiv);
 
-    // Calculate accuracy
+    // Calculate accuracy on the actual output region
     const expected = flowData.output_grid;
     const predicted = flowData.prediction;
-    const outH = flowData.output_shape[0];
-    const outW = flowData.output_shape[1];
 
     let correct = 0;
-    let total = outH * outW;
-    for (let r = 0; r < outH; r++) {
-        for (let c = 0; c < outW; c++) {
+    let total = actualH * actualW;
+    for (let r = 0; r < actualH; r++) {
+        for (let c = 0; c < actualW; c++) {
             if (expected[r][c] === predicted[r][c]) {
                 correct++;
             }
@@ -643,6 +696,24 @@ function renderIOPanel() {
         <span style="color: #888; font-size: 0.85em;"> (${correct}/${total} pixels)</span>
     `;
     container.appendChild(accDiv);
+
+    // Size prediction accuracy if model has it enabled
+    if (hasSizePrediction) {
+        const sizeCorrect = (predH === actualH && predW === actualW);
+        const heightCorrect = (predH === actualH);
+        const widthCorrect = (predW === actualW);
+
+        const sizeDiv = document.createElement('div');
+        sizeDiv.style.cssText = 'margin-top: 8px; padding: 8px; border-radius: 4px; background: #0a1428; font-size: 0.85em;';
+        sizeDiv.innerHTML = `
+            <div style="color: #888; margin-bottom: 4px;">Size Prediction:</div>
+            <div style="display: flex; gap: 15px; justify-content: center;">
+                <span>Height: <span style="color: ${heightCorrect ? '#2ECC40' : '#FF4136'};">${predH}</span> / ${actualH} ${heightCorrect ? '✓' : '✗'}</span>
+                <span>Width: <span style="color: ${widthCorrect ? '#2ECC40' : '#FF4136'};">${predW}</span> / ${actualW} ${widthCorrect ? '✓' : '✗'}</span>
+            </div>
+        `;
+        container.appendChild(sizeDiv);
+    }
 }
 
 function displayLayer(idx) {
@@ -734,12 +805,25 @@ function displayLayer(idx) {
     // Render overlay
     const overlayPanel = document.getElementById('overlay-panel');
 
+    // Get actual and predicted sizes for cropping
+    const actualH = flowData.output_shape[0];
+    const actualW = flowData.output_shape[1];
+    const hasSizePrediction = flowData.has_size_prediction || false;
+    const predH = flowData.predicted_height || actualH;
+    const predW = flowData.predicted_width || actualW;
+    const displayH = hasSizePrediction ? predH : actualH;
+    const displayW = hasSizePrediction ? predW : actualW;
+
     if (isOutput) {
         // For output layer, show prediction with color legend
-        overlayPanel.innerHTML = '<h4 style="color: #888; margin-bottom: 10px;">Model Prediction</h4>';
+        const sizeInfo = hasSizePrediction ? ` (${displayH}x${displayW})` : ` (${actualH}x${actualW})`;
+        overlayPanel.innerHTML = `<h4 style="color: #888; margin-bottom: 10px;">Model Prediction${sizeInfo}</h4>`;
         const predContainer = document.createElement('div');
         predContainer.className = 'arc-grid-container';
-        renderArcGrid(flowData.prediction, predContainer, 6);
+        renderArcGrid(flowData.prediction, predContainer, 6, {
+            cropHeight: displayH,
+            cropWidth: displayW
+        });
         overlayPanel.appendChild(predContainer);
     } else {
         overlayPanel.innerHTML = '<h4 style="color: #888; margin-bottom: 10px;">Mean Activation</h4>';

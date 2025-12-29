@@ -215,9 +215,24 @@ def capture_layer_flow(
     else:
         candidate_tensor = expected_tensor
 
+    # Check if model has size prediction enabled
+    has_size_prediction = getattr(model, 'predict_size', False)
+    predicted_height = None
+    predicted_width = None
+
     # Run inference with candidate (zeros for real test, or expected for comparison)
     with torch.no_grad():
         logits = model(inp_tensor, candidate_tensor)
+
+        # Handle dict output from size-predicting models
+        if isinstance(logits, dict):
+            pixel_logits = logits['pixel_logits']
+            height_logits = logits['height_logits']
+            width_logits = logits['width_logits']
+            # Get predicted size (convert from 0-29 class to 1-30 size)
+            predicted_height = int(height_logits.argmax(dim=1).item()) + 1
+            predicted_width = int(width_logits.argmax(dim=1).item()) + 1
+            logits = pixel_logits  # Use pixel logits for the rest of processing
 
         # Get prediction based on model type
         if model.num_classes == 1:
@@ -288,7 +303,7 @@ def capture_layer_flow(
     # What candidate was used for inference
     candidate_grid = candidate_tensor.squeeze(0).cpu().numpy()
 
-    return {
+    result = {
         'input_grid': inp_pad.tolist(),
         'output_grid': out_pad.tolist(),  # This is the EXPECTED output
         'candidate_grid': candidate_grid.tolist(),  # This is what was passed to model (zeros or expected)
@@ -304,6 +319,16 @@ def capture_layer_flow(
             'output': out_emb.tolist()
         }
     }
+
+    # Add size prediction info if model has it enabled
+    if has_size_prediction and predicted_height is not None:
+        result['has_size_prediction'] = True
+        result['predicted_height'] = predicted_height
+        result['predicted_width'] = predicted_width
+    else:
+        result['has_size_prediction'] = False
+
+    return result
 
 
 # =============================================================================
@@ -341,6 +366,7 @@ def api_model_info():
         'use_onehot': model.use_onehot,
         'use_attention': getattr(model, 'use_attention', False),
         'use_cross_attention': getattr(model, 'use_cross_attention', False),
+        'predict_size': getattr(model, 'predict_size', False),
         'encoding': 'one-hot (11 ch/grid)' if model.use_onehot else 'learned embeddings (16 ch/grid)',
         'num_classes': model.num_classes,
         'layer_names': layer_names,
