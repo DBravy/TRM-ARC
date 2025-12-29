@@ -15,7 +15,8 @@ NEW: Automatic augmentation selection based on palette analysis
 Usage:
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100
     python eval_cnn_generalization.py --dataset arc-agi-1 --epochs 100 --max-puzzles 50
-    python eval_cnn_generalization.py --auto-augment  # NEW: automatic detection
+    python eval_cnn_generalization.py --auto-augment  # Automatic augmentation detection
+    python eval_cnn_generalization.py --try-both  # Try full first, then dihedral if not 100%
     python eval_cnn_generalization.py --eval-only  # Only evaluate on evaluation puzzles (not training)
 
     # Full example matching train_pixel_error_cnn.py options:
@@ -1464,6 +1465,8 @@ def main():
                         help="Disable all augmentation")
     parser.add_argument("--auto-augment", action="store_true",
                         help="Automatically detect color semantics and choose augmentation strategy")
+    parser.add_argument("--try-both", action="store_true",
+                        help="Try full augmentation first; if not 100%% on test, try dihedral-only and use best result")
 
     # Evaluation modes
     parser.add_argument("--multi-puzzle", action="store_true",
@@ -1488,6 +1491,15 @@ def main():
         print("Error: Can only specify one of --dihedral-only, --color-only, --no-augment")
         return
 
+    # --try-both is mutually exclusive with other augmentation flags
+    if args.try_both and (args.auto_augment or args.dihedral_only or args.color_only or args.no_augment):
+        print("Error: --try-both cannot be used with --auto-augment, --dihedral-only, --color-only, or --no-augment")
+        return
+
+    if args.try_both and args.multi_puzzle:
+        print("Error: --try-both is only supported in per-puzzle mode, not --multi-puzzle")
+        return
+
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
     if args.eval_only:
@@ -1500,7 +1512,9 @@ def main():
     print(f"Epochs: {args.epochs}")
 
     # Print augmentation mode
-    if args.auto_augment:
+    if args.try_both:
+        print(f"Augmentation: TRY-BOTH (full first, dihedral-only if not 100%)")
+    elif args.auto_augment:
         print(f"Augmentation: AUTO (palette-based detection)")
     elif args.no_augment:
         print(f"Augmentation: NONE")
@@ -1674,45 +1688,188 @@ def main():
 
         results: List[PuzzleResult] = []
 
-        for puzzle_id in tqdm(puzzle_ids, desc="Puzzles"):
-            result = evaluate_puzzle(
-                puzzle_id, puzzles[puzzle_id],
-                epochs=args.epochs,
-                hidden_dim=args.hidden_dim,
-                num_negatives=args.num_negatives,
-                dihedral_only=args.dihedral_only,
-                color_only=args.color_only,
-                no_augment=args.no_augment,
-                negative_type=args.negative_type,
-                visualize=args.visualize,
-                verbose=args.verbose,
-                auto_augment=args.auto_augment,
-                # Architecture options
-                lr=args.lr,
-                batch_size=args.batch_size,
-                num_layers=args.num_layers,
-                conv_depth=args.conv_depth,
-                kernel_size=args.kernel_size,
-                out_kernel_size=args.out_kernel_size,
-                no_skip=args.no_skip,
-                use_onehot=args.use_onehot,
-                use_attention=args.use_attention,
-                use_cross_attention=args.use_cross_attention,
-                ir_checkpoint=args.ir_checkpoint,
-                use_untrained_ir=args.use_untrained_ir,
-                ir_hidden_dim=args.ir_hidden_dim,
-                ir_out_dim=args.ir_out_dim,
-                ir_num_layers=args.ir_num_layers,
-                ir_kernel_size=args.ir_kernel_size,
-                freeze_ir=args.freeze_ir,
-                # Size prediction options
-                predict_size=args.predict_size,
-                size_weight=args.size_weight,
-                size_hidden_dim=args.size_hidden_dim,
-            )
-            results.append(result)
+        # Track try-both statistics
+        full_won = 0
+        dihedral_won = 0
+        skipped_second = 0
 
-            if args.verbose or result.all_perfect:
+        for puzzle_id in tqdm(puzzle_ids, desc="Puzzles"):
+            if args.try_both:
+                # TRY-BOTH MODE: Train with full augmentation first
+                result_full = evaluate_puzzle(
+                    puzzle_id, puzzles[puzzle_id],
+                    epochs=args.epochs,
+                    hidden_dim=args.hidden_dim,
+                    num_negatives=args.num_negatives,
+                    dihedral_only=False,  # Full augmentation
+                    color_only=False,
+                    no_augment=False,
+                    negative_type=args.negative_type,
+                    visualize=False,  # Don't visualize first attempt
+                    verbose=args.verbose,
+                    auto_augment=False,
+                    lr=args.lr,
+                    batch_size=args.batch_size,
+                    num_layers=args.num_layers,
+                    conv_depth=args.conv_depth,
+                    kernel_size=args.kernel_size,
+                    out_kernel_size=args.out_kernel_size,
+                    no_skip=args.no_skip,
+                    use_onehot=args.use_onehot,
+                    use_attention=args.use_attention,
+                    use_cross_attention=args.use_cross_attention,
+                    ir_checkpoint=args.ir_checkpoint,
+                    use_untrained_ir=args.use_untrained_ir,
+                    ir_hidden_dim=args.ir_hidden_dim,
+                    ir_out_dim=args.ir_out_dim,
+                    ir_num_layers=args.ir_num_layers,
+                    ir_kernel_size=args.ir_kernel_size,
+                    freeze_ir=args.freeze_ir,
+                    predict_size=args.predict_size,
+                    size_weight=args.size_weight,
+                    size_hidden_dim=args.size_hidden_dim,
+                )
+
+                # If 100% perfect with full augmentation, use that result
+                if result_full.all_perfect:
+                    result = result_full
+                    result.augmentation_used = "full"
+                    result.augmentation_reason = "try_both_full_perfect"
+                    skipped_second += 1
+                    full_won += 1
+                    if args.verbose:
+                        print(f"  {puzzle_id}: ✓ PERFECT with full aug ({result.train_time:.1f}s) - skipping dihedral")
+                else:
+                    # Try dihedral-only
+                    result_dihedral = evaluate_puzzle(
+                        puzzle_id, puzzles[puzzle_id],
+                        epochs=args.epochs,
+                        hidden_dim=args.hidden_dim,
+                        num_negatives=args.num_negatives,
+                        dihedral_only=True,  # Dihedral only
+                        color_only=False,
+                        no_augment=False,
+                        negative_type=args.negative_type,
+                        visualize=False,  # Don't visualize second attempt either
+                        verbose=args.verbose,
+                        auto_augment=False,
+                        lr=args.lr,
+                        batch_size=args.batch_size,
+                        num_layers=args.num_layers,
+                        conv_depth=args.conv_depth,
+                        kernel_size=args.kernel_size,
+                        out_kernel_size=args.out_kernel_size,
+                        no_skip=args.no_skip,
+                        use_onehot=args.use_onehot,
+                        use_attention=args.use_attention,
+                        use_cross_attention=args.use_cross_attention,
+                        ir_checkpoint=args.ir_checkpoint,
+                        use_untrained_ir=args.use_untrained_ir,
+                        ir_hidden_dim=args.ir_hidden_dim,
+                        ir_out_dim=args.ir_out_dim,
+                        ir_num_layers=args.ir_num_layers,
+                        ir_kernel_size=args.ir_kernel_size,
+                        freeze_ir=args.freeze_ir,
+                        predict_size=args.predict_size,
+                        size_weight=args.size_weight,
+                        size_hidden_dim=args.size_hidden_dim,
+                    )
+
+                    # Use whichever has better pixel accuracy
+                    if result_dihedral.pixel_accuracy > result_full.pixel_accuracy:
+                        result = result_dihedral
+                        result.augmentation_used = "dihedral_only"
+                        result.augmentation_reason = "try_both_dihedral_better"
+                        result.train_time = result_full.train_time + result_dihedral.train_time
+                        dihedral_won += 1
+                    else:
+                        result = result_full
+                        result.augmentation_used = "full"
+                        result.augmentation_reason = "try_both_full_better"
+                        result.train_time = result_full.train_time + result_dihedral.train_time
+                        full_won += 1
+
+                    if args.verbose:
+                        print(f"  {puzzle_id}: full={result_full.pixel_accuracy:.1%}, dihedral={result_dihedral.pixel_accuracy:.1%} -> {result.augmentation_used} ({result.train_time:.1f}s)")
+
+                # Visualize the final result if requested
+                if args.visualize and not result.all_perfect:
+                    # Re-evaluate with visualization for the winning augmentation
+                    _ = evaluate_puzzle(
+                        puzzle_id, puzzles[puzzle_id],
+                        epochs=args.epochs,
+                        hidden_dim=args.hidden_dim,
+                        num_negatives=args.num_negatives,
+                        dihedral_only=(result.augmentation_used == "dihedral_only"),
+                        color_only=False,
+                        no_augment=False,
+                        negative_type=args.negative_type,
+                        visualize=True,
+                        verbose=False,
+                        auto_augment=False,
+                        lr=args.lr,
+                        batch_size=args.batch_size,
+                        num_layers=args.num_layers,
+                        conv_depth=args.conv_depth,
+                        kernel_size=args.kernel_size,
+                        out_kernel_size=args.out_kernel_size,
+                        no_skip=args.no_skip,
+                        use_onehot=args.use_onehot,
+                        use_attention=args.use_attention,
+                        use_cross_attention=args.use_cross_attention,
+                        ir_checkpoint=args.ir_checkpoint,
+                        use_untrained_ir=args.use_untrained_ir,
+                        ir_hidden_dim=args.ir_hidden_dim,
+                        ir_out_dim=args.ir_out_dim,
+                        ir_num_layers=args.ir_num_layers,
+                        ir_kernel_size=args.ir_kernel_size,
+                        freeze_ir=args.freeze_ir,
+                        predict_size=args.predict_size,
+                        size_weight=args.size_weight,
+                        size_hidden_dim=args.size_hidden_dim,
+                    )
+
+                results.append(result)
+            else:
+                # Standard single-augmentation mode
+                result = evaluate_puzzle(
+                    puzzle_id, puzzles[puzzle_id],
+                    epochs=args.epochs,
+                    hidden_dim=args.hidden_dim,
+                    num_negatives=args.num_negatives,
+                    dihedral_only=args.dihedral_only,
+                    color_only=args.color_only,
+                    no_augment=args.no_augment,
+                    negative_type=args.negative_type,
+                    visualize=args.visualize,
+                    verbose=args.verbose,
+                    auto_augment=args.auto_augment,
+                    # Architecture options
+                    lr=args.lr,
+                    batch_size=args.batch_size,
+                    num_layers=args.num_layers,
+                    conv_depth=args.conv_depth,
+                    kernel_size=args.kernel_size,
+                    out_kernel_size=args.out_kernel_size,
+                    no_skip=args.no_skip,
+                    use_onehot=args.use_onehot,
+                    use_attention=args.use_attention,
+                    use_cross_attention=args.use_cross_attention,
+                    ir_checkpoint=args.ir_checkpoint,
+                    use_untrained_ir=args.use_untrained_ir,
+                    ir_hidden_dim=args.ir_hidden_dim,
+                    ir_out_dim=args.ir_out_dim,
+                    ir_num_layers=args.ir_num_layers,
+                    ir_kernel_size=args.ir_kernel_size,
+                    freeze_ir=args.freeze_ir,
+                    # Size prediction options
+                    predict_size=args.predict_size,
+                    size_weight=args.size_weight,
+                    size_hidden_dim=args.size_hidden_dim,
+                )
+                results.append(result)
+
+            if not args.try_both and (args.verbose or result.all_perfect):
                 status = "✓ PERFECT" if result.all_perfect else f"✗ {result.pixel_accuracy:.1%}"
                 aug_info = f" [{result.augmentation_used}]" if args.auto_augment else ""
                 print(f"  {puzzle_id}: {status} ({result.train_time:.1f}s){aug_info}")
@@ -1737,6 +1894,34 @@ def main():
             avg_time = sum(r.train_time for r in valid_results) / len(valid_results)
             print(f"Average pixel accuracy: {avg_accuracy:.2%}")
             print(f"Average training time: {avg_time:.1f}s")
+
+        # Try-both strategy breakdown
+        if args.try_both:
+            print(f"\n{'─'*60}")
+            print("TRY-BOTH STRATEGY BREAKDOWN")
+            print(f"{'─'*60}")
+            print(f"Full augmentation won: {full_won} puzzles ({100*full_won/max(len(valid_results),1):.1f}%)")
+            print(f"  - Perfect on first try (skipped dihedral): {skipped_second}")
+            print(f"  - Better than dihedral: {full_won - skipped_second}")
+            print(f"Dihedral-only won: {dihedral_won} puzzles ({100*dihedral_won/max(len(valid_results),1):.1f}%)")
+
+            # Show accuracy by winning augmentation
+            full_results = [r for r in valid_results if r.augmentation_used == "full"]
+            dihedral_results = [r for r in valid_results if r.augmentation_used == "dihedral_only"]
+
+            if full_results:
+                full_perfect = sum(1 for r in full_results if r.all_perfect)
+                full_avg_acc = sum(r.pixel_accuracy for r in full_results) / len(full_results)
+                print(f"\n  Full augmentation puzzles ({len(full_results)}):")
+                print(f"    Perfect: {full_perfect} ({100*full_perfect/len(full_results):.1f}%)")
+                print(f"    Avg accuracy: {full_avg_acc:.2%}")
+
+            if dihedral_results:
+                dihedral_perfect = sum(1 for r in dihedral_results if r.all_perfect)
+                dihedral_avg_acc = sum(r.pixel_accuracy for r in dihedral_results) / len(dihedral_results)
+                print(f"\n  Dihedral-only puzzles ({len(dihedral_results)}):")
+                print(f"    Perfect: {dihedral_perfect} ({100*dihedral_perfect/len(dihedral_results):.1f}%)")
+                print(f"    Avg accuracy: {dihedral_avg_acc:.2%}")
 
         # Augmentation strategy breakdown (if auto_augment)
         if args.auto_augment:
@@ -1789,24 +1974,34 @@ def main():
         if perfect_results:
             print(f"\nPerfect generalization puzzles ({len(perfect_results)}):")
             for r in sorted(perfect_results, key=lambda x: x.puzzle_id)[:20]:
-                aug_info = f" [{r.augmentation_used}]" if args.auto_augment else ""
+                aug_info = f" [{r.augmentation_used}]" if (args.auto_augment or args.try_both) else ""
                 print(f"  {r.puzzle_id} (train={r.num_train}, test={r.num_test}, time={r.train_time:.1f}s){aug_info}")
             if len(perfect_results) > 20:
                 print(f"  ... and {len(perfect_results) - 20} more")
 
         # Save results
+        summary_data = {
+            "total_puzzles": len(puzzle_ids),
+            "valid_evaluations": len(valid_results),
+            "perfect_count": len(perfect_results),
+            "perfect_rate": len(perfect_results) / max(len(valid_results), 1),
+            "high_acc_count": len(high_acc_results),
+            "avg_pixel_accuracy": avg_accuracy,
+            "avg_train_time": avg_time,
+        }
+
+        # Add try-both statistics if applicable
+        if args.try_both:
+            summary_data["try_both"] = {
+                "full_won": full_won,
+                "dihedral_won": dihedral_won,
+                "skipped_second": skipped_second,
+            }
+
         output_data = {
             "config": vars(args),
             "mode": "per-puzzle",
-            "summary": {
-                "total_puzzles": len(puzzle_ids),
-                "valid_evaluations": len(valid_results),
-                "perfect_count": len(perfect_results),
-                "perfect_rate": len(perfect_results) / max(len(valid_results), 1),
-                "high_acc_count": len(high_acc_results),
-                "avg_pixel_accuracy": avg_accuracy,
-                "avg_train_time": avg_time,
-            },
+            "summary": summary_data,
             "results": [
                 {
                     "puzzle_id": r.puzzle_id,
