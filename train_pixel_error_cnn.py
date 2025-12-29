@@ -326,8 +326,11 @@ class IREncoder(nn.Module):
 
     @classmethod
     def from_checkpoint(cls, path: str, device=None):
-        """Load encoder weights from an instance recognition checkpoint."""
-        encoder = cls()
+        """Load encoder weights from an instance recognition checkpoint.
+
+        Automatically infers architecture (hidden_dim, out_dim, num_layers, kernel_size)
+        from the checkpoint's state_dict.
+        """
         ckpt = torch.load(path, map_location=device or 'cpu', weights_only=False)
         # Extract encoder weights from full model checkpoint
         state_dict = {k.replace('encoder.', ''): v
@@ -349,6 +352,18 @@ class IREncoder(nn.Module):
                 new_state_dict[new_key] = value
             state_dict = new_state_dict
 
+        # Infer architecture from state_dict
+        # hidden_dim: output channels of first conv layer
+        hidden_dim = state_dict['convs.0.weight'].shape[0]
+        # out_dim: output channels of projection layer
+        out_dim = state_dict['proj.weight'].shape[0]
+        # num_layers: count conv layers
+        num_layers = sum(1 for k in state_dict if k.startswith('convs.') and k.endswith('.weight'))
+        # kernel_size: from first conv layer weight shape
+        kernel_size = state_dict['convs.0.weight'].shape[2]
+
+        encoder = cls(hidden_dim=hidden_dim, out_dim=out_dim,
+                      num_layers=num_layers, kernel_size=kernel_size)
         encoder.load_state_dict(state_dict)
         return encoder
 
@@ -539,7 +554,7 @@ class PixelErrorCNN(nn.Module):
         if use_cross_attention and (ir_checkpoint or use_untrained_ir):
             if ir_checkpoint:
                 self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
-                ir_feature_dim = 64  # Pretrained checkpoint uses 64
+                ir_feature_dim = self.ir_encoder.out_dim  # Get from loaded checkpoint
             else:
                 # Use randomly initialized IR encoder (for ablation study)
                 self.ir_encoder = IREncoder(
