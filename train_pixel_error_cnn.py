@@ -2235,7 +2235,7 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
             if sample_idx >= len(dataset):
                 continue
 
-            input_grid, output_grid, target_colors, pixel_mask = dataset[sample_idx]
+            input_grid, output_grid, target_colors, pixel_mask, target_dims = dataset[sample_idx]
 
             inp_t = input_grid.unsqueeze(0).to(device)
             out_t = output_grid.unsqueeze(0).to(device)

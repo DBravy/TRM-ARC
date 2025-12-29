@@ -371,11 +371,16 @@ class SinglePuzzleDataset(Dataset):
             aug_output = dihedral_transform(color_map[correct_output], trans_id)
             candidate = generate_color_swap(aug_output)
             target = aug_output
-        
+
+        # Get output dimensions (after augmentation, since dihedral can swap h/w)
+        out_h, out_w = target.shape
+        output_dims = torch.tensor([out_h, out_w], dtype=torch.long)
+
         return (
             torch.from_numpy(self._pad_grid(aug_input)).long(),
             torch.from_numpy(self._pad_grid(candidate)).long(),
             torch.from_numpy(self._pad_grid(target)).long(),
+            output_dims,
         )
 
 
@@ -579,10 +584,15 @@ class MultiPuzzleDataset(Dataset):
             candidate = generate_color_swap(aug_output)
             target = aug_output
 
+        # Get output dimensions (after augmentation, since dihedral can swap h/w)
+        out_h, out_w = target.shape
+        output_dims = torch.tensor([out_h, out_w], dtype=torch.long)
+
         return (
             torch.from_numpy(self._pad_grid(aug_input)).long(),
             torch.from_numpy(self._pad_grid(candidate)).long(),
             torch.from_numpy(self._pad_grid(target)).long(),
+            output_dims,
         )
 
 
@@ -618,6 +628,10 @@ def train_on_puzzle(
     ir_num_layers: int = 3,
     ir_kernel_size: int = 3,
     freeze_ir: bool = True,
+    # Size prediction options
+    predict_size: bool = False,
+    size_weight: float = 0.1,
+    size_hidden_dim: int = 128,
 ) -> nn.Module:
     """Train a CNN on a single puzzle's training examples.
 
@@ -702,6 +716,8 @@ def train_on_puzzle(
         ir_num_layers=ir_num_layers,
         ir_kernel_size=ir_kernel_size,
         freeze_ir=freeze_ir,
+        predict_size=predict_size,
+        size_hidden_dim=size_hidden_dim,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -710,14 +726,33 @@ def train_on_puzzle(
     model.train()
     for epoch in range(epochs):
         total_loss = 0
-        for inp, candidate, target in loader:
+        for inp, candidate, target, output_dims in loader:
             inp = inp.to(DEVICE)
             candidate = candidate.to(DEVICE)
             target = target.to(DEVICE)
+            output_dims = output_dims.to(DEVICE)
 
             optimizer.zero_grad()
-            logits = model(inp, candidate)
-            loss = F.cross_entropy(logits, target)
+            output = model(inp, candidate)
+
+            # Handle both dict (with size) and tensor (pixel only) outputs
+            if isinstance(output, dict):
+                pixel_logits = output['pixel_logits']
+                height_logits = output['height_logits']
+                width_logits = output['width_logits']
+
+                pixel_loss = F.cross_entropy(pixel_logits, target)
+
+                # Size targets: convert 1-30 to 0-29 for classification
+                target_h = output_dims[:, 0] - 1
+                target_w = output_dims[:, 1] - 1
+                size_loss = (F.cross_entropy(height_logits, target_h) +
+                             F.cross_entropy(width_logits, target_w)) / 2
+
+                loss = pixel_loss + size_weight * size_loss
+            else:
+                loss = F.cross_entropy(output, target)
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -758,6 +793,10 @@ def train_on_all_puzzles(
     ir_num_layers: int = 3,
     ir_kernel_size: int = 3,
     freeze_ir: bool = True,
+    # Size prediction options
+    predict_size: bool = False,
+    size_weight: float = 0.1,
+    size_hidden_dim: int = 128,
 ) -> nn.Module:
     """Train a single CNN on ALL puzzles' training examples together.
 
@@ -814,6 +853,8 @@ def train_on_all_puzzles(
         ir_num_layers=ir_num_layers,
         ir_kernel_size=ir_kernel_size,
         freeze_ir=freeze_ir,
+        predict_size=predict_size,
+        size_hidden_dim=size_hidden_dim,
     ).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -823,14 +864,33 @@ def train_on_all_puzzles(
     for epoch in range(epochs):
         total_loss = 0
         num_batches = 0
-        for inp, candidate, target in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+        for inp, candidate, target, output_dims in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
             inp = inp.to(DEVICE)
             candidate = candidate.to(DEVICE)
             target = target.to(DEVICE)
+            output_dims = output_dims.to(DEVICE)
 
             optimizer.zero_grad()
-            logits = model(inp, candidate)
-            loss = F.cross_entropy(logits, target)
+            output = model(inp, candidate)
+
+            # Handle both dict (with size) and tensor (pixel only) outputs
+            if isinstance(output, dict):
+                pixel_logits = output['pixel_logits']
+                height_logits = output['height_logits']
+                width_logits = output['width_logits']
+
+                pixel_loss = F.cross_entropy(pixel_logits, target)
+
+                # Size targets: convert 1-30 to 0-29 for classification
+                target_h = output_dims[:, 0] - 1
+                target_w = output_dims[:, 1] - 1
+                size_loss = (F.cross_entropy(height_logits, target_h) +
+                             F.cross_entropy(width_logits, target_w)) / 2
+
+                loss = pixel_loss + size_weight * size_loss
+            else:
+                loss = F.cross_entropy(output, target)
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -914,44 +974,51 @@ def visualize_prediction(
     print()
 
 
-def evaluate_on_test(model: nn.Module, puzzle: Dict, puzzle_id: str = "", 
+def evaluate_on_test(model: nn.Module, puzzle: Dict, puzzle_id: str = "",
                      candidate_mode: str = "zeros", visualize: bool = False) -> Dict:
     """
     Evaluate trained model on puzzle's test examples.
-    
+
     CRITICAL: We must NOT give the model the correct output as input!
     The model was designed for error correction (input, candidate) -> corrected
     But for actual puzzle solving, we need to give it a blank/garbage candidate.
-    
+
     candidate_mode:
         - "zeros": All zeros (blank grid)
         - "random": Random colors 0-9
         - "input_copy": Copy of the input (tests if it learns input->output transform)
     """
     model.eval()
-    
+
     test_examples = puzzle.get("test", [])
     if not test_examples or not any("output" in ex for ex in test_examples):
         return {"error": "no_test_outputs"}
-    
+
     results = []
     total_correct = 0
     total_pixels = 0
-    
+
+    # Size prediction tracking
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
+    total_size_samples = 0
+    has_size_prediction = hasattr(model, 'predict_size') and model.predict_size
+
     with torch.no_grad():
         for ex in test_examples:
             if "output" not in ex:
                 continue
-            
+
             inp = np.array(ex["input"], dtype=np.uint8)
             out = np.array(ex["output"], dtype=np.uint8)
             h_out, w_out = out.shape
             h_inp, w_inp = inp.shape
-            
+
             # Pad input
             inp_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
             inp_pad[:h_inp, :w_inp] = inp
-            
+
             # Create candidate output - NOT the correct answer!
             if candidate_mode == "zeros":
                 candidate_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
@@ -962,41 +1029,75 @@ def evaluate_on_test(model: nn.Module, puzzle: Dict, puzzle_id: str = "",
                 candidate_pad[:h_inp, :w_inp] = inp
             else:
                 raise ValueError(f"Unknown candidate_mode: {candidate_mode}")
-            
+
             inp_t = torch.from_numpy(inp_pad).long().unsqueeze(0).to(DEVICE)
             candidate_t = torch.from_numpy(candidate_pad).long().unsqueeze(0).to(DEVICE)
-            
+
             # Model predicts what the output SHOULD be
             pred = model.predict_colors(inp_t, candidate_t)[0].cpu().numpy()
-            
+
             # Compare to actual correct output
             correct = (pred[:h_out, :w_out] == out).sum()
             total = h_out * w_out
-            
+
+            # Size prediction evaluation
+            size_result = {}
+            if has_size_prediction:
+                pred_h, pred_w = model.predict_output_size(inp_t, candidate_t)
+                pred_h, pred_w = pred_h.item(), pred_w.item()
+                h_correct = (pred_h == h_out)
+                w_correct = (pred_w == w_out)
+                both_correct = h_correct and w_correct
+
+                total_height_correct += int(h_correct)
+                total_width_correct += int(w_correct)
+                total_both_correct += int(both_correct)
+                total_size_samples += 1
+
+                size_result = {
+                    "pred_h": pred_h,
+                    "pred_w": pred_w,
+                    "actual_h": h_out,
+                    "actual_w": w_out,
+                    "h_correct": h_correct,
+                    "w_correct": w_correct,
+                    "both_correct": both_correct,
+                }
+
             # Visualize if requested
             if visualize:
                 # Pad output for visualization
                 out_pad = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
                 out_pad[:h_out, :w_out] = out
                 visualize_prediction(inp_pad, out_pad, pred, h_out, w_out, puzzle_id)
-            
-            results.append({
+
+            result = {
                 "correct": int(correct),
                 "total": total,
                 "accuracy": correct / total,
                 "perfect": correct == total
-            })
-            
+            }
+            result.update(size_result)
+            results.append(result)
+
             total_correct += correct
             total_pixels += total
-    
-    return {
+
+    output = {
         "pixel_accuracy": total_correct / max(total_pixels, 1),
         "perfect_rate": sum(r["perfect"] for r in results) / max(len(results), 1),
         "num_test_examples": len(results),
         "all_perfect": all(r["perfect"] for r in results),
         "results": results
     }
+
+    # Add size metrics if available
+    if has_size_prediction and total_size_samples > 0:
+        output["height_accuracy"] = total_height_correct / total_size_samples
+        output["width_accuracy"] = total_width_correct / total_size_samples
+        output["both_accuracy"] = total_both_correct / total_size_samples
+
+    return output
 
 
 def evaluate_all_tests(
@@ -1115,6 +1216,10 @@ def evaluate_puzzle(
     ir_num_layers: int = 3,
     ir_kernel_size: int = 3,
     freeze_ir: bool = True,
+    # Size prediction options
+    predict_size: bool = False,
+    size_weight: float = 0.1,
+    size_hidden_dim: int = 128,
 ) -> PuzzleResult:
     """Train and evaluate on a single puzzle."""
 
@@ -1183,6 +1288,10 @@ def evaluate_puzzle(
         ir_num_layers=ir_num_layers,
         ir_kernel_size=ir_kernel_size,
         freeze_ir=freeze_ir,
+        # Size prediction options
+        predict_size=predict_size,
+        size_weight=size_weight,
+        size_hidden_dim=size_hidden_dim,
     )
     train_time = time.time() - start
 
@@ -1337,6 +1446,14 @@ def main():
                         help="Freeze IR encoder weights during training (default: True)")
     parser.add_argument("--no-freeze-ir", dest="freeze_ir", action="store_false",
                         help="Allow IR encoder weights to be fine-tuned")
+
+    # Size prediction options
+    parser.add_argument("--predict-size", action="store_true",
+                        help="Enable joint output size prediction during training")
+    parser.add_argument("--size-weight", type=float, default=0.1,
+                        help="Weight for size loss when --predict-size is enabled (default: 0.1)")
+    parser.add_argument("--size-hidden-dim", type=int, default=128,
+                        help="Hidden dimension for size prediction MLP (default: 128)")
 
     # Augmentation options
     parser.add_argument("--dihedral-only", action="store_true",
@@ -1582,6 +1699,10 @@ def main():
                 ir_num_layers=args.ir_num_layers,
                 ir_kernel_size=args.ir_kernel_size,
                 freeze_ir=args.freeze_ir,
+                # Size prediction options
+                predict_size=args.predict_size,
+                size_weight=args.size_weight,
+                size_hidden_dim=args.size_hidden_dim,
             )
             results.append(result)
 
