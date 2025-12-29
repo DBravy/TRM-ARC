@@ -275,6 +275,53 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
+class IREncoder(nn.Module):
+    """
+    Instance Recognition encoder - produces 64-dim features per pixel.
+
+    This matches the architecture from ir_checkpoints/test.pt:
+    - conv1: (10, 128, 3x3) with BatchNorm + ReLU
+    - conv2: (128, 128, 3x3) with BatchNorm + ReLU
+    - conv3: (128, 128, 3x3) with BatchNorm + ReLU
+    - conv4: (128, 64, 1x1) - final projection to 64 features
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(10, 128, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(128)
+        self.conv2 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 64, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: One-hot encoded grid (B, 10, H, W)
+        Returns:
+            Features (B, H, W, 64)
+        """
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.conv4(x)  # (B, 64, H, W)
+        return x.permute(0, 2, 3, 1)  # (B, H, W, 64)
+
+    @classmethod
+    def from_checkpoint(cls, path: str, device=None):
+        """Load encoder weights from an instance recognition checkpoint."""
+        encoder = cls()
+        ckpt = torch.load(path, map_location=device or 'cpu', weights_only=False)
+        # Extract encoder weights from full model checkpoint
+        state_dict = {k.replace('encoder.', ''): v
+                      for k, v in ckpt['model_state_dict'].items()
+                      if k.startswith('encoder.')}
+        encoder.load_state_dict(state_dict)
+        return encoder
+
+
 class SpatialSelfAttention(nn.Module):
     """
     Single-head spatial self-attention over pixels with learned Q/K/V projections.
@@ -337,20 +384,30 @@ class CrossAttention(nn.Module):
     this output pixel?" before any convolutional processing.
 
     Args:
-        dim: Feature dimension (embedding size)
+        query_dim: Dimension of query embeddings (from output)
+        kv_dim: Dimension of key/value embeddings (from input). Defaults to query_dim.
+        proj_dim: Dimension for attention computation. Defaults to query_dim.
 
     Set capture_attention=True to store attention weights for visualization.
     Access via .last_attention_weights after forward pass.
     """
-    def __init__(self, dim: int):
+    def __init__(self, query_dim: int, kv_dim: int = None, proj_dim: int = None):
         super().__init__()
-        self.dim = dim
-        self.scale = dim ** -0.5
+        kv_dim = kv_dim if kv_dim is not None else query_dim
+        proj_dim = proj_dim if proj_dim is not None else query_dim
 
-        # Q comes from output, K/V come from input
-        self.q_proj = nn.Linear(dim, dim)  # "What am I looking for?" (output)
-        self.k_proj = nn.Linear(dim, dim)  # "What's available?" (input)
-        self.v_proj = nn.Linear(dim, dim)  # "What to retrieve?" (input)
+        self.query_dim = query_dim
+        self.kv_dim = kv_dim
+        self.proj_dim = proj_dim
+        self.scale = proj_dim ** -0.5
+
+        # Q comes from output, K/V come from input (possibly different dimensions)
+        self.q_proj = nn.Linear(query_dim, proj_dim)  # "What am I looking for?" (output)
+        self.k_proj = nn.Linear(kv_dim, proj_dim)     # "What's available?" (input)
+        self.v_proj = nn.Linear(kv_dim, proj_dim)     # "What to retrieve?" (input)
+
+        # Output projection back to query_dim if proj_dim differs
+        self.out_proj = nn.Linear(proj_dim, query_dim) if proj_dim != query_dim else nn.Identity()
 
         self.capture_attention = False
         self.last_attention_weights = None  # (B, H*W, H*W) when captured
@@ -358,23 +415,24 @@ class CrossAttention(nn.Module):
     def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            query: Output embeddings (B, H, W, C) - queries come from here
-            key_value: Input embeddings (B, H, W, C) - keys and values come from here
+            query: Output embeddings (B, H, W, query_dim) - queries come from here
+            key_value: Input embeddings (B, H, W, kv_dim) - keys and values come from here
 
         Returns:
-            Attended output embeddings (B, H, W, C)
+            Attended output embeddings (B, H, W, query_dim)
         """
-        B, H, W, C = query.shape
+        B, H, W, C_q = query.shape
+        _, _, _, C_kv = key_value.shape
         N = H * W
 
         # Flatten spatial dimensions
-        q_flat = query.view(B, N, C)      # (B, N, C)
-        kv_flat = key_value.view(B, N, C)  # (B, N, C)
+        q_flat = query.view(B, N, C_q)       # (B, N, query_dim)
+        kv_flat = key_value.view(B, N, C_kv)  # (B, N, kv_dim)
 
-        # Project
-        q = self.q_proj(q_flat)   # (B, N, C) - from output
-        k = self.k_proj(kv_flat)  # (B, N, C) - from input
-        v = self.v_proj(kv_flat)  # (B, N, C) - from input
+        # Project to proj_dim
+        q = self.q_proj(q_flat)   # (B, N, proj_dim) - from output
+        k = self.k_proj(kv_flat)  # (B, N, proj_dim) - from input
+        v = self.v_proj(kv_flat)  # (B, N, proj_dim) - from input
 
         # Attention scores: each output pixel attends to all input pixels
         scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
@@ -385,12 +443,15 @@ class CrossAttention(nn.Module):
             self.last_attention_weights = attn.detach().cpu()
 
         # Apply attention: gather information from input based on attention
-        attended = torch.bmm(attn, v)  # (B, N, C)
+        attended = torch.bmm(attn, v)  # (B, N, proj_dim)
+
+        # Project attended values back to query_dim if needed
+        attended = self.out_proj(attended)  # (B, N, query_dim)
 
         # Residual connection: output embedding + attended input info
-        out = q_flat + attended
+        out = q_flat + attended  # (B, N, query_dim)
 
-        return out.view(B, H, W, C)
+        return out.view(B, H, W, self.query_dim)
 
 
 class PixelErrorCNN(nn.Module):
@@ -406,7 +467,8 @@ class PixelErrorCNN(nn.Module):
     def __init__(self, hidden_dim: int = 64,
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
                  kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
-                 use_attention: bool = False, use_cross_attention: bool = False):
+                 use_attention: bool = False, use_cross_attention: bool = False,
+                 ir_checkpoint: str = None, freeze_ir: bool = True):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -418,6 +480,8 @@ class PixelErrorCNN(nn.Module):
         self.out_kernel_size = out_kernel_size
         self.use_attention = use_attention
         self.use_cross_attention = use_cross_attention
+        self.ir_checkpoint = ir_checkpoint
+        self.freeze_ir = freeze_ir
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -430,8 +494,24 @@ class PixelErrorCNN(nn.Module):
 
         self.embed_dim = embed_dim
 
-        # Cross-attention on embeddings (output attends to input)
-        self.cross_attention = CrossAttention(embed_dim) if use_cross_attention else None
+        # Instance Recognition encoder for cross-attention (optional)
+        self.ir_encoder = None
+        if use_cross_attention and ir_checkpoint:
+            self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+            if freeze_ir:
+                for p in self.ir_encoder.parameters():
+                    p.requires_grad = False
+            # Cross-attention: query_dim=embed_dim (16 or 11), kv_dim=64 (IR output)
+            self.cross_attention = CrossAttention(
+                query_dim=embed_dim,
+                kv_dim=64,
+                proj_dim=embed_dim  # Project to embedding dimension
+            )
+        elif use_cross_attention:
+            # Original behavior - same dimension for query and kv
+            self.cross_attention = CrossAttention(embed_dim)
+        else:
+            self.cross_attention = None
 
         # Channel concatenation: embed_dim * 2 (inp, out)
         in_channels = embed_dim * 2
@@ -480,18 +560,34 @@ class PixelErrorCNN(nn.Module):
         return torch.cat([onehot, nonzero], dim=-1)
 
     def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        # Encode both grids
+        # Encode output grid (for queries and concatenation)
         if self.use_onehot:
-            inp_emb = self._encode_grid(input_grid)   # (B, 30, 30, 11)
             out_emb = self._encode_grid(output_grid)  # (B, 30, 30, 11)
         else:
-            inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
             out_emb = self.output_embed(output_grid)  # (B, 30, 30, 16)
 
         # Apply cross-attention: output pixels attend to input pixels
         # This happens BEFORE convolutions so global info is available early
         if self.cross_attention is not None:
-            out_emb = self.cross_attention(query=out_emb, key_value=inp_emb)
+            if self.ir_encoder is not None:
+                # Use IR encoder for input features (keys/values)
+                inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+                inp_onehot = inp_onehot.permute(0, 3, 1, 2)  # (B, 10, H, W)
+                ir_features = self.ir_encoder(inp_onehot)    # (B, H, W, 64)
+                out_emb = self.cross_attention(query=out_emb, key_value=ir_features)
+            else:
+                # Original behavior - use same embedding type for input
+                if self.use_onehot:
+                    inp_emb_for_attn = self._encode_grid(input_grid)
+                else:
+                    inp_emb_for_attn = self.input_embed(input_grid)
+                out_emb = self.cross_attention(query=out_emb, key_value=inp_emb_for_attn)
+
+        # Encode input grid for U-Net concatenation (always use original embeddings)
+        if self.use_onehot:
+            inp_emb = self._encode_grid(input_grid)   # (B, 30, 30, 11)
+        else:
+            inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
 
         # Channel concatenation: input and output side by side in channel dim
         x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, 30, 30, 32) or (B, 30, 30, 22)
@@ -588,6 +684,8 @@ class PixelErrorCNN(nn.Module):
         out_kernel_size = args.get('out_kernel_size', 1)
         use_attention = args.get('use_attention', False)
         use_cross_attention = args.get('use_cross_attention', False)
+        ir_checkpoint = args.get('ir_checkpoint', None)
+        freeze_ir = args.get('freeze_ir', True)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -598,7 +696,9 @@ class PixelErrorCNN(nn.Module):
             use_onehot=use_onehot,
             out_kernel_size=out_kernel_size,
             use_attention=use_attention,
-            use_cross_attention=use_cross_attention
+            use_cross_attention=use_cross_attention,
+            ir_checkpoint=ir_checkpoint,
+            freeze_ir=freeze_ir
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1963,6 +2063,12 @@ def main():
                         help="Add spatial self-attention before output layer (each pixel attends to all others)")
     parser.add_argument("--use-cross-attention", action="store_true",
                         help="Add cross-attention on embeddings: output pixels attend to input pixels before convolutions")
+    parser.add_argument("--ir-checkpoint", type=str, default=None,
+                        help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
+    parser.add_argument("--freeze-ir", action="store_true", default=True,
+                        help="Freeze IR encoder weights during training (default: True)")
+    parser.add_argument("--no-freeze-ir", dest="freeze_ir", action="store_false",
+                        help="Allow IR encoder weights to be fine-tuned")
 
     # Layer-wise ablation analysis
     parser.add_argument("--ablation", action="store_true",
@@ -2165,7 +2271,9 @@ def main():
         use_onehot=args.use_onehot,
         out_kernel_size=args.out_kernel_size,
         use_attention=args.use_attention,
-        use_cross_attention=args.use_cross_attention
+        use_cross_attention=args.use_cross_attention,
+        ir_checkpoint=args.ir_checkpoint,
+        freeze_ir=args.freeze_ir
     )
     model = model.to(DEVICE)
 
@@ -2177,7 +2285,11 @@ def main():
     if args.use_attention:
         print("Spatial self-attention: ENABLED (each pixel attends to all others)")
     if args.use_cross_attention:
-        print("Cross-attention: ENABLED (output pixels attend to input pixels on embeddings)")
+        if args.ir_checkpoint:
+            freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
+            print(f"Cross-attention: ENABLED with IR encoder ({freeze_str}) from {args.ir_checkpoint}")
+        else:
+            print("Cross-attention: ENABLED (output pixels attend to input pixels on embeddings)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
