@@ -80,6 +80,7 @@ def build_command(combo: Dict, seed: int) -> List[str]:
         "--cross-attention-position", combo["position"],
         "--cross-attention-heads", str(combo["heads"]),
         "--seed", str(seed),
+        "--use-last-epoch",  # Disable early stopping, run all 50 epochs
     ]
 
     if combo["onehot"]:
