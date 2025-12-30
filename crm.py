@@ -275,21 +275,619 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
+class IREncoder(nn.Module):
+    """
+    Instance Recognition encoder - produces features per pixel.
+
+    Default architecture matches ir_checkpoints/test.pt:
+    - conv1: (10, 128, 3x3) with BatchNorm + ReLU
+    - conv2: (128, 128, 3x3) with BatchNorm + ReLU
+    - conv3: (128, 128, 3x3) with BatchNorm + ReLU
+    - conv4: (128, 64, 1x1) - final projection to out_dim features
+
+    Args:
+        hidden_dim: Number of channels in hidden conv layers (default: 128)
+        out_dim: Output feature dimension per pixel (default: 64)
+        num_layers: Number of 3x3 conv layers before projection (default: 3)
+        kernel_size: Kernel size for conv layers (default: 3)
+    """
+
+    def __init__(self, hidden_dim: int = 128, out_dim: int = 64,
+                 num_layers: int = 3, kernel_size: int = 3):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+        padding = (kernel_size - 1) // 2
+
+        # Build conv layers dynamically
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(num_layers):
+            in_ch = 10 if i == 0 else hidden_dim
+            self.convs.append(nn.Conv2d(in_ch, hidden_dim, kernel_size, padding=padding))
+            self.bns.append(nn.BatchNorm2d(hidden_dim))
+
+        # Final 1x1 projection to output dimension
+        self.proj = nn.Conv2d(hidden_dim, out_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: One-hot encoded grid (B, 10, H, W)
+        Returns:
+            Features (B, H, W, out_dim)
+        """
+        for conv, bn in zip(self.convs, self.bns):
+            x = F.relu(bn(conv(x)))
+        x = self.proj(x)  # (B, out_dim, H, W)
+        return x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, out_dim)
+
+    @classmethod
+    def from_checkpoint(cls, path: str, device=None):
+        """Load encoder weights from an instance recognition checkpoint.
+
+        Automatically infers architecture (hidden_dim, out_dim, num_layers, kernel_size)
+        from the checkpoint's state_dict.
+        """
+        ckpt = torch.load(path, map_location=device or 'cpu', weights_only=False)
+        # Extract encoder weights from full model checkpoint
+        state_dict = {k.replace('encoder.', ''): v
+                      for k, v in ckpt['model_state_dict'].items()
+                      if k.startswith('encoder.')}
+
+        # Handle old checkpoint format (conv1, bn1, ...) vs new format (convs.0, bns.0, ...)
+        if 'conv1.weight' in state_dict and 'convs.0.weight' not in state_dict:
+            # Map old keys to new keys
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                new_key = key
+                # Map convN -> convs.(N-1) for N in 1,2,3
+                for i in range(1, 4):
+                    new_key = new_key.replace(f'conv{i}.', f'convs.{i-1}.')
+                    new_key = new_key.replace(f'bn{i}.', f'bns.{i-1}.')
+                # Map conv4 -> proj (the final projection layer)
+                new_key = new_key.replace('conv4.', 'proj.')
+                new_state_dict[new_key] = value
+            state_dict = new_state_dict
+
+        # Infer architecture from state_dict
+        # hidden_dim: output channels of first conv layer
+        hidden_dim = state_dict['convs.0.weight'].shape[0]
+        # out_dim: output channels of projection layer
+        out_dim = state_dict['proj.weight'].shape[0]
+        # num_layers: count conv layers
+        num_layers = sum(1 for k in state_dict if k.startswith('convs.') and k.endswith('.weight'))
+        # kernel_size: from first conv layer weight shape
+        kernel_size = state_dict['convs.0.weight'].shape[2]
+
+        encoder = cls(hidden_dim=hidden_dim, out_dim=out_dim,
+                      num_layers=num_layers, kernel_size=kernel_size)
+        encoder.load_state_dict(state_dict)
+        return encoder
+
+
+class SizeClassificationHead(nn.Module):
+    """
+    Predicts output grid size (height, width) from input grid using IR encoder.
+
+    Uses the IR encoder to extract features from the input grid, then applies
+    global average pooling and MLP heads to predict height and width as
+    classification tasks (1-30 for each dimension).
+
+    Args:
+        ir_encoder: Pre-trained or untrained IREncoder instance
+        max_size: Maximum grid dimension (default: 30)
+        hidden_dim: Hidden dimension for MLP (default: 128)
+        freeze_ir: Whether to freeze IR encoder weights (default: True)
+    """
+
+    def __init__(self, ir_encoder: IREncoder, max_size: int = 30,
+                 hidden_dim: int = 128, freeze_ir: bool = True):
+        super().__init__()
+        self.ir_encoder = ir_encoder
+        self.max_size = max_size
+        self.freeze_ir = freeze_ir
+
+        if freeze_ir:
+            for p in self.ir_encoder.parameters():
+                p.requires_grad = False
+
+        ir_feature_dim = ir_encoder.out_dim
+
+        # Global average pooling
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # Shared trunk
+        self.trunk = nn.Sequential(
+            nn.Linear(ir_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+
+        # Separate heads for height and width (classes 0-29 map to sizes 1-30)
+        self.height_head = nn.Linear(hidden_dim, max_size)
+        self.width_head = nn.Linear(hidden_dim, max_size)
+
+    def forward(self, input_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            input_grid: (B, H, W) integer grid with values 0-9
+        Returns:
+            height_logits: (B, max_size) - logits for height classes
+            width_logits: (B, max_size) - logits for width classes
+        """
+        # One-hot encode input
+        inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+        inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+
+        # Get IR features
+        features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
+        features = features.permute(0, 3, 1, 2)  # (B, out_dim, H, W)
+
+        # Global average pool
+        pooled = self.pool(features).squeeze(-1).squeeze(-1)  # (B, out_dim)
+
+        # Predict sizes through trunk + heads
+        trunk_out = self.trunk(pooled)
+        height_logits = self.height_head(trunk_out)
+        width_logits = self.width_head(trunk_out)
+
+        return height_logits, width_logits
+
+    def predict_size(self, input_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict output size as (height, width) integers.
+
+        Args:
+            input_grid: (B, H, W) integer grid
+        Returns:
+            heights: (B,) predicted heights (1-30)
+            widths: (B,) predicted widths (1-30)
+        """
+        height_logits, width_logits = self.forward(input_grid)
+        heights = height_logits.argmax(dim=1) + 1  # Convert from class (0-29) to size (1-30)
+        widths = width_logits.argmax(dim=1) + 1
+        return heights, widths
+
+    @classmethod
+    def from_ir_checkpoint(cls, ir_checkpoint_path: str, max_size: int = 30,
+                           hidden_dim: int = 128, freeze_ir: bool = True,
+                           device: torch.device = None):
+        """Create SizeClassificationHead from an IR encoder checkpoint."""
+        ir_encoder = IREncoder.from_checkpoint(ir_checkpoint_path, device)
+        model = cls(ir_encoder, max_size=max_size, hidden_dim=hidden_dim, freeze_ir=freeze_ir)
+        if device:
+            model = model.to(device)
+        return model
+
+    def save_checkpoint(self, path: str, args: dict = None):
+        """Save model checkpoint."""
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'ir_out_dim': self.ir_encoder.out_dim,
+            'ir_hidden_dim': self.ir_encoder.hidden_dim,
+            'ir_num_layers': self.ir_encoder.num_layers,
+            'ir_kernel_size': self.ir_encoder.kernel_size,
+            'max_size': self.max_size,
+            'args': args or {},
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
+        """Load SizeClassificationHead from checkpoint."""
+        ckpt = torch.load(checkpoint_path, map_location=device or 'cpu', weights_only=False)
+
+        # Reconstruct IR encoder
+        ir_encoder = IREncoder(
+            hidden_dim=ckpt.get('ir_hidden_dim', 128),
+            out_dim=ckpt.get('ir_out_dim', 64),
+            num_layers=ckpt.get('ir_num_layers', 3),
+            kernel_size=ckpt.get('ir_kernel_size', 3),
+        )
+
+        args = ckpt.get('args', {})
+        model = cls(
+            ir_encoder,
+            max_size=ckpt.get('max_size', 30),
+            hidden_dim=args.get('size_hidden_dim', 128),
+            freeze_ir=False,  # We're loading full weights
+        )
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+
+        if device:
+            model = model.to(device)
+        return model
+
+
+class SpatialSelfAttention(nn.Module):
+    """
+    Single-head spatial self-attention over pixels with learned Q/K/V projections.
+    Each pixel attends to all other pixels in the feature map.
+
+    Args:
+        dim: Feature dimension (number of channels)
+
+    Set capture_attention=True to store attention weights for visualization.
+    Access via .last_attention_weights after forward pass.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.scale = dim ** -0.5
+
+        # Learned Q/K/V projections
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+
+        self.capture_attention = False
+        self.last_attention_weights = None  # (B, H*W, H*W) when captured
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+
+        # Reshape to (B, N, C)
+        x_flat = x.reshape(B, C, N).permute(0, 2, 1)  # (B, N, C)
+
+        # Project to Q, K, V
+        q = self.q_proj(x_flat)  # (B, N, C) - "what am I looking for?"
+        k = self.k_proj(x_flat)  # (B, N, C) - "what do I have to offer?"
+        v = self.v_proj(x_flat)  # (B, N, C) - "what info to pass along?"
+
+        # Attention scores
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
+        attn = F.softmax(scores, dim=-1)
+
+        # Optionally store attention weights for visualization
+        if self.capture_attention:
+            self.last_attention_weights = attn.detach().cpu()
+
+        # Apply attention to values
+        attended = torch.bmm(attn, v)  # (B, N, C)
+
+        # Residual connection
+        out = x_flat + attended
+
+        return out.permute(0, 2, 1).reshape(B, C, H, W)
+
+
+class CrossAttention(nn.Module):
+    """
+    Multi-head cross-attention: output embeddings attend to input embeddings.
+
+    Each output pixel queries all input pixels to gather relevant information.
+    This allows the model to learn "what in the input is relevant for predicting
+    this output pixel?" before any convolutional processing.
+
+    Multi-head attention allows the model to attend to information from different
+    representation subspaces at different positions. Each head can learn to focus
+    on different aspects (e.g., color matching, spatial patterns, shape boundaries).
+
+    Args:
+        query_dim: Dimension of query embeddings (from output)
+        kv_dim: Dimension of key/value embeddings (from input). Defaults to query_dim.
+        proj_dim: Dimension for attention computation. Defaults to query_dim.
+        num_heads: Number of attention heads. Must divide proj_dim evenly.
+
+    Set capture_attention=True to store attention weights for visualization.
+    Access via .last_attention_weights after forward pass (B, num_heads, H*W, H*W).
+    """
+    def __init__(self, query_dim: int, kv_dim: int = None, proj_dim: int = None,
+                 num_heads: int = 1):
+        super().__init__()
+        kv_dim = kv_dim if kv_dim is not None else query_dim
+        proj_dim = proj_dim if proj_dim is not None else query_dim
+
+        if proj_dim % num_heads != 0:
+            raise ValueError(f"proj_dim ({proj_dim}) must be divisible by num_heads ({num_heads})")
+
+        self.query_dim = query_dim
+        self.kv_dim = kv_dim
+        self.proj_dim = proj_dim
+        self.num_heads = num_heads
+        self.head_dim = proj_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Q comes from output, K/V come from input (possibly different dimensions)
+        self.q_proj = nn.Linear(query_dim, proj_dim)  # "What am I looking for?" (output)
+        self.k_proj = nn.Linear(kv_dim, proj_dim)     # "What's available?" (input)
+        self.v_proj = nn.Linear(kv_dim, proj_dim)     # "What to retrieve?" (input)
+
+        # Output projection back to query_dim
+        self.out_proj = nn.Linear(proj_dim, query_dim)
+
+        self.capture_attention = False
+        self.last_attention_weights = None  # (B, num_heads, H*W, H*W) when captured
+
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query: Output embeddings (B, H, W, query_dim) - queries come from here
+            key_value: Input embeddings (B, H, W, kv_dim) - keys and values come from here
+
+        Returns:
+            Attended output embeddings (B, H, W, query_dim)
+        """
+        B, H, W, C_q = query.shape
+        _, _, _, C_kv = key_value.shape
+        N = H * W
+
+        # Flatten spatial dimensions
+        q_flat = query.reshape(B, N, C_q)       # (B, N, query_dim)
+        kv_flat = key_value.reshape(B, N, C_kv)  # (B, N, kv_dim)
+
+        # Project to proj_dim
+        q = self.q_proj(q_flat)   # (B, N, proj_dim) - from output
+        k = self.k_proj(kv_flat)  # (B, N, proj_dim) - from input
+        v = self.v_proj(kv_flat)  # (B, N, proj_dim) - from input
+
+        # Reshape for multi-head attention: (B, N, num_heads, head_dim) -> (B, num_heads, N, head_dim)
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
+
+        # Attention scores: each output pixel attends to all input pixels (per head)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
+        attn = F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
+
+        # Optionally store attention weights for visualization (all heads)
+        if self.capture_attention:
+            self.last_attention_weights = attn.detach().cpu()  # (B, num_heads, N, N)
+
+        # Apply attention: gather information from input based on attention
+        attended = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+
+        # Concatenate heads: (B, num_heads, N, head_dim) -> (B, N, proj_dim)
+        attended = attended.transpose(1, 2).contiguous().view(B, N, self.proj_dim)
+
+        # Project attended values back to query_dim
+        attended = self.out_proj(attended)  # (B, N, query_dim)
+
+        # Residual connection: output embedding + attended input info
+        out = q_flat + attended  # (B, N, query_dim)
+
+        return out.reshape(B, H, W, self.query_dim)
+
+
+class SlotAttention(nn.Module):
+    """
+    Slot Attention module that discovers object slots from input features.
+
+    Takes per-pixel features and produces:
+    - Slot embeddings: (B, K, slot_dim) abstract feature vectors per slot
+    - Slot masks: (B, K, H, W) soft assignment of pixels to slots
+
+    Uses iterative refinement with GRU updates and competition via softmax.
+
+    Args:
+        input_dim: Dimension of input features (D)
+        slot_dim: Dimension of slot embeddings
+        num_slots: Number of slots (K)
+        num_iterations: Number of refinement iterations
+        mlp_hidden_dim: Hidden dimension for slot MLP
+    """
+
+    def __init__(self, input_dim: int, slot_dim: int, num_slots: int,
+                 num_iterations: int = 3, mlp_hidden_dim: int = 128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.slot_dim = slot_dim
+        self.num_slots = num_slots
+        self.num_iterations = num_iterations
+        self.scale = slot_dim ** -0.5
+
+        # Learnable slot prototypes
+        self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim))
+        self.slot_log_sigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
+
+        # Layer norms
+        self.norm_inputs = nn.LayerNorm(input_dim)
+        self.norm_slots = nn.LayerNorm(slot_dim)
+        self.norm_mlp = nn.LayerNorm(slot_dim)
+
+        # Projections for attention
+        self.to_q = nn.Linear(slot_dim, slot_dim)
+        self.to_k = nn.Linear(input_dim, slot_dim)
+        self.to_v = nn.Linear(input_dim, slot_dim)
+
+        # GRU for slot updates
+        self.gru = nn.GRUCell(slot_dim, slot_dim)
+
+        # MLP for slot refinement
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim, mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, slot_dim),
+        )
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            features: (B, H, W, D) per-pixel features from IR encoder
+
+        Returns:
+            slots: (B, K, slot_dim) slot embeddings
+            masks: (B, K, H, W) soft pixel-to-slot assignments (sum to 1 over slots)
+        """
+        B, H, W, D = features.shape
+        N = H * W
+
+        # Flatten spatial dimensions
+        inputs = features.reshape(B, N, D)  # (B, N, D)
+        inputs = self.norm_inputs(inputs)
+
+        # Project inputs to keys and values
+        k = self.to_k(inputs)  # (B, N, slot_dim)
+        v = self.to_v(inputs)  # (B, N, slot_dim)
+
+        # Initialize slots from learnable prototypes with noise
+        slots = self.slot_mu + torch.exp(self.slot_log_sigma) * torch.randn_like(
+            self.slot_mu.expand(B, -1, -1)
+        )  # (B, K, slot_dim)
+
+        # Store attention weights from last iteration for masks
+        attn = None
+
+        # Iterative refinement
+        for _ in range(self.num_iterations):
+            slots_prev = slots
+
+            # Normalize slots
+            slots = self.norm_slots(slots)
+
+            # Compute queries from slots
+            q = self.to_q(slots)  # (B, K, slot_dim)
+
+            # Attention: each input pixel attends to slots
+            # attn_logits: (B, N, K) - for each pixel, scores over slots
+            attn_logits = torch.bmm(k, q.transpose(1, 2)) * self.scale  # (B, N, K)
+
+            # Softmax over slots (competition) - each pixel picks which slot(s)
+            attn = F.softmax(attn_logits, dim=-1)  # (B, N, K)
+
+            # Weighted mean: aggregate inputs to each slot
+            # attn_weights: (B, K, N) - for each slot, weights over pixels
+            attn_weights = attn.transpose(1, 2)  # (B, K, N)
+            attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # Aggregate values to slots
+            updates = torch.bmm(attn_weights, v)  # (B, K, slot_dim)
+
+            # GRU update
+            slots = self.gru(
+                updates.reshape(B * self.num_slots, self.slot_dim),
+                slots_prev.reshape(B * self.num_slots, self.slot_dim)
+            )
+            slots = slots.reshape(B, self.num_slots, self.slot_dim)
+
+            # MLP refinement with residual
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        # Compute final masks from attention weights
+        # attn: (B, N, K) -> masks: (B, K, H, W)
+        masks = attn.transpose(1, 2).reshape(B, self.num_slots, H, W)  # (B, K, H, W)
+
+        return slots, masks
+
+
+class SlotRoutedCrossAttention(nn.Module):
+    """
+    Cross-attention where output pixels attend to input pixels via slot routing.
+
+    Each output pixel:
+    1. Attends to K slots (using decoder features as query, slots as keys)
+    2. Combines slot attention with slot masks to get input pixel attention
+    3. Gathers values from IR encoder features
+
+    This allows output pixels to attend to input pixels through object-level
+    slot selection, enabling structured reasoning about objects.
+
+    Args:
+        query_dim: Dimension of decoder features (C)
+        slot_dim: Dimension of slot embeddings
+        value_dim: Dimension of IR encoder features (D)
+        proj_dim: Dimension for attention computation (defaults to slot_dim)
+    """
+
+    def __init__(self, query_dim: int, slot_dim: int, value_dim: int, proj_dim: int = None):
+        super().__init__()
+        proj_dim = proj_dim if proj_dim is not None else slot_dim
+
+        self.query_dim = query_dim
+        self.slot_dim = slot_dim
+        self.value_dim = value_dim
+        self.proj_dim = proj_dim
+        self.scale = proj_dim ** -0.5
+
+        # Query projection (from decoder features)
+        self.q_proj = nn.Linear(query_dim, proj_dim)
+        # Key projection (from slot embeddings)
+        self.k_proj = nn.Linear(slot_dim, proj_dim)
+        # Value projection (from IR features)
+        self.v_proj = nn.Linear(value_dim, proj_dim)
+        # Output projection (back to query_dim for residual)
+        self.out_proj = nn.Linear(proj_dim, query_dim)
+
+    def forward(self, decoder_features: torch.Tensor, slot_embeddings: torch.Tensor,
+                slot_masks: torch.Tensor, ir_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            decoder_features: (B, H_out, W_out, C) from U-Net decoder
+            slot_embeddings: (B, K, slot_dim) from SlotAttention
+            slot_masks: (B, K, H_in, W_in) from SlotAttention
+            ir_features: (B, H_in, W_in, D) from IR encoder
+
+        Returns:
+            output: (B, H_out, W_out, C) attended features for residual addition
+        """
+        B, H_out, W_out, C = decoder_features.shape
+        _, K, H_in, W_in = slot_masks.shape
+        N_out = H_out * W_out
+        N_in = H_in * W_in
+
+        # Step 1: Normalize slot masks (sum to 1 over spatial dimensions)
+        # This ensures attending to large vs small objects produces comparable magnitudes
+        masks_normalized = slot_masks / (slot_masks.sum(dim=(-2, -1), keepdim=True) + 1e-8)  # (B, K, H_in, W_in)
+
+        # Step 2: Compute slot attention weights
+        # Query from decoder features, keys from slot embeddings
+        q = self.q_proj(decoder_features.reshape(B, N_out, C))  # (B, N_out, proj_dim)
+        k = self.k_proj(slot_embeddings)  # (B, K, proj_dim)
+
+        # Attention scores over slots for each output pixel
+        slot_attn = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N_out, K)
+        slot_attn = F.softmax(slot_attn, dim=-1)  # (B, N_out, K)
+
+        # Step 3: Combine slot attention with slot masks via einsum
+        # For each output pixel, weight the slot masks by slot attention
+        # Result: attention distribution over input pixels for each output pixel
+        masks_flat = masks_normalized.reshape(B, K, N_in)  # (B, K, N_in)
+        # einsum: (B, N_out, K) x (B, K, N_in) -> (B, N_out, N_in)
+        combined_attn = torch.bmm(slot_attn, masks_flat)  # (B, N_out, N_in)
+
+        # Step 4: Gather values from IR encoder features
+        v = self.v_proj(ir_features.reshape(B, N_in, -1))  # (B, N_in, proj_dim)
+        # Weighted sum of input features for each output pixel
+        attended = torch.bmm(combined_attn, v)  # (B, N_out, proj_dim)
+
+        # Step 5: Project back to query_dim
+        output = self.out_proj(attended)  # (B, N_out, query_dim)
+
+        return output.reshape(B, H_out, W_out, self.query_dim)
+
+
 class PixelErrorCNN(nn.Module):
     """
-    U-Net style CNN with SPATIAL (side-by-side) concatenation of input and output.
+    U-Net style CNN for comparing input and output grids.
 
-    Input grid is placed on the LEFT, output grid on the RIGHT, creating a
-    (B, embed_dim, 30, 60) tensor that the U-Net processes spatially.
-
-    The model predicts colors only for the OUTPUT half (right 30 columns).
+    Concatenates input and output embeddings along the channel dimension,
+    allowing convolutions to see both grids at corresponding spatial positions.
 
     Predicts what color each pixel SHOULD be (0-9).
+    Optionally also predicts output size (height, width) using IR encoder.
     """
 
     def __init__(self, hidden_dim: int = 64,
                  no_skip: bool = False, num_layers: int = 3, conv_depth: int = 2,
-                 kernel_size: int = 3, use_onehot: bool = False):
+                 kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
+                 use_attention: bool = False, use_cross_attention: bool = False,
+                 cross_attention_heads: int = 1, cross_attention_position: str = "late",
+                 ir_checkpoint: str = None, use_untrained_ir: bool = False,
+                 ir_hidden_dim: int = 128, ir_out_dim: int = 64,
+                 ir_num_layers: int = 3, ir_kernel_size: int = 3,
+                 freeze_ir: bool = True,
+                 predict_size: bool = False, size_hidden_dim: int = 128,
+                 use_slot_cross_attention: bool = False,
+                 num_slots: int = 8, slot_dim: int = 64,
+                 slot_iterations: int = 3, slot_mlp_hidden: int = 128):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -298,6 +896,25 @@ class PixelErrorCNN(nn.Module):
         self.conv_depth = conv_depth
         self.kernel_size = kernel_size
         self.use_onehot = use_onehot
+        self.out_kernel_size = out_kernel_size
+        self.use_attention = use_attention
+        self.use_cross_attention = use_cross_attention
+        self.cross_attention_heads = cross_attention_heads
+        self.cross_attention_position = cross_attention_position
+        self.ir_checkpoint = ir_checkpoint
+        self.use_untrained_ir = use_untrained_ir
+        self.ir_hidden_dim = ir_hidden_dim
+        self.ir_out_dim = ir_out_dim
+        self.ir_num_layers = ir_num_layers
+        self.ir_kernel_size = ir_kernel_size
+        self.freeze_ir = freeze_ir
+        self.predict_size = predict_size
+        self.size_hidden_dim = size_hidden_dim
+        self.use_slot_cross_attention = use_slot_cross_attention
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.slot_iterations = slot_iterations
+        self.slot_mlp_hidden = slot_mlp_hidden
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -308,8 +925,57 @@ class PixelErrorCNN(nn.Module):
             self.input_embed = nn.Embedding(NUM_COLORS, 16)
             self.output_embed = nn.Embedding(NUM_COLORS, 16)
 
-        # Spatial concatenation: just embed_dim channels, width is doubled
-        in_channels = embed_dim
+        self.embed_dim = embed_dim
+
+        # Instance Recognition encoder for cross-attention (required for cross-attention)
+        self.ir_encoder = None
+        self.ir_self_attention = None
+        self.ir_feature_dim = None  # Store for cross-attention setup later
+
+        # Cross-attention requires IR encoder
+        if use_cross_attention and not (ir_checkpoint or use_untrained_ir):
+            raise ValueError(
+                "Cross-attention requires IR encoder. "
+                "Use --ir-checkpoint <path> or --use-untrained-ir"
+            )
+
+        if ir_checkpoint or use_untrained_ir:
+            if ir_checkpoint:
+                self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                self.ir_feature_dim = self.ir_encoder.out_dim  # Get from loaded checkpoint
+            else:
+                # Use randomly initialized IR encoder (for ablation study)
+                self.ir_encoder = IREncoder(
+                    hidden_dim=ir_hidden_dim,
+                    out_dim=ir_out_dim,
+                    num_layers=ir_num_layers,
+                    kernel_size=ir_kernel_size
+                )
+                self.ir_feature_dim = ir_out_dim
+            if freeze_ir and ir_checkpoint:
+                # Only freeze if using pretrained weights
+                for p in self.ir_encoder.parameters():
+                    p.requires_grad = False
+            # Self-attention on IR features before cross-attention
+            # All input pixels attend to each other before being queried by output
+            self.ir_self_attention = SpatialSelfAttention(self.ir_feature_dim)
+
+        # Cross-attention setup depends on position
+        # "early": operates on embeddings (embed_dim) before CNN
+        # "late": operates on decoder features (hidden_dim) after CNN
+        self.cross_attention = None
+        if use_cross_attention and cross_attention_position == "early":
+            # Early cross-attention on embeddings
+            self.cross_attention = CrossAttention(
+                query_dim=embed_dim,
+                kv_dim=self.ir_feature_dim,
+                proj_dim=embed_dim,
+                num_heads=cross_attention_heads
+            )
+        # Late cross-attention is created below after base_ch is defined
+
+        # Channel concatenation: embed_dim * 2 (inp, out)
+        in_channels = embed_dim * 2
 
         base_ch = hidden_dim
 
@@ -340,7 +1006,99 @@ class PixelErrorCNN(nn.Module):
                 self.up3 = Up(base_ch * 2, base_ch, conv_depth, kernel_size)
 
         # Output: 10 channels for color prediction
-        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=3, padding=1)
+        out_padding = (out_kernel_size - 1) // 2
+        self.outc = nn.Conv2d(base_ch, NUM_COLORS, kernel_size=out_kernel_size, padding=out_padding)
+
+        # Optional spatial self-attention before output
+        self.attention = SpatialSelfAttention(base_ch) if use_attention else None
+
+        # Late cross-attention: decoder features (query) attend to IR features (key/value)
+        # Applied after decoder, before outc - operates on hidden_dim features
+        if use_cross_attention and cross_attention_position == "late":
+            self.cross_attention = CrossAttention(
+                query_dim=base_ch,            # hidden_dim - decoder output channels
+                kv_dim=self.ir_feature_dim,   # IR encoder output dim
+                proj_dim=base_ch,             # Project to hidden_dim (divisible by common head counts)
+                num_heads=cross_attention_heads
+            )
+
+        # Slot-routed cross-attention (separate from regular cross-attention)
+        self.slot_attention = None
+        self.slot_cross_attention = None
+        if use_slot_cross_attention:
+            # Ensure IR encoder exists for slot attention
+            if self.ir_encoder is None:
+                if ir_checkpoint:
+                    self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                    ir_feature_dim = self.ir_encoder.out_dim
+                else:
+                    # Create untrained IR encoder for slot attention
+                    self.ir_encoder = IREncoder(
+                        hidden_dim=ir_hidden_dim,
+                        out_dim=ir_out_dim,
+                        num_layers=ir_num_layers,
+                        kernel_size=ir_kernel_size
+                    )
+                    ir_feature_dim = ir_out_dim
+                if freeze_ir and ir_checkpoint:
+                    for p in self.ir_encoder.parameters():
+                        p.requires_grad = False
+            else:
+                ir_feature_dim = self.ir_encoder.out_dim
+
+            # SlotAttention: discovers slots from IR features
+            self.slot_attention = SlotAttention(
+                input_dim=ir_feature_dim,
+                slot_dim=slot_dim,
+                num_slots=num_slots,
+                num_iterations=slot_iterations,
+                mlp_hidden_dim=slot_mlp_hidden
+            )
+
+            # SlotRoutedCrossAttention: applies after decoder, before outc
+            # query_dim = base_ch (decoder output channels)
+            self.slot_cross_attention = SlotRoutedCrossAttention(
+                query_dim=base_ch,
+                slot_dim=slot_dim,
+                value_dim=ir_feature_dim,
+                proj_dim=slot_dim
+            )
+
+        # Size prediction head (uses IR encoder features)
+        self.size_head = None
+        if predict_size:
+            # Ensure we have an IR encoder for size prediction
+            if self.ir_encoder is None:
+                if ir_checkpoint:
+                    self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                    ir_feature_dim = self.ir_encoder.out_dim
+                else:
+                    # Create untrained IR encoder for size prediction
+                    self.ir_encoder = IREncoder(
+                        hidden_dim=ir_hidden_dim,
+                        out_dim=ir_out_dim,
+                        num_layers=ir_num_layers,
+                        kernel_size=ir_kernel_size
+                    )
+                    ir_feature_dim = ir_out_dim
+                if freeze_ir and ir_checkpoint:
+                    for p in self.ir_encoder.parameters():
+                        p.requires_grad = False
+            else:
+                ir_feature_dim = self.ir_encoder.out_dim
+
+            # Size prediction MLP (global pool -> trunk -> height/width heads)
+            self.size_pool = nn.AdaptiveAvgPool2d(1)
+            self.size_trunk = nn.Sequential(
+                nn.Linear(ir_feature_dim, size_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(size_hidden_dim, size_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            )
+            self.height_head = nn.Linear(size_hidden_dim, GRID_SIZE)  # 30 classes
+            self.width_head = nn.Linear(size_hidden_dim, GRID_SIZE)   # 30 classes
 
     def _encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         """Encode grid to (B, H, W, 11) one-hot + nonzero mask."""
@@ -350,21 +1108,45 @@ class PixelErrorCNN(nn.Module):
         nonzero = (grid > 0).float().unsqueeze(-1)
         return torch.cat([onehot, nonzero], dim=-1)
 
-    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
-        # Encode both grids
+    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor):
+        """
+        Forward pass for pixel prediction and optionally size prediction.
+
+        Returns:
+            If predict_size=False: pixel_logits (B, 10, H, W)
+            If predict_size=True: dict with 'pixel_logits', 'height_logits', 'width_logits'
+        """
+        # Compute IR features for size prediction (if enabled) or cross-attention
+        ir_features_for_size = None
+        if self.ir_encoder is not None:
+            inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+            inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+            ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
+
+            # Save for size prediction before any modifications
+            if self.predict_size:
+                ir_features_for_size = ir_features.permute(0, 3, 1, 2).contiguous()  # (B, out_dim, H, W)
+
+        # Encode output grid (for queries and concatenation)
         if self.use_onehot:
-            inp_emb = self._encode_grid(input_grid)   # (B, 30, 30, 11)
             out_emb = self._encode_grid(output_grid)  # (B, 30, 30, 11)
         else:
-            inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
             out_emb = self.output_embed(output_grid)  # (B, 30, 30, 16)
 
-        # Spatial concatenation: input on left, output on right
-        # First permute to (B, C, H, W) format
-        inp_emb = inp_emb.permute(0, 3, 1, 2).contiguous()  # (B, 16, 30, 30)
-        out_emb = out_emb.permute(0, 3, 1, 2).contiguous()  # (B, 16, 30, 30)
-        # Concatenate along width dimension (dim=3)
-        x = torch.cat([inp_emb, out_emb], dim=3)  # (B, 16, 30, 60)
+        # Early cross-attention: output embeddings attend to IR features (before CNN)
+        if self.cross_attention is not None and self.cross_attention_position == "early":
+            out_emb = self.cross_attention(query=out_emb, key_value=ir_features)
+
+        # Encode input grid for U-Net concatenation (always use original embeddings)
+        if self.use_onehot:
+            inp_emb = self._encode_grid(input_grid)   # (B, 30, 30, 11)
+        else:
+            inp_emb = self.input_embed(input_grid)    # (B, 30, 30, 16)
+
+        # Channel concatenation: input and output side by side in channel dim
+        x = torch.cat([inp_emb, out_emb], dim=-1)  # (B, 30, 30, 32) or (B, 30, 30, 22)
+
+        x = x.permute(0, 3, 1, 2).contiguous()
 
         # U-Net forward - encoder
         x1 = self.inc(x)
@@ -412,20 +1194,117 @@ class PixelErrorCNN(nn.Module):
             else:  # num_layers == 1
                 x = self.up3(bottleneck, x1)
 
-        logits = self.outc(x)  # (B, 10, 30, 60) for spatial concat
-        # Extract only the output half (right 30 columns)
-        logits = logits[:, :, :, GRID_SIZE:]  # (B, 10, 30, 30)
-        return logits  # (B, 10, 30, 30) for color prediction
+        # Apply spatial self-attention if enabled
+        if self.attention is not None:
+            x = self.attention(x)
+
+        # Late cross-attention: decoder features attend to IR encoder features
+        # This allows the model to query the input representation for relevant context
+        if self.cross_attention is not None and self.cross_attention_position == "late":
+            # x is (B, C, H, W), need (B, H, W, C) for attention
+            x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, hidden_dim)
+            # ir_features is (B, H, W, ir_feature_dim) from earlier computation
+            x_perm = self.cross_attention(query=x_perm, key_value=ir_features)
+            x = x_perm.permute(0, 3, 1, 2).contiguous()  # Back to (B, C, H, W)
+
+        # Apply slot-routed cross-attention if enabled
+        if self.slot_cross_attention is not None:
+            # Compute slot embeddings and masks from IR features
+            slot_embeddings, slot_masks = self.slot_attention(ir_features)
+
+            # Permute decoder features for attention: (B, C, H, W) -> (B, H, W, C)
+            x_perm = x.permute(0, 2, 3, 1).contiguous()
+
+            # Apply slot-routed cross-attention (returns features for residual)
+            attended = self.slot_cross_attention(
+                decoder_features=x_perm,
+                slot_embeddings=slot_embeddings,
+                slot_masks=slot_masks,
+                ir_features=ir_features
+            )
+
+            # Residual connection: permute back and add
+            x = x + attended.permute(0, 3, 1, 2).contiguous()
+
+        pixel_logits = self.outc(x)  # (B, 10, H, W) for color prediction
+
+        # Size prediction (if enabled)
+        if self.predict_size and ir_features_for_size is not None:
+            # Global pool IR features and predict size
+            pooled = self.size_pool(ir_features_for_size).squeeze(-1).squeeze(-1)  # (B, ir_dim)
+            trunk_out = self.size_trunk(pooled)
+            height_logits = self.height_head(trunk_out)  # (B, 30)
+            width_logits = self.width_head(trunk_out)    # (B, 30)
+
+            return {
+                'pixel_logits': pixel_logits,
+                'height_logits': height_logits,
+                'width_logits': width_logits,
+            }
+
+        return pixel_logits
 
     def predict_proba(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
         """Return softmax probabilities for color prediction"""
-        logits = self.forward(input_grid, output_grid)
+        output = self.forward(input_grid, output_grid)
+        logits = output['pixel_logits'] if isinstance(output, dict) else output
         return F.softmax(logits, dim=1)
 
     def predict_colors(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> torch.Tensor:
         """Return predicted color per pixel"""
-        logits = self.forward(input_grid, output_grid)
+        output = self.forward(input_grid, output_grid)
+        logits = output['pixel_logits'] if isinstance(output, dict) else output
         return logits.argmax(dim=1)  # (B, H, W)
+
+    def predict_output_size(self, input_grid: torch.Tensor, output_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict output size (height, width).
+
+        Returns:
+            heights: (B,) predicted heights (1-30)
+            widths: (B,) predicted widths (1-30)
+        """
+        if not self.predict_size:
+            raise RuntimeError("Model was not initialized with predict_size=True")
+        output = self.forward(input_grid, output_grid)
+        heights = output['height_logits'].argmax(dim=1) + 1  # Convert 0-29 to 1-30
+        widths = output['width_logits'].argmax(dim=1) + 1
+        return heights, widths
+
+    def predict_size_from_input(self, input_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict output size from input grid only (no output grid needed).
+
+        This is the method to use at inference time when you don't have the output yet.
+        Size prediction only depends on the input grid via the IR encoder.
+
+        Args:
+            input_grid: (B, H, W) integer grid
+
+        Returns:
+            heights: (B,) predicted heights (1-30)
+            widths: (B,) predicted widths (1-30)
+        """
+        if not self.predict_size:
+            raise RuntimeError("Model was not initialized with predict_size=True")
+        if self.ir_encoder is None:
+            raise RuntimeError("Size prediction requires an IR encoder")
+
+        # Encode input with IR encoder
+        inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+        inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+        ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
+        ir_features = ir_features.permute(0, 3, 1, 2).contiguous()  # (B, out_dim, H, W)
+
+        # Global pool and predict size
+        pooled = self.size_pool(ir_features).squeeze(-1).squeeze(-1)  # (B, ir_dim)
+        trunk_out = self.size_trunk(pooled)
+        height_logits = self.height_head(trunk_out)
+        width_logits = self.width_head(trunk_out)
+
+        heights = height_logits.argmax(dim=1) + 1  # Convert 0-29 to 1-30
+        widths = width_logits.argmax(dim=1) + 1
+        return heights, widths
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None):
@@ -451,6 +1330,20 @@ class PixelErrorCNN(nn.Module):
                 conv_depth = 2
 
         use_onehot = args.get('use_onehot', False)
+        out_kernel_size = args.get('out_kernel_size', 1)
+        use_attention = args.get('use_attention', False)
+        use_cross_attention = args.get('use_cross_attention', False)
+        cross_attention_heads = args.get('cross_attention_heads', 1)
+        cross_attention_position = args.get('cross_attention_position', 'late')
+        ir_checkpoint = args.get('ir_checkpoint', None)
+        use_untrained_ir = args.get('use_untrained_ir', False)
+        ir_hidden_dim = args.get('ir_hidden_dim', 128)
+        ir_out_dim = args.get('ir_out_dim', 64)
+        ir_num_layers = args.get('ir_num_layers', 3)
+        ir_kernel_size = args.get('ir_kernel_size', 3)
+        freeze_ir = args.get('freeze_ir', True)
+        predict_size = args.get('predict_size', False)
+        size_hidden_dim = args.get('size_hidden_dim', 128)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -458,7 +1351,21 @@ class PixelErrorCNN(nn.Module):
             num_layers=num_layers,
             conv_depth=conv_depth,
             kernel_size=kernel_size,
-            use_onehot=use_onehot
+            use_onehot=use_onehot,
+            out_kernel_size=out_kernel_size,
+            use_attention=use_attention,
+            use_cross_attention=use_cross_attention,
+            cross_attention_heads=cross_attention_heads,
+            cross_attention_position=cross_attention_position,
+            ir_checkpoint=ir_checkpoint,
+            use_untrained_ir=use_untrained_ir,
+            ir_hidden_dim=ir_hidden_dim,
+            ir_out_dim=ir_out_dim,
+            ir_num_layers=ir_num_layers,
+            ir_kernel_size=ir_kernel_size,
+            freeze_ir=freeze_ir,
+            predict_size=predict_size,
+            size_hidden_dim=size_hidden_dim,
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -466,6 +1373,102 @@ class PixelErrorCNN(nn.Module):
         if device:
             model = model.to(device)
         return model
+
+
+# =============================================================================
+# Critic CNN - Predicts which pixels are wrong from output only
+# =============================================================================
+
+class CriticCNN(nn.Module):
+    """
+    Critic network that predicts which pixels are wrong in a predicted output.
+
+    Only sees the predicted output grid - no input, no ground truth at inference.
+    Trained concurrently with PixelErrorCNN to learn error patterns.
+
+    Architecture: Simplified U-Net
+    - Input: predicted output grid (10 channels one-hot)
+    - Output: per-pixel error probability (1 channel, sigmoid)
+    """
+
+    def __init__(self, hidden_dim: int = 32, num_layers: int = 3,
+                 conv_depth: int = 2, kernel_size: int = 3):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.conv_depth = conv_depth
+        self.kernel_size = kernel_size
+
+        # Input: one-hot encoded grid (10 channels)
+        in_channels = NUM_COLORS  # 10
+        base_ch = hidden_dim
+
+        # Encoder
+        self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
+        if num_layers >= 1:
+            self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
+        if num_layers >= 2:
+            self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
+        if num_layers >= 3:
+            self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
+
+        # Decoder with skip connections
+        if num_layers >= 3:
+            self.up1 = Up(base_ch * 8, base_ch * 4, conv_depth, kernel_size)
+        if num_layers >= 2:
+            self.up2 = Up(base_ch * 4, base_ch * 2, conv_depth, kernel_size)
+        if num_layers >= 1:
+            self.up3 = Up(base_ch * 2, base_ch, conv_depth, kernel_size)
+
+        # Output: single channel (error probability)
+        self.outc = nn.Conv2d(base_ch, 1, kernel_size=1)
+
+    def forward(self, pred_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred_grid: (B, H, W) predicted output grid with values 0-9
+
+        Returns:
+            error_probs: (B, 1, H, W) probability each pixel is wrong
+        """
+        # One-hot encode the predicted grid
+        x = F.one_hot(pred_grid.long(), NUM_COLORS).float()  # (B, H, W, 10)
+        x = x.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+
+        # Encoder path
+        x1 = self.inc(x)  # (B, base_ch, H, W)
+
+        if self.num_layers >= 1:
+            x2 = self.down1(x1)  # (B, base_ch*2, H/2, W/2)
+        if self.num_layers >= 2:
+            x3 = self.down2(x2)  # (B, base_ch*4, H/4, W/4)
+        if self.num_layers >= 3:
+            x4 = self.down3(x3)  # (B, base_ch*8, H/8, W/8)
+
+        # Decoder path with skip connections
+        if self.num_layers >= 3:
+            x = self.up1(x4, x3)
+        else:
+            x = x3 if self.num_layers >= 2 else (x2 if self.num_layers >= 1 else x1)
+        if self.num_layers >= 2:
+            x = self.up2(x, x2)
+        if self.num_layers >= 1:
+            x = self.up3(x, x1)
+
+        # Output layer (no sigmoid - use BCEWithLogitsLoss)
+        logits = self.outc(x)  # (B, 1, H, W)
+        return logits
+
+    def predict_errors(self, pred_grid: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+        """Return binary error prediction."""
+        logits = self.forward(pred_grid)
+        probs = torch.sigmoid(logits)
+        return (probs > threshold).float().squeeze(1)  # (B, H, W)
+
+    def predict_proba(self, pred_grid: torch.Tensor) -> torch.Tensor:
+        """Return error probabilities."""
+        logits = self.forward(pred_grid)
+        return torch.sigmoid(logits).squeeze(1)  # (B, H, W)
 
 
 # =============================================================================
@@ -479,8 +1482,8 @@ class CorrespondenceDataset(Dataset):
     Sample types:
     1. POSITIVE: (input, output) with SAME augmentation applied to both
     2. NEGATIVE - corrupted: (input, corrupted_output)
-    3. NEGATIVE - wrong input: (wrong_input, correct_output) â† CRITICAL
-    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) â† CRITICAL
+    3. NEGATIVE - wrong input: (wrong_input, correct_output) - CRITICAL
+    4. NEGATIVE - mismatched aug: (aug1(input), aug2(output)) - CRITICAL
     5. NEGATIVE - all_zeros: output is all zeros (blank)
     6. NEGATIVE - constant_fill: output is all one color (1-9)
     7. NEGATIVE - random_noise: output is random values
@@ -737,6 +1740,11 @@ class CorrespondenceDataset(Dataset):
             target_correct = aug_output  # What it SHOULD be
             is_positive = 0.0
 
+        # Track target output dimensions (after augmentation)
+        # For positive samples, use the augmented output shape
+        # For negatives, use the correct output shape (what it SHOULD be)
+        target_out_h, target_out_w = target_correct.shape
+
         # Pad grids
         final_input = self._pad_grid(final_input)
         final_output = self._pad_grid(final_output)
@@ -773,6 +1781,7 @@ class CorrespondenceDataset(Dataset):
             torch.from_numpy(final_output.copy()).long(),
             torch.from_numpy(target_correct.copy()).long(),  # Target colors (0-9)
             torch.from_numpy(pixel_mask.copy()).float(),  # Still useful for metrics
+            torch.tensor([target_out_h, target_out_w], dtype=torch.long),  # Target output dims
         )
 
 
@@ -837,15 +1846,21 @@ class TestEvalDataset(Dataset):
 
 def visualize_prediction(
     input_grid: np.ndarray,
-    target_grid: np.ndarray, 
+    target_grid: np.ndarray,
     pred_grid: np.ndarray,
     inp_h: int,
     inp_w: int,
-    out_h: int, 
+    out_h: int,
     out_w: int,
-    puzzle_id: str
+    puzzle_id: str,
+    pred_size: Tuple[int, int] = None
 ):
-    """Visualize input, target output, and prediction stacked vertically."""
+    """Visualize input, target output, and prediction stacked vertically.
+
+    Args:
+        pred_size: Optional (pred_h, pred_w) tuple. If provided, shows predicted size
+                   and uses it to crop the prediction display.
+    """
     # Color codes for terminal (ANSI) - 256 color mode for better visibility
     COLORS = [
         '\033[48;5;0m',    # 0: black
@@ -860,42 +1875,177 @@ def visualize_prediction(
         '\033[48;5;88m',   # 9: maroon
     ]
     RESET = '\033[0m'
-    
+
+    # Determine display dimensions for prediction
+    if pred_size is not None:
+        disp_h, disp_w = pred_size
+        size_correct = (disp_h == out_h and disp_w == out_w)
+    else:
+        disp_h, disp_w = out_h, out_w
+        size_correct = True
+
     # Extract actual regions using provided dimensions
     inp = input_grid[:inp_h, :inp_w]
     tgt = target_grid[:out_h, :out_w]
-    pred = pred_grid[:out_h, :out_w]
+    pred = pred_grid[:disp_h, :disp_w]  # Use predicted size for display
+
+    # Calculate errors in overlapping region
+    compare_h, compare_w = min(disp_h, out_h), min(disp_w, out_w)
+    errors = (pred_grid[:compare_h, :compare_w] != target_grid[:compare_h, :compare_w]).sum()
+    is_perfect = (errors == 0) and size_correct
     
-    # Calculate errors
-    errors = (pred != tgt).sum()
-    total = out_h * out_w
-    
-    print(f"\n{'â•'*50}")
-    if errors == 0:
-        print(f"\033[92mâœ“ PERFECT: {puzzle_id}\033[0m")
+    print(f"\n{'='*50}")
+    if is_perfect:
+        print(f"[PERFECT] {puzzle_id}")
     else:
-        print(f"\033[91mâœ— {puzzle_id}: {errors}/{total} errors ({100*errors/total:.1f}% wrong)\033[0m")
-    print(f"  Input: {inp_h}Ã—{inp_w} â†’ Output: {out_h}Ã—{out_w}")
-    print(f"{'â•'*50}")
+        print(f"[ERRORS: {errors}/{compare_h*compare_w}] {puzzle_id}")
+
+    # Show size info
+    if pred_size is not None:
+        if size_correct:
+            print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w} (size correct)")
+        else:
+            print(f"  Input: {inp_h}x{inp_w} -> True: {out_h}x{out_w}, Pred: {disp_h}x{disp_w} (SIZE WRONG)")
+    else:
+        print(f"  Input: {inp_h}x{inp_w} -> Output: {out_h}x{out_w}")
+    print(f"{'='*50}")
     
-    def print_grid(grid, label, rows, cols, highlight_errors=False, target=None):
+    def print_grid(grid, label, rows, cols, highlight_errors=False, target=None, mark_outside=False, true_rows=None, true_cols=None):
         print(f"\n{label}:")
         for r in range(rows):
             row_str = "  "
             for c in range(cols):
                 val = grid[r, c]
-                if highlight_errors and target is not None and grid[r, c] != target[r, c]:
+                # Check if outside true target region (size mismatch - extra pixels)
+                outside = mark_outside and true_rows is not None and true_cols is not None and (r >= true_rows or c >= true_cols)
+                if outside:
+                    # Yellow background for extra pixels
+                    row_str += f"\033[43m\033[30m{val}\033[0m "
+                elif highlight_errors and target is not None and r < target.shape[0] and c < target.shape[1] and grid[r, c] != target[r, c]:
                     # White text on red background for errors
                     row_str += f"\033[41m\033[97m{val}\033[0m "
                 else:
                     row_str += f"{COLORS[val]}{val}{RESET} "
             print(row_str)
-    
+
     # Print grids stacked
     print_grid(inp, "INPUT", inp_h, inp_w)
     print_grid(tgt, "TARGET", out_h, out_w)
-    print_grid(pred, "PREDICTION (errors in red)", out_h, out_w, highlight_errors=True, target=tgt)
-    
+
+    # For prediction, show with predicted size and highlight errors/extra pixels
+    pred_label = "PREDICTION"
+    if pred_size is not None and not size_correct:
+        pred_label += f" ({disp_h}x{disp_w}, errors=red, extra=yellow)"
+    else:
+        pred_label += " (errors in red)"
+    print_grid(pred, pred_label, disp_h, disp_w, highlight_errors=True, target=tgt,
+               mark_outside=(not size_correct), true_rows=out_h, true_cols=out_w)
+
+    print()
+
+
+def visualize_critic_prediction(
+    pred_output: np.ndarray,
+    ground_truth: np.ndarray,
+    critic_pred_errors: np.ndarray,
+    out_h: int,
+    out_w: int,
+    puzzle_id: str = "",
+):
+    """
+    Visualize critic's error predictions vs actual errors.
+
+    Shows:
+    - Predicted output from main model
+    - Ground truth
+    - Actual errors (where prediction != truth)
+    - Critic's predicted errors
+    - Color coding: TP=green, FP=yellow, FN=red, TN=default
+
+    Args:
+        pred_output: (H, W) predicted output grid from main model
+        ground_truth: (H, W) ground truth grid
+        critic_pred_errors: (H, W) binary mask of critic's error predictions
+        out_h, out_w: actual output dimensions (to crop padding)
+        puzzle_id: optional puzzle identifier
+    """
+    # Color codes for terminal
+    COLORS = [
+        '\033[48;5;0m',    # 0: black
+        '\033[48;5;21m',   # 1: blue
+        '\033[48;5;196m',  # 2: red
+        '\033[48;5;46m',   # 3: green
+        '\033[48;5;226m',  # 4: yellow
+        '\033[48;5;250m',  # 5: gray
+        '\033[48;5;201m',  # 6: magenta
+        '\033[48;5;208m',  # 7: orange
+        '\033[48;5;51m',   # 8: cyan
+        '\033[48;5;88m',   # 9: maroon
+    ]
+    RESET = '\033[0m'
+    GREEN_BG = '\033[42m\033[30m'  # TP: correctly predicted error
+    YELLOW_BG = '\033[43m\033[30m'  # FP: predicted error but was correct
+    RED_BG = '\033[41m\033[97m'    # FN: missed error
+
+    # Crop to actual dimensions
+    pred = pred_output[:out_h, :out_w]
+    truth = ground_truth[:out_h, :out_w]
+    critic_pred = critic_pred_errors[:out_h, :out_w]
+
+    # Compute actual errors
+    actual_errors = (pred != truth)
+
+    # Compute confusion matrix elements
+    tp = (critic_pred & actual_errors).sum()
+    fp = (critic_pred & ~actual_errors).sum()
+    fn = (~critic_pred & actual_errors).sum()
+    tn = (~critic_pred & ~actual_errors).sum()
+
+    # Metrics
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    print(f"\n{'='*60}")
+    print(f"CRITIC EVALUATION {puzzle_id}")
+    print(f"{'='*60}")
+    print(f"Precision: {precision:.3f}  Recall: {recall:.3f}  F1: {f1:.3f}")
+    print(f"TP: {tp}  FP: {fp}  FN: {fn}  TN: {tn}")
+    print(f"Total errors: {actual_errors.sum()}  Predicted errors: {critic_pred.sum()}")
+    print(f"{'='*60}")
+
+    def print_grid(grid, label, rows, cols):
+        print(f"\n{label}:")
+        for r in range(rows):
+            row_str = "  "
+            for c in range(cols):
+                val = grid[r, c]
+                row_str += f"{COLORS[val]}{val}{RESET} "
+            print(row_str)
+
+    def print_error_grid(actual, predicted, label, rows, cols):
+        """Print error grid with TP/FP/FN highlighting."""
+        print(f"\n{label}:")
+        print("  (green=TP, yellow=FP, red=FN)")
+        for r in range(rows):
+            row_str = "  "
+            for c in range(cols):
+                is_actual = actual[r, c]
+                is_pred = predicted[r, c]
+                if is_pred and is_actual:
+                    row_str += f"{GREEN_BG}X{RESET} "  # TP
+                elif is_pred and not is_actual:
+                    row_str += f"{YELLOW_BG}X{RESET} "  # FP
+                elif not is_pred and is_actual:
+                    row_str += f"{RED_BG}X{RESET} "  # FN
+                else:
+                    row_str += ". "  # TN
+            print(row_str)
+
+    # Print grids
+    print_grid(pred, "MAIN MODEL OUTPUT", out_h, out_w)
+    print_grid(truth, "GROUND TRUTH", out_h, out_w)
+    print_error_grid(actual_errors, critic_pred, "CRITIC ERROR PREDICTION", out_h, out_w)
     print()
 
 
@@ -913,43 +2063,76 @@ def evaluate_test_examples(
 
     With recursive_iters > 1, we feed the model's output back as the candidate
     and iterate, tracking accuracy at each step.
+
+    If model.predict_size is True, uses predicted size to constrain pixel predictions.
     """
     model.eval()
-    
+
+    # Check if model predicts size
+    uses_size_prediction = getattr(model, 'predict_size', False)
+
     total_pixels = 0
     total_correct = 0
     total_examples = 0
     perfect_examples = 0
-    
+
+    # Size prediction stats (when using predicted size)
+    size_height_correct = 0
+    size_width_correct = 0
+    size_both_correct = 0
+
     # Track per-iteration stats
     iter_stats = {i: {"correct": 0, "total": 0} for i in range(recursive_iters)}
-    
+
     results = []
-    
+
     with torch.no_grad():
         for i in range(len(dataset)):
             input_grid, output_grid, dims, puzzle_id = dataset[i]
-            inp_h, inp_w, out_h, out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
-            
+            inp_h, inp_w, true_out_h, true_out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
+
             inp_t = input_grid.unsqueeze(0).to(device)
             target_colors = output_grid.numpy()
-            
+
+            # Predict output size if model supports it
+            if uses_size_prediction:
+                pred_h, pred_w = model.predict_size_from_input(inp_t)
+                pred_h, pred_w = pred_h.item(), pred_w.item()
+
+                # Track size prediction accuracy
+                h_correct = (pred_h == true_out_h)
+                w_correct = (pred_w == true_out_w)
+                size_height_correct += int(h_correct)
+                size_width_correct += int(w_correct)
+                size_both_correct += int(h_correct and w_correct)
+
+                # Use predicted size for evaluation (constraining pixel predictions)
+                eval_h, eval_w = pred_h, pred_w
+            else:
+                pred_h, pred_w = None, None
+                eval_h, eval_w = true_out_h, true_out_w
+
             # Start with blank candidate
             candidate = torch.zeros_like(input_grid).unsqueeze(0).to(device)
 
             # Recursive iteration
             for iter_idx in range(recursive_iters):
                 # Predict colors from (input, current_candidate)
-                logits = model(inp_t, candidate)  # (1, 10, H, W)
+                output = model(inp_t, candidate)
+                # Handle dict output when predict_size=True
+                logits = output['pixel_logits'] if isinstance(output, dict) else output  # (1, 10, H, W)
                 pred_colors = logits.argmax(dim=1)  # (1, H, W)
 
-                # Track accuracy at this iteration
+                # Track accuracy at this iteration using PREDICTED size for cropping
                 pred_np = pred_colors[0].cpu().numpy()
-                pred_region = pred_np[:out_h, :out_w]
-                target_region = target_colors[:out_h, :out_w]
+                pred_region = pred_np[:eval_h, :eval_w]
+
+                # For accuracy, we need to compare against target at the SAME region
+                # If predicted size differs from true size, this naturally penalizes wrong size predictions
+                target_region = target_colors[:eval_h, :eval_w]
 
                 correct = (pred_region == target_region).sum()
-                total = out_h * out_w
+                total = eval_h * eval_w
 
                 iter_stats[iter_idx]["correct"] += correct
                 iter_stats[iter_idx]["total"] += total
@@ -958,7 +2141,7 @@ def evaluate_test_examples(
                 candidate = pred_colors.long()
 
             # Final results use last iteration
-            is_perfect = (correct == total)
+            is_perfect = (correct == total) and (eval_h == true_out_h) and (eval_w == true_out_w)
 
             # Visualize final result
             if visualize:
@@ -967,8 +2150,9 @@ def evaluate_test_examples(
                     target_colors,
                     pred_np,
                     inp_h, inp_w,
-                    out_h, out_w,
-                    puzzle_id
+                    true_out_h, true_out_w,
+                    puzzle_id,
+                    pred_size=(pred_h, pred_w) if uses_size_prediction else None
                 )
 
             total_correct += correct
@@ -976,25 +2160,33 @@ def evaluate_test_examples(
             total_examples += 1
             if is_perfect:
                 perfect_examples += 1
-            
+
             results.append({
                 'puzzle_id': puzzle_id,
                 'correct': correct,
                 'total': total,
                 'accuracy': correct / total,
-                'perfect': is_perfect
+                'perfect': is_perfect,
+                'pred_h': pred_h,
+                'pred_w': pred_w,
+                'true_h': true_out_h,
+                'true_w': true_out_w,
             })
-            
+
             if verbose and not visualize:
-                status = "âœ“ PERFECT" if is_perfect else f"âœ— {correct}/{total} ({100*correct/total:.1f}%)"
-                print(f"  Example {i+1}: {puzzle_id} - {status}")
+                size_info = ""
+                if uses_size_prediction:
+                    size_match = "✓" if (pred_h == true_out_h and pred_w == true_out_w) else "✗"
+                    size_info = f" [size: {pred_h}×{pred_w} vs {true_out_h}×{true_out_w} {size_match}]"
+                status = "✓ PERFECT" if is_perfect else f"✗ {correct}/{total} ({100*correct/total:.1f}%)"
+                print(f"  Example {i+1}: {puzzle_id} - {status}{size_info}")
     
     overall_accuracy = total_correct / max(total_pixels, 1)
     perfect_rate = perfect_examples / max(total_examples, 1)
     
     # Print per-iteration accuracy if recursive
     if recursive_iters > 1 and verbose:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print("ACCURACY BY ITERATION:")
         for iter_idx in range(recursive_iters):
             iter_correct = iter_stats[iter_idx]["correct"]
@@ -1006,9 +2198,9 @@ def evaluate_test_examples(
                 diff = iter_acc - prev_acc
                 delta = f" ({'+' if diff >= 0 else ''}{100*diff:.2f}%)"
             print(f"  Iteration {iter_idx}: {100*iter_acc:.2f}%{delta}")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
     
-    return {
+    result = {
         'pixel_accuracy': overall_accuracy,
         'perfect_rate': perfect_rate,
         'total_examples': total_examples,
@@ -1016,6 +2208,19 @@ def evaluate_test_examples(
         'results': results,
         'iter_stats': iter_stats if recursive_iters > 1 else None,
     }
+
+    # Add size prediction stats if applicable
+    if uses_size_prediction and total_examples > 0:
+        result['size_height_accuracy'] = size_height_correct / total_examples
+        result['size_width_accuracy'] = size_width_correct / total_examples
+        result['size_both_accuracy'] = size_both_correct / total_examples
+        if verbose:
+            print(f"\nSize Prediction Accuracy:")
+            print(f"  Height: {size_height_correct}/{total_examples} ({100*size_height_correct/total_examples:.1f}%)")
+            print(f"  Width:  {size_width_correct}/{total_examples} ({100*size_width_correct/total_examples:.1f}%)")
+            print(f"  Both:   {size_both_correct}/{total_examples} ({100*size_both_correct/total_examples:.1f}%)")
+
+    return result
 
 
 # =============================================================================
@@ -1055,7 +2260,7 @@ def run_layer_ablation(
     print(f"BASELINE (no ablation):")
     print(f"  Pixel Accuracy: {baseline_acc:.2%}")
     print(f"  Perfect Rate:   {baseline_perfect:.2%}")
-    print(f"{'─'*70}\n")
+    print(f"{'-'*70}\n")
 
     # PixelErrorCNN (U-Net) layers - build based on num_layers
     encoder_layers = [
@@ -1193,17 +2398,17 @@ def run_layer_ablation(
         print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} drop ({res['accuracy']:.2%} remaining)")
     
     # Interpretation
-    print("\n" + "─"*70)
+    print("\n" + "-"*70)
     print("INTERPRETATION:")
     
     critical_layers = [name for name, res in sorted_layers if res["accuracy_drop"] > 0.3]
     if critical_layers:
-        print(f"  • Critical layers: {', '.join(critical_layers)}")
+        print(f"  * Critical layers: {', '.join(critical_layers)}")
         print(f"    These layers store essential transformation knowledge.")
     
     minimal_layers = [name for name, res in sorted_layers if res["accuracy_drop"] < 0.02]
     if minimal_layers:
-        print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+        print(f"  * Minimal-impact layers: {', '.join(minimal_layers)}")
         print(f"    These layers may be redundant or store non-essential features.")
     
     # Check if attention matters
@@ -1212,13 +2417,13 @@ def run_layer_ablation(
     if attention_results:
         attn_drop = max(res["accuracy_drop"] for res in attention_results)
         if attn_drop > 0.1:
-            print(f"  • Attention is important (drop: {attn_drop:+.2%})")
+            print(f"  * Attention is important (drop: {attn_drop:+.2%})")
             print(f"    The transformation likely requires global/relational reasoning.")
         else:
-            print(f"  • Attention has minimal impact (drop: {attn_drop:+.2%})")
+            print(f"  * Attention has minimal impact (drop: {attn_drop:+.2%})")
             print(f"    The transformation may be primarily local/convolutional.")
     
-    print("─"*70 + "\n")
+    print("-"*70 + "\n")
     
     return {
         "baseline": {"accuracy": baseline_acc, "perfect_rate": baseline_perfect},
@@ -1226,56 +2431,220 @@ def run_layer_ablation(
     }
 
 
+def create_output_region_mask(output_dims: torch.Tensor, grid_size: int = GRID_SIZE) -> torch.Tensor:
+    """
+    Create a mask that is 1.0 for the actual output region and 0.0 for padding.
+
+    Args:
+        output_dims: (B, 2) tensor with (height, width) for each sample
+        grid_size: Size of the padded grid (default: 30)
+
+    Returns:
+        mask: (B, grid_size, grid_size) tensor with 1.0 in content region, 0.0 in padding
+    """
+    batch_size = output_dims.size(0)
+    device = output_dims.device
+
+    # Create coordinate grids
+    rows = torch.arange(grid_size, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, H)
+    cols = torch.arange(grid_size, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, W)
+
+    # Get heights and widths for each sample
+    heights = output_dims[:, 0].unsqueeze(1)  # (B, 1)
+    widths = output_dims[:, 1].unsqueeze(1)   # (B, 1)
+
+    # Create row and column masks
+    row_mask = (rows < heights).float()  # (B, H)
+    col_mask = (cols < widths).float()   # (B, W)
+
+    # Combine to get 2D mask: outer product
+    mask = row_mask.unsqueeze(2) * col_mask.unsqueeze(1)  # (B, H, W)
+
+    return mask
+
+
+def masked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cross-entropy loss only on masked (content) pixels.
+
+    Args:
+        logits: (B, C, H, W) prediction logits
+        targets: (B, H, W) target class indices
+        mask: (B, H, W) binary mask (1.0 for content, 0.0 for padding)
+
+    Returns:
+        Scalar loss averaged over masked pixels
+    """
+    # Compute per-pixel loss
+    per_pixel_loss = F.cross_entropy(logits, targets, reduction='none')  # (B, H, W)
+
+    # Apply mask and compute mean over content pixels only
+    masked_loss = per_pixel_loss * mask
+    num_content_pixels = mask.sum()
+
+    if num_content_pixels > 0:
+        return masked_loss.sum() / num_content_pixels
+    else:
+        return masked_loss.sum()  # Fallback (shouldn't happen)
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    size_weight: float = 0.0,  # Weight for size prediction loss (0 = pixel only)
+    critic: nn.Module = None,  # Optional critic CNN for error prediction
+    critic_optimizer: torch.optim.Optimizer = None,  # Critic optimizer
 ) -> Dict[str, float]:
-    """Training epoch for color prediction"""
+    """Training epoch for color prediction (and optionally size prediction and critic)"""
     model.train()
+    if critic is not None:
+        critic.train()
 
     total_loss = 0.0
+    total_pixel_loss = 0.0
+    total_size_loss = 0.0
     total_color_correct = 0
     total_pixels = 0
     total_error_pixels = 0
     total_error_color_correct = 0
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
+    total_samples = 0
     num_batches = 0
 
+    # Critic metrics
+    total_critic_loss = 0.0
+    total_critic_tp = 0  # True positives (correctly predicted errors)
+    total_critic_fp = 0  # False positives (predicted error but was correct)
+    total_critic_fn = 0  # False negatives (missed errors)
+    total_critic_tn = 0  # True negatives (correctly predicted correct)
+
     pbar = tqdm(loader, desc="Training")
-    for input_grid, output_grid, target_colors, pixel_mask in pbar:
+    for input_grid, output_grid, target_colors, pixel_mask, output_dims in pbar:
         input_grid = input_grid.to(device)
         output_grid = output_grid.to(device)
         target_colors = target_colors.to(device)
         pixel_mask = pixel_mask.to(device)
+        output_dims = output_dims.to(device)
 
         optimizer.zero_grad()
 
-        logits = model(input_grid, output_grid)  # (B, 10, H, W)
-        
-        # Cross-entropy loss for color prediction
-        loss = F.cross_entropy(logits, target_colors)
+        output = model(input_grid, output_grid)
+
+        # Create mask for actual output region (excludes padding)
+        content_mask = create_output_region_mask(output_dims)
+
+        # Handle both dict (with size) and tensor (pixel only) outputs
+        if isinstance(output, dict):
+            pixel_logits = output['pixel_logits']
+            height_logits = output['height_logits']
+            width_logits = output['width_logits']
+
+            # Pixel loss - MASKED to only compute on actual output region
+            pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
+
+            # Size loss (convert sizes 1-30 to classes 0-29)
+            target_h = output_dims[:, 0] - 1
+            target_w = output_dims[:, 1] - 1
+            size_loss = (F.cross_entropy(height_logits, target_h) +
+                         F.cross_entropy(width_logits, target_w)) / 2
+
+            # Combined loss
+            loss = pixel_loss + size_weight * size_loss
+        else:
+            pixel_logits = output
+            # Pixel loss - MASKED to only compute on actual output region
+            pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
+            loss = pixel_loss
+            size_loss = torch.tensor(0.0)
 
         loss.backward()
         optimizer.step()
 
+        # Get predicted colors for critic and metrics
         with torch.no_grad():
-            pred_colors = logits.argmax(dim=1)  # (B, H, W)
-            
-            # Overall color accuracy
-            correct = (pred_colors == target_colors).sum().item()
-            total = target_colors.numel()
+            pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
+
+        # Train critic if provided
+        if critic is not None and critic_optimizer is not None:
+            critic_optimizer.zero_grad()
+
+            # Critic sees only the predicted colors (detached from main model)
+            critic_input = pred_colors.detach()
+
+            # Critic predicts error logits
+            error_logits = critic(critic_input)  # (B, 1, H, W)
+            error_logits = error_logits.squeeze(1)  # (B, H, W)
+
+            # Actual errors: where prediction differs from target (only in content region)
+            actual_errors = (pred_colors != target_colors).float()  # (B, H, W)
+
+            # BCE loss with masking to content region
+            # pos_weight helps with class imbalance (errors are often rare later in training)
+            bce_loss = F.binary_cross_entropy_with_logits(
+                error_logits, actual_errors, reduction='none'
+            )
+            # Mask to content region
+            masked_bce = bce_loss * content_mask
+            critic_loss = masked_bce.sum() / content_mask.sum().clamp(min=1)
+
+            critic_loss.backward()
+            critic_optimizer.step()
+
+            # Track critic metrics
+            with torch.no_grad():
+                pred_errors = (torch.sigmoid(error_logits) > 0.5).float()
+                actual_bool = actual_errors.bool()
+                pred_bool = pred_errors.bool()
+                content_bool = content_mask.bool()
+
+                # Only count within content region
+                tp = ((pred_bool & actual_bool) & content_bool).sum().item()
+                fp = ((pred_bool & ~actual_bool) & content_bool).sum().item()
+                fn = ((~pred_bool & actual_bool) & content_bool).sum().item()
+                tn = ((~pred_bool & ~actual_bool) & content_bool).sum().item()
+
+                total_critic_tp += tp
+                total_critic_fp += fp
+                total_critic_fn += fn
+                total_critic_tn += tn
+                total_critic_loss += critic_loss.item()
+
+        with torch.no_grad():
+
+            # Overall color accuracy - only on content pixels (not padding)
+            content_mask_bool = content_mask.bool()
+            correct = ((pred_colors == target_colors) & content_mask_bool).sum().item()
+            total = content_mask.sum().item()
             total_color_correct += correct
             total_pixels += total
 
             # Accuracy on error pixels only (pixels where output != target)
-            error_mask = (pixel_mask == 0)  # pixels that are wrong
+            # Also restrict to content region
+            error_mask = (pixel_mask == 0) & content_mask_bool  # pixels that are wrong AND in content
             if error_mask.sum() > 0:
                 error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
                 total_error_color_correct += error_correct
                 total_error_pixels += error_mask.sum().item()
 
+            # Size accuracy (if predicting size)
+            if isinstance(output, dict):
+                pred_h = height_logits.argmax(dim=1)
+                pred_w = width_logits.argmax(dim=1)
+                target_h = output_dims[:, 0] - 1
+                target_w = output_dims[:, 1] - 1
+
+                total_height_correct += (pred_h == target_h).sum().item()
+                total_width_correct += (pred_w == target_w).sum().item()
+                total_both_correct += ((pred_h == target_h) & (pred_w == target_w)).sum().item()
+                total_samples += input_grid.size(0)
+                total_size_loss += size_loss.item()
+
             total_loss += loss.item()
+            total_pixel_loss += pixel_loss.item()
             num_batches += 1
 
         pbar.set_postfix(loss=loss.item())
@@ -1283,72 +2652,378 @@ def train_epoch(
     color_accuracy = total_color_correct / max(total_pixels, 1)
     error_color_accuracy = total_error_color_correct / max(total_error_pixels, 1)
 
-    return {
+    metrics = {
         "loss": total_loss / max(num_batches, 1),
+        "pixel_loss": total_pixel_loss / max(num_batches, 1),
         "color_accuracy": color_accuracy,
         "error_color_accuracy": error_color_accuracy,
     }
+
+    # Add size metrics if applicable
+    if total_samples > 0:
+        metrics["size_loss"] = total_size_loss / max(num_batches, 1)
+        metrics["height_accuracy"] = total_height_correct / total_samples
+        metrics["width_accuracy"] = total_width_correct / total_samples
+        metrics["both_accuracy"] = total_both_correct / total_samples
+
+    # Add critic metrics if applicable
+    if critic is not None:
+        metrics["critic_loss"] = total_critic_loss / max(num_batches, 1)
+        # Precision: of predicted errors, how many were actually errors
+        precision = total_critic_tp / max(total_critic_tp + total_critic_fp, 1)
+        # Recall: of actual errors, how many did we catch
+        recall = total_critic_tp / max(total_critic_tp + total_critic_fn, 1)
+        # F1 score
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+        metrics["critic_precision"] = precision
+        metrics["critic_recall"] = recall
+        metrics["critic_f1"] = f1
+        metrics["critic_tp"] = total_critic_tp
+        metrics["critic_fp"] = total_critic_fp
+        metrics["critic_fn"] = total_critic_fn
+        metrics["critic_tn"] = total_critic_tn
+
+    return metrics
 
 
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    size_weight: float = 0.0,
+    critic: nn.Module = None,  # Optional critic CNN for error prediction
 ) -> Dict[str, float]:
-    """Evaluation for color prediction"""
+    """Evaluation for color prediction (and optionally size prediction and critic)"""
     model.eval()
+    if critic is not None:
+        critic.eval()
 
     total_loss = 0.0
+    total_pixel_loss = 0.0
+    total_size_loss = 0.0
     total_color_correct = 0
     total_pixels = 0
     total_error_pixels = 0
     total_error_color_correct = 0
     total_perfect = 0
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
     total_samples = 0
     num_batches = 0
 
+    # Critic metrics
+    total_critic_loss = 0.0
+    total_critic_tp = 0
+    total_critic_fp = 0
+    total_critic_fn = 0
+    total_critic_tn = 0
+
     with torch.no_grad():
-        for input_grid, output_grid, target_colors, pixel_mask in loader:
+        for input_grid, output_grid, target_colors, pixel_mask, output_dims in loader:
             input_grid = input_grid.to(device)
             output_grid = output_grid.to(device)
             target_colors = target_colors.to(device)
             pixel_mask = pixel_mask.to(device)
+            output_dims = output_dims.to(device)
 
-            logits = model(input_grid, output_grid)  # (B, 10, H, W)
-            loss = F.cross_entropy(logits, target_colors)
+            output = model(input_grid, output_grid)
 
-            pred_colors = logits.argmax(dim=1)  # (B, H, W)
-            
-            # Overall color accuracy
-            correct = (pred_colors == target_colors).sum().item()
-            total = target_colors.numel()
+            # Create mask for actual output region (excludes padding)
+            content_mask = create_output_region_mask(output_dims)
+
+            # Handle both dict (with size) and tensor (pixel only) outputs
+            if isinstance(output, dict):
+                pixel_logits = output['pixel_logits']
+                height_logits = output['height_logits']
+                width_logits = output['width_logits']
+
+                # Pixel loss - MASKED to only compute on actual output region
+                pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
+
+                target_h = output_dims[:, 0] - 1
+                target_w = output_dims[:, 1] - 1
+                size_loss = (F.cross_entropy(height_logits, target_h) +
+                             F.cross_entropy(width_logits, target_w)) / 2
+
+                loss = pixel_loss + size_weight * size_loss
+
+                # Size accuracy
+                pred_h = height_logits.argmax(dim=1)
+                pred_w = width_logits.argmax(dim=1)
+                total_height_correct += (pred_h == target_h).sum().item()
+                total_width_correct += (pred_w == target_w).sum().item()
+                total_both_correct += ((pred_h == target_h) & (pred_w == target_w)).sum().item()
+                total_size_loss += size_loss.item()
+            else:
+                pixel_logits = output
+                # Pixel loss - MASKED to only compute on actual output region
+                pixel_loss = masked_cross_entropy(pixel_logits, target_colors, content_mask)
+                loss = pixel_loss
+
+            pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
+
+            # Evaluate critic if provided
+            if critic is not None:
+                error_logits = critic(pred_colors)  # (B, 1, H, W)
+                error_logits = error_logits.squeeze(1)  # (B, H, W)
+
+                # Actual errors
+                actual_errors = (pred_colors != target_colors).float()
+
+                # BCE loss
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    error_logits, actual_errors, reduction='none'
+                )
+                masked_bce = bce_loss * content_mask
+                critic_loss = masked_bce.sum() / content_mask.sum().clamp(min=1)
+                total_critic_loss += critic_loss.item()
+
+                # Critic metrics
+                pred_errors = (torch.sigmoid(error_logits) > 0.5).float()
+                actual_bool = actual_errors.bool()
+                pred_bool = pred_errors.bool()
+                content_bool = content_mask.bool()
+
+                tp = ((pred_bool & actual_bool) & content_bool).sum().item()
+                fp = ((pred_bool & ~actual_bool) & content_bool).sum().item()
+                fn = ((~pred_bool & actual_bool) & content_bool).sum().item()
+                tn = ((~pred_bool & ~actual_bool) & content_bool).sum().item()
+
+                total_critic_tp += tp
+                total_critic_fp += fp
+                total_critic_fn += fn
+                total_critic_tn += tn
+
+            # Overall color accuracy - only on content pixels (not padding)
+            content_mask_bool = content_mask.bool()
+            correct = ((pred_colors == target_colors) & content_mask_bool).sum().item()
+            total = content_mask.sum().item()
             total_color_correct += correct
             total_pixels += total
 
-            # Accuracy on error pixels only
-            error_mask = (pixel_mask == 0)
+            # Accuracy on error pixels only - also restrict to content region
+            error_mask = (pixel_mask == 0) & content_mask_bool
             if error_mask.sum() > 0:
                 error_correct = ((pred_colors == target_colors) & error_mask).sum().item()
                 total_error_color_correct += error_correct
                 total_error_pixels += error_mask.sum().item()
 
-            # Perfect predictions (all pixels correct)
-            batch_perfect = (pred_colors == target_colors).all(dim=-1).all(dim=-1).sum().item()
-            total_perfect += batch_perfect
+            # Perfect predictions (all content pixels correct)
+            # Check per-sample if all content pixels are correct
+            for b in range(input_grid.size(0)):
+                h, w = output_dims[b, 0].item(), output_dims[b, 1].item()
+                if (pred_colors[b, :h, :w] == target_colors[b, :h, :w]).all():
+                    total_perfect += 1
             total_samples += input_grid.size(0)
 
             total_loss += loss.item()
+            total_pixel_loss += pixel_loss.item()
             num_batches += 1
 
     color_accuracy = total_color_correct / max(total_pixels, 1)
     error_color_accuracy = total_error_color_correct / max(total_error_pixels, 1)
     perfect_rate = total_perfect / max(total_samples, 1)
 
-    return {
+    metrics = {
         "loss": total_loss / max(num_batches, 1),
+        "pixel_loss": total_pixel_loss / max(num_batches, 1),
         "color_accuracy": color_accuracy,
         "error_color_accuracy": error_color_accuracy,
         "perfect_rate": perfect_rate,
+    }
+
+    # Add size metrics if applicable
+    if total_samples > 0 and total_size_loss > 0:
+        metrics["size_loss"] = total_size_loss / max(num_batches, 1)
+        metrics["height_accuracy"] = total_height_correct / total_samples
+        metrics["width_accuracy"] = total_width_correct / total_samples
+        metrics["both_accuracy"] = total_both_correct / total_samples
+
+    # Add critic metrics if applicable
+    if critic is not None:
+        metrics["critic_loss"] = total_critic_loss / max(num_batches, 1)
+        precision = total_critic_tp / max(total_critic_tp + total_critic_fp, 1)
+        recall = total_critic_tp / max(total_critic_tp + total_critic_fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+        metrics["critic_precision"] = precision
+        metrics["critic_recall"] = recall
+        metrics["critic_f1"] = f1
+        metrics["critic_tp"] = total_critic_tp
+        metrics["critic_fp"] = total_critic_fp
+        metrics["critic_fn"] = total_critic_fn
+        metrics["critic_tn"] = total_critic_tn
+
+    return metrics
+
+
+# =============================================================================
+# Size Prediction Training
+# =============================================================================
+
+def train_size_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Training epoch for output size prediction."""
+    model.train()
+
+    total_loss = 0.0
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
+    total_samples = 0
+    num_batches = 0
+
+    pbar = tqdm(loader, desc="Training Size")
+    for input_grid, _, _, _, output_dims in pbar:
+        input_grid = input_grid.to(device)
+        target_h = output_dims[:, 0].to(device) - 1  # Convert size (1-30) to class (0-29)
+        target_w = output_dims[:, 1].to(device) - 1
+
+        optimizer.zero_grad()
+
+        height_logits, width_logits = model(input_grid)
+
+        # Cross-entropy loss for both dimensions
+        loss_h = F.cross_entropy(height_logits, target_h)
+        loss_w = F.cross_entropy(width_logits, target_w)
+        loss = (loss_h + loss_w) / 2
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            pred_h = height_logits.argmax(dim=1)
+            pred_w = width_logits.argmax(dim=1)
+
+            h_correct = (pred_h == target_h).sum().item()
+            w_correct = (pred_w == target_w).sum().item()
+            both_correct = ((pred_h == target_h) & (pred_w == target_w)).sum().item()
+
+            total_height_correct += h_correct
+            total_width_correct += w_correct
+            total_both_correct += both_correct
+            total_samples += input_grid.size(0)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        pbar.set_postfix(loss=loss.item(), h_acc=h_correct/input_grid.size(0), w_acc=w_correct/input_grid.size(0))
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "height_accuracy": total_height_correct / max(total_samples, 1),
+        "width_accuracy": total_width_correct / max(total_samples, 1),
+        "both_accuracy": total_both_correct / max(total_samples, 1),
+    }
+
+
+def evaluate_size(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluation for output size prediction."""
+    model.eval()
+
+    total_loss = 0.0
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
+    total_samples = 0
+    num_batches = 0
+
+    with torch.no_grad():
+        for input_grid, _, _, _, output_dims in loader:
+            input_grid = input_grid.to(device)
+            target_h = output_dims[:, 0].to(device) - 1
+            target_w = output_dims[:, 1].to(device) - 1
+
+            height_logits, width_logits = model(input_grid)
+
+            loss_h = F.cross_entropy(height_logits, target_h)
+            loss_w = F.cross_entropy(width_logits, target_w)
+            loss = (loss_h + loss_w) / 2
+
+            pred_h = height_logits.argmax(dim=1)
+            pred_w = width_logits.argmax(dim=1)
+
+            h_correct = (pred_h == target_h).sum().item()
+            w_correct = (pred_w == target_w).sum().item()
+            both_correct = ((pred_h == target_h) & (pred_w == target_w)).sum().item()
+
+            total_height_correct += h_correct
+            total_width_correct += w_correct
+            total_both_correct += both_correct
+            total_samples += input_grid.size(0)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "height_accuracy": total_height_correct / max(total_samples, 1),
+        "width_accuracy": total_width_correct / max(total_samples, 1),
+        "both_accuracy": total_both_correct / max(total_samples, 1),
+    }
+
+
+def evaluate_size_on_test(
+    model: nn.Module,
+    dataset,  # TestEvalDataset
+    device: torch.device,
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """Evaluate size prediction on held-out test examples."""
+    model.eval()
+
+    total_height_correct = 0
+    total_width_correct = 0
+    total_both_correct = 0
+    total_examples = 0
+
+    results = []
+
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            input_grid, _, dims, puzzle_id = dataset[i]
+            out_h, out_w = dims[2].item(), dims[3].item()
+
+            inp_t = input_grid.unsqueeze(0).to(device)
+
+            pred_h, pred_w = model.predict_size(inp_t)
+            pred_h, pred_w = pred_h.item(), pred_w.item()
+
+            h_correct = (pred_h == out_h)
+            w_correct = (pred_w == out_w)
+            both_correct = h_correct and w_correct
+
+            total_height_correct += int(h_correct)
+            total_width_correct += int(w_correct)
+            total_both_correct += int(both_correct)
+            total_examples += 1
+
+            results.append({
+                'puzzle_id': puzzle_id,
+                'true_h': out_h, 'true_w': out_w,
+                'pred_h': pred_h, 'pred_w': pred_w,
+                'h_correct': h_correct, 'w_correct': w_correct,
+                'both_correct': both_correct,
+            })
+
+            if verbose:
+                status = "✓" if both_correct else "✗"
+                print(f"  {status} {puzzle_id}: true={out_h}×{out_w}, pred={pred_h}×{pred_w}")
+
+    return {
+        "height_accuracy": total_height_correct / max(total_examples, 1),
+        "width_accuracy": total_width_correct / max(total_examples, 1),
+        "both_accuracy": total_both_correct / max(total_examples, 1),
+        "total_examples": total_examples,
+        "results": results,
     }
 
 
@@ -1366,11 +3041,19 @@ def _find_grid_bounds(grid: np.ndarray, max_size: int = 30) -> Tuple[int, int]:
 
 
 def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.device, num_samples: int = 8):
-    """Visualize predictions for color prediction"""
+    """Visualize predictions for color prediction.
+
+    If model.predict_size=True, uses predicted size to constrain pixel predictions.
+    """
     model.eval()
+
+    # Check if model predicts size
+    uses_size_prediction = getattr(model, 'predict_size', False)
 
     print("\n" + "="*80)
     print("Sample Predictions (Color Mode - Color Prediction)")
+    if uses_size_prediction:
+        print("(Using PREDICTED size for pixel prediction region)")
     print("="*80)
 
     # Get samples of each type with their counts
@@ -1397,9 +3080,9 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
         if count == 0:
             continue
 
-        print(f"\n{'â”€'*80}")
+        print(f"\n{'-'*80}")
         print(f"Sample Type: {sample_type.upper()}")
-        print(f"{'â”€'*80}")
+        print(f"{'-'*80}")
 
         samples_to_show = min(2, count)
         for i in range(samples_to_show):
@@ -1410,13 +3093,20 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
             if sample_idx >= len(dataset):
                 continue
 
-            input_grid, output_grid, target_colors, pixel_mask = dataset[sample_idx]
+            input_grid, output_grid, target_colors, pixel_mask, target_dims = dataset[sample_idx]
 
             inp_t = input_grid.unsqueeze(0).to(device)
             out_t = output_grid.unsqueeze(0).to(device)
 
             with torch.no_grad():
                 pred_colors = model.predict_colors(inp_t, out_t)[0].cpu().numpy()
+
+                # Get predicted size if model supports it
+                if uses_size_prediction:
+                    pred_h, pred_w = model.predict_size_from_input(inp_t)
+                    pred_h, pred_w = pred_h.item(), pred_w.item()
+                else:
+                    pred_h, pred_w = None, None
 
             input_np = input_grid.numpy()
             output_np = output_grid.numpy()
@@ -1429,35 +3119,71 @@ def visualize_predictions(model: nn.Module, dataset: Dataset, device: torch.devi
 
             # Also check target bounds (may differ from output for corrupted samples)
             tgt_r, tgt_c = _find_grid_bounds(target_np)
-            out_r = max(out_r, tgt_r)
-            out_c = max(out_c, tgt_c)
+            true_out_r = max(out_r, tgt_r)
+            true_out_c = max(out_c, tgt_c)
 
             # For all-zeros output, use mask to find content region
-            if out_r == 1 and out_c == 1:
+            if true_out_r == 1 and true_out_c == 1:
                 error_positions = np.where(mask_np == 0)
                 if len(error_positions[0]) > 0:
-                    out_r = min(error_positions[0].max() + 1, 30)
-                    out_c = min(error_positions[1].max() + 1, 30)
+                    true_out_r = min(error_positions[0].max() + 1, 30)
+                    true_out_c = min(error_positions[1].max() + 1, 30)
 
-            num_errors = int((mask_np[:out_r, :out_c] == 0).sum())
-            num_correct_preds = int((pred_colors[:out_r, :out_c] == target_np[:out_r, :out_c]).sum())
-            total_pixels = out_r * out_c
+            # Use predicted size if available, otherwise use true size
+            if uses_size_prediction and pred_h is not None:
+                disp_r, disp_c = pred_h, pred_w
+                size_correct = (pred_h == true_out_r and pred_w == true_out_c)
+            else:
+                disp_r, disp_c = true_out_r, true_out_c
+                size_correct = True
 
-            print(f"\nInput: {inp_r}Ã—{inp_c} â†’ Output: {out_r}Ã—{out_c}")
-            print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{total_pixels}")
+            # Calculate accuracy within the predicted/display region
+            compare_r, compare_c = min(disp_r, true_out_r), min(disp_c, true_out_c)
+            num_errors = int((mask_np[:true_out_r, :true_out_c] == 0).sum())
+            num_correct_preds = int((pred_colors[:compare_r, :compare_c] == target_np[:compare_r, :compare_c]).sum())
+
+            # Print size info
+            if uses_size_prediction:
+                if size_correct:
+                    print(f"\nInput: {inp_r}x{inp_c} -> Output: {true_out_r}x{true_out_c} \033[92m(size correct)\033[0m")
+                else:
+                    print(f"\nInput: {inp_r}x{inp_c} -> True: {true_out_r}x{true_out_c}, \033[91mPred: {pred_h}x{pred_w} (size wrong)\033[0m")
+            else:
+                print(f"\nInput: {inp_r}x{inp_c} -> Output: {true_out_r}x{true_out_c}")
+            print(f"Actual errors: {num_errors}, Color prediction accuracy: {num_correct_preds}/{compare_r*compare_c}")
 
             # Print INPUT separately with its own dimensions
-            print(f"\nINPUT ({inp_r}Ã—{inp_c}):")
+            print(f"\nINPUT ({inp_r}x{inp_c}):")
             for r in range(inp_r):
                 inp_row = " ".join(f"{input_np[r, c]}" for c in range(inp_c))
                 print(f"  {inp_row}")
 
-            # Print OUTPUT, TARGET, PREDICTED with output dimensions
-            print(f"\n{'OUTPUT':<25} {'TARGET':<25} {'PREDICTED':<25}")
-            for r in range(out_r):
-                out_row = " ".join(f"{output_np[r, c]}" for c in range(out_c))
-                tgt_row = " ".join(f"{target_np[r, c]}" for c in range(out_c))
-                pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(out_c))
+            # Print OUTPUT, TARGET, PREDICTED
+            # OUTPUT and TARGET use true size, PREDICTED uses predicted size (if size prediction enabled)
+            max_r = max(true_out_r, disp_r)
+
+            pred_label = f"PREDICTED ({disp_r}x{disp_c})" if uses_size_prediction else "PREDICTED"
+            print(f"\n{'OUTPUT':<25} {'TARGET':<25} {pred_label:<25}")
+
+            for r in range(max_r):
+                # OUTPUT column (true size)
+                if r < true_out_r:
+                    out_row = " ".join(f"{output_np[r, c]}" for c in range(true_out_c))
+                else:
+                    out_row = ""
+
+                # TARGET column (true size)
+                if r < true_out_r:
+                    tgt_row = " ".join(f"{target_np[r, c]}" for c in range(true_out_c))
+                else:
+                    tgt_row = ""
+
+                # PREDICTED column (predicted size)
+                if r < disp_r:
+                    pred_row = " ".join(f"{pred_colors[r, c]}" for c in range(disp_c))
+                else:
+                    pred_row = ""
+
                 print(f"  {out_row:<23} {tgt_row:<23} {pred_row:<23}")
 
     print("="*80 + "\n")
@@ -1489,12 +3215,13 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
 
         with torch.no_grad():
             for batch in loader:
-                input_grid, output_grid, target, _ = batch
+                input_grid, output_grid, target, _, _ = batch
                 input_grid = input_grid.to(device)
                 output_grid = output_grid.to(device)
                 target = target.to(device)
 
-                logits = model(input_grid, output_grid)
+                output = model(input_grid, output_grid)
+                logits = output['pixel_logits'] if isinstance(output, dict) else output
                 preds = logits.argmax(dim=1)
 
                 pixel_correct += (preds == target).sum().item()
@@ -1523,7 +3250,7 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
         print(f"BASELINE (no ablation):")
         print(f"  Pixel Accuracy: {baseline_acc:.2%}")
         print(f"  Grid Accuracy:  {baseline_grid_acc:.2%}")
-        print(f"{'─'*70}\n")
+        print(f"{'-'*70}\n")
 
     # Define layer groups based on architecture (similar to run_layer_ablation)
     layer_groups = {
@@ -1681,7 +3408,7 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
             print(f"  {i}. {name}: {res['accuracy_drop']:+.2%} pixel drop")
 
         # Interpretation
-        print("\n" + "─"*70)
+        print("\n" + "-"*70)
         print("INTERPRETATION:")
 
         # Critical thresholds
@@ -1689,16 +3416,16 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
         pixel_critical = [name for name, res in sorted_by_pixel if res["accuracy_drop"] > 0.3]
 
         if grid_critical:
-            print(f"  • Grid-critical (>30% drop): {', '.join(grid_critical)}")
+            print(f"  * Grid-critical (>30% drop): {', '.join(grid_critical)}")
 
         if pixel_critical:
-            print(f"  • Pixel-critical (>30% drop): {', '.join(pixel_critical)}")
+            print(f"  * Pixel-critical (>30% drop): {', '.join(pixel_critical)}")
 
         # Minimal impact (both metrics)
         minimal_layers = [name for name, res in sorted_by_grid
                         if res["grid_drop"] < 0.02 and res["accuracy_drop"] < 0.02]
         if minimal_layers:
-            print(f"  • Minimal-impact layers: {', '.join(minimal_layers)}")
+            print(f"  * Minimal-impact layers: {', '.join(minimal_layers)}")
 
         # Check encoder vs decoder balance
         encoder_grid_drops = [res["grid_drop"] for _, res in ablation_results.items()
@@ -1710,11 +3437,11 @@ def run_ablation_analysis(model, test_loader, verbose: bool = True):
             avg_encoder = sum(encoder_grid_drops) / len(encoder_grid_drops)
             avg_decoder = sum(decoder_grid_drops) / len(decoder_grid_drops)
             if avg_encoder > avg_decoder * 1.5:
-                print(f"  • Encoder-heavy (grid): avg {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
+                print(f"  * Encoder-heavy (grid): avg {avg_encoder:.1%} vs decoder {avg_decoder:.1%}")
             elif avg_decoder > avg_encoder * 1.5:
-                print(f"  • Decoder-heavy (grid): avg {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
+                print(f"  * Decoder-heavy (grid): avg {avg_decoder:.1%} vs encoder {avg_encoder:.1%}")
 
-        print("─"*70 + "\n")
+        print("-"*70 + "\n")
 
     return {
         "baseline": {"accuracy": baseline_acc, "grid_accuracy": baseline_grid_acc},
@@ -1777,7 +3504,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-path", type=str, default="checkpoints/pixel_error_cnn.pt")
-    
+    parser.add_argument("--use-last-epoch", action="store_true",
+                        help="Use the model from the last epoch instead of the best checkpoint. "
+                             "Useful for comparing with eval_cnn_generalization.py behavior.")
+
     # Architecture options
     parser.add_argument("--no-augment", action="store_true",
                         help="Train without augmentations (use raw example grids)")
@@ -1815,14 +3545,83 @@ def main():
                              "RF per block = depth*(kernel_size-1)+1. Default: 2 (5x5 RF with 3x3 kernels)")
     parser.add_argument("--kernel-size", type=int, default=3,
                         help="Kernel size for convolutional layers (default: 3). Use odd numbers (3, 5, 7, etc.)")
+    parser.add_argument("--out-kernel-size", type=int, default=1,
+                        help="Kernel size for output conv layer (default: 1). Use odd numbers (1, 3, 5, etc.)")
     parser.add_argument("--use-onehot", action="store_true",
                         help="Use one-hot + nonzero mask encoding (11 ch/grid) instead of learned embeddings (16 ch/grid)")
+    parser.add_argument("--use-attention", action="store_true",
+                        help="Add spatial self-attention before output layer (each pixel attends to all others)")
+    parser.add_argument("--use-cross-attention", action="store_true",
+                        help="Add cross-attention to IR encoder features (requires --ir-checkpoint or --use-untrained-ir). Use --cross-attention-position to control where.")
+    parser.add_argument("--cross-attention-heads", type=int, default=1,
+                        help="Number of attention heads for cross-attention (default: 1). Must divide proj_dim evenly.")
+    parser.add_argument("--cross-attention-position", type=str, default="late",
+                        choices=["early", "late"],
+                        help="Where to apply cross-attention: 'early' (on embeddings before CNN) or 'late' (on decoder features before outc, default)")
+    parser.add_argument("--ir-checkpoint", type=str, default=None,
+                        help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
+    parser.add_argument("--use-untrained-ir", action="store_true",
+                        help="Use randomly initialized IR encoder instead of pretrained (for ablation study)")
+    parser.add_argument("--ir-hidden-dim", type=int, default=128,
+                        help="Hidden dimension for untrained IR encoder (default: 128)")
+    parser.add_argument("--ir-out-dim", type=int, default=64,
+                        help="Output feature dimension for untrained IR encoder (default: 64)")
+    parser.add_argument("--ir-num-layers", type=int, default=3,
+                        help="Number of conv layers in untrained IR encoder (default: 3)")
+    parser.add_argument("--ir-kernel-size", type=int, default=3,
+                        help="Kernel size for untrained IR encoder (default: 3)")
+    parser.add_argument("--freeze-ir", action="store_true", default=True,
+                        help="Freeze IR encoder weights during training (default: True)")
+    parser.add_argument("--no-freeze-ir", dest="freeze_ir", action="store_false",
+                        help="Allow IR encoder weights to be fine-tuned")
+
+    # Slot-routed cross-attention
+    parser.add_argument("--use-slot-cross-attention", action="store_true",
+                        help="Enable slot-routed cross-attention: output pixels attend to input "
+                             "pixels via object-level slot routing. Requires IR encoder.")
+    parser.add_argument("--num-slots", type=int, default=8,
+                        help="Number of slots for slot attention (default: 8)")
+    parser.add_argument("--slot-dim", type=int, default=64,
+                        help="Dimension of slot embeddings (default: 64)")
+    parser.add_argument("--slot-iterations", type=int, default=3,
+                        help="Number of slot attention refinement iterations (default: 3)")
+    parser.add_argument("--slot-mlp-hidden", type=int, default=128,
+                        help="Hidden dimension for slot attention MLP (default: 128)")
+
+    # Joint size prediction (integrated into PixelErrorCNN)
+    parser.add_argument("--predict-size", action="store_true",
+                        help="Enable joint output size prediction alongside pixel prediction. "
+                             "Uses IR encoder to predict output height/width (1-30 each).")
+    parser.add_argument("--size-weight", type=float, default=1.0,
+                        help="Weight for size prediction loss relative to pixel loss (default: 1.0)")
 
     # Layer-wise ablation analysis
     parser.add_argument("--ablation", action="store_true",
                         help="Run layer-wise ablation analysis after training. "
                              "Zeros each layer's output and measures accuracy drop. "
                              "Requires --eval-on-test to have test data to evaluate against.")
+
+    # Size prediction mode
+    parser.add_argument("--train-size", action="store_true",
+                        help="Train output size prediction head instead of pixel prediction. "
+                             "Requires --ir-checkpoint to provide the IR encoder.")
+    parser.add_argument("--size-hidden-dim", type=int, default=128,
+                        help="Hidden dimension for size prediction MLP (default: 128)")
+    parser.add_argument("--size-save-path", type=str, default="checkpoints/size_predictor.pt",
+                        help="Path to save size prediction model checkpoint")
+
+    # Critic CNN - concurrent error prediction training
+    parser.add_argument("--use-critic", action="store_true",
+                        help="Train a critic CNN concurrently that predicts which pixels are wrong. "
+                             "The critic only sees the main model's predicted output (not input/ground truth).")
+    parser.add_argument("--critic-hidden-dim", type=int, default=8,
+                        help="Hidden dimension for critic CNN (default: 32)")
+    parser.add_argument("--critic-num-layers", type=int, default=1,
+                        help="Number of encoder/decoder layers in critic CNN (default: 3)")
+    parser.add_argument("--critic-lr", type=float, default=1e-3,
+                        help="Learning rate for critic optimizer (default: 1e-3)")
+    parser.add_argument("--visualize-critic", action="store_true",
+                        help="Visualize critic predictions during evaluation")
 
     args = parser.parse_args()
 
@@ -1833,7 +3632,6 @@ def main():
     print(f"Device: {DEVICE}")
     print(f"Dataset: {args.dataset}")
     print(f"Mode: COLOR (predict correct colors 0-9)")
-    print(f"Architecture: Spatial concatenation (input|output side-by-side)")
 
     # Determine augmentation mode
     if args.no_augment:
@@ -1907,10 +3705,9 @@ def main():
     print(f"Train puzzles: {len(train_puzzles)}, Val puzzles: {len(val_puzzles)}")
 
     # Auto-distribute negatives across types
-    # Ratio: 1 positive per 4 negatives
     # Negatives split: 35% corrupted, 15% wrong_input, 15% mismatched_aug, 15% color_swap, 20% degenerate
     num_negatives = args.num_negatives
-    num_positives = max(1, num_negatives // 4)
+    num_positives = 0
     use_augment = not args.no_augment
 
     # Handle --negative-type for ablation studies
@@ -2005,6 +3802,94 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
+    # =========================================================================
+    # SIZE PREDICTION MODE
+    # =========================================================================
+    if args.train_size:
+        if not args.ir_checkpoint and not args.use_untrained_ir:
+            print("Error: --train-size requires --ir-checkpoint or --use-untrained-ir")
+            return
+
+        print("\n" + "="*60)
+        print("SIZE PREDICTION MODE")
+        print("="*60)
+
+        # Create IR encoder
+        if args.ir_checkpoint:
+            print(f"Loading IR encoder from: {args.ir_checkpoint}")
+            ir_encoder = IREncoder.from_checkpoint(args.ir_checkpoint, DEVICE)
+        else:
+            print("Using untrained IR encoder")
+            ir_encoder = IREncoder(
+                hidden_dim=args.ir_hidden_dim,
+                out_dim=args.ir_out_dim,
+                num_layers=args.ir_num_layers,
+                kernel_size=args.ir_kernel_size,
+            )
+
+        # Create size prediction model
+        size_model = SizeClassificationHead(
+            ir_encoder=ir_encoder,
+            max_size=GRID_SIZE,
+            hidden_dim=args.size_hidden_dim,
+            freeze_ir=args.freeze_ir,
+        ).to(DEVICE)
+
+        num_params = sum(p.numel() for p in size_model.parameters())
+        trainable_params = sum(p.numel() for p in size_model.parameters() if p.requires_grad)
+        print(f"Size model parameters: {num_params:,} total, {trainable_params:,} trainable")
+        print(f"IR encoder frozen: {args.freeze_ir}")
+
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, size_model.parameters()),
+            lr=args.lr
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10
+        )
+
+        best_both_acc = 0.0
+        print(f"\nTraining for {args.epochs} epochs...")
+
+        for epoch in range(args.epochs):
+            train_metrics = train_size_epoch(size_model, train_loader, optimizer, DEVICE)
+            val_metrics = evaluate_size(size_model, val_loader, DEVICE)
+
+            scheduler.step(val_metrics['loss'])
+
+            print(f"Epoch {epoch+1}/{args.epochs}")
+            print(f"  Train - Loss: {train_metrics['loss']:.4f}, H: {train_metrics['height_accuracy']:.2%}, "
+                  f"W: {train_metrics['width_accuracy']:.2%}, Both: {train_metrics['both_accuracy']:.2%}")
+            print(f"  Val   - Loss: {val_metrics['loss']:.4f}, H: {val_metrics['height_accuracy']:.2%}, "
+                  f"W: {val_metrics['width_accuracy']:.2%}, Both: {val_metrics['both_accuracy']:.2%}")
+
+            # Save best model
+            if val_metrics['both_accuracy'] > best_both_acc:
+                best_both_acc = val_metrics['both_accuracy']
+                os.makedirs(os.path.dirname(args.size_save_path) or '.', exist_ok=True)
+                size_model.save_checkpoint(args.size_save_path, vars(args))
+                print(f"  Saved new best model (both_accuracy: {best_both_acc:.2%})")
+
+        print(f"\nBest validation both_accuracy: {best_both_acc:.2%}")
+
+        # Evaluate on test set if available
+        if args.eval_on_test and test_eval_dataset is not None:
+            print("\n" + "="*60)
+            print("SIZE PREDICTION ON TEST EXAMPLES")
+            print("="*60)
+            test_results = evaluate_size_on_test(size_model, test_eval_dataset, DEVICE, verbose=True)
+            print(f"\nTest Results:")
+            print(f"  Height accuracy: {test_results['height_accuracy']:.2%}")
+            print(f"  Width accuracy:  {test_results['width_accuracy']:.2%}")
+            print(f"  Both correct:    {test_results['both_accuracy']:.2%}")
+
+        print("\nSize prediction training complete!")
+        return  # Exit early - don't continue to pixel prediction training
+
+    # =========================================================================
+    # PIXEL PREDICTION MODE (default)
+    # =========================================================================
+
     # Create model
     print("\nCreating model...")
     rf_per_block = args.conv_depth * (args.kernel_size - 1) + 1
@@ -2017,7 +3902,26 @@ def main():
         num_layers=args.num_layers,
         conv_depth=args.conv_depth,
         kernel_size=args.kernel_size,
-        use_onehot=args.use_onehot
+        use_onehot=args.use_onehot,
+        out_kernel_size=args.out_kernel_size,
+        use_attention=args.use_attention,
+        use_cross_attention=args.use_cross_attention,
+        cross_attention_heads=args.cross_attention_heads,
+        cross_attention_position=args.cross_attention_position,
+        ir_checkpoint=args.ir_checkpoint,
+        use_untrained_ir=args.use_untrained_ir,
+        ir_hidden_dim=args.ir_hidden_dim,
+        ir_out_dim=args.ir_out_dim,
+        ir_num_layers=args.ir_num_layers,
+        ir_kernel_size=args.ir_kernel_size,
+        freeze_ir=args.freeze_ir,
+        predict_size=args.predict_size,
+        size_hidden_dim=args.size_hidden_dim,
+        use_slot_cross_attention=args.use_slot_cross_attention,
+        num_slots=args.num_slots,
+        slot_dim=args.slot_dim,
+        slot_iterations=args.slot_iterations,
+        slot_mlp_hidden=args.slot_mlp_hidden,
     )
     model = model.to(DEVICE)
 
@@ -2026,10 +3930,57 @@ def main():
     print(f"Output classes: 10 (color prediction)")
     if args.no_skip:
         print("Skip connections: DISABLED (all info flows through bottleneck)")
+    if args.use_attention:
+        print("Spatial self-attention: ENABLED (each pixel attends to all others)")
+    if args.use_cross_attention:
+        heads_str = f", {args.cross_attention_heads} heads" if args.cross_attention_heads > 1 else ""
+        pos = args.cross_attention_position
+        pos_desc = "on embeddings before CNN" if pos == "early" else "on decoder features after CNN"
+        if args.ir_checkpoint:
+            freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
+            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}{heads_str}) from {args.ir_checkpoint}")
+            print(f"  Position: {pos} ({pos_desc})")
+        elif args.use_untrained_ir:
+            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init{heads_str}, for ablation)")
+            print(f"  IR encoder config: hidden={args.ir_hidden_dim}, out={args.ir_out_dim}, "
+                  f"layers={args.ir_num_layers}, kernel={args.ir_kernel_size}x{args.ir_kernel_size}")
+            print(f"  Position: {pos} ({pos_desc})")
+    if args.predict_size:
+        print(f"Size prediction: ENABLED (joint training with weight={args.size_weight})")
+        if not args.use_cross_attention and not args.ir_checkpoint and not args.use_untrained_ir:
+            print("  Note: IR encoder will be created for size prediction")
+    if args.use_slot_cross_attention:
+        print(f"Slot cross-attention: ENABLED")
+        print(f"  Slots: {args.num_slots}, dim={args.slot_dim}, iterations={args.slot_iterations}")
+        if args.ir_checkpoint:
+            freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
+            print(f"  Using IR encoder ({freeze_str}) from {args.ir_checkpoint}")
+        elif args.use_untrained_ir:
+            print(f"  Using UNTRAINED IR encoder (random init)")
+        else:
+            print(f"  Note: IR encoder will be created for slot attention")
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+
+    # Create critic CNN if requested
+    critic = None
+    critic_optimizer = None
+    if args.use_critic:
+        critic = CriticCNN(
+            hidden_dim=args.critic_hidden_dim,
+            num_layers=args.critic_num_layers,
+            conv_depth=args.conv_depth,
+            kernel_size=args.kernel_size,
+        ).to(DEVICE)
+        critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr, weight_decay=0.01)
+        print(f"\nCritic CNN enabled:")
+        print(f"  Hidden dim: {args.critic_hidden_dim}")
+        print(f"  Num layers: {args.critic_num_layers}")
+        print(f"  Learning rate: {args.critic_lr}")
+        param_count = sum(p.numel() for p in critic.parameters())
+        print(f"  Parameters: {param_count:,}")
 
     # Create checkpoint directory
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
@@ -2041,23 +3992,58 @@ def main():
 
     best_val_metric = 0.0
 
+    size_weight = args.size_weight if args.predict_size else 0.0
+
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
-        val_metrics = evaluate(model, val_loader, DEVICE)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, size_weight=size_weight,
+                                     critic=critic, critic_optimizer=critic_optimizer)
+        val_metrics = evaluate(model, val_loader, DEVICE, size_weight=size_weight, critic=critic)
 
+        # Print pixel metrics
         print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
               f"Error Color Acc: {train_metrics['error_color_accuracy']:.2%}")
         print(f"  Val   Loss: {val_metrics['loss']:.4f}, Color Acc: {val_metrics['color_accuracy']:.2%}, "
               f"Error Color Acc: {val_metrics['error_color_accuracy']:.2%}, "
               f"Perfect: {val_metrics['perfect_rate']:.2%}")
 
+        # Print critic metrics if applicable
+        if critic is not None and 'critic_f1' in train_metrics:
+            print(f"  Train Critic - Loss: {train_metrics['critic_loss']:.4f}, "
+                  f"P: {train_metrics['critic_precision']:.2%}, R: {train_metrics['critic_recall']:.2%}, "
+                  f"F1: {train_metrics['critic_f1']:.2%}")
+            print(f"  Val   Critic - Loss: {val_metrics['critic_loss']:.4f}, "
+                  f"P: {val_metrics['critic_precision']:.2%}, R: {val_metrics['critic_recall']:.2%}, "
+                  f"F1: {val_metrics['critic_f1']:.2%}")
+
+        # Print size metrics if applicable
+        if args.predict_size and 'both_accuracy' in train_metrics and 'both_accuracy' in val_metrics:
+            print(f"  Train Size - H: {train_metrics['height_accuracy']:.2%}, "
+                  f"W: {train_metrics['width_accuracy']:.2%}, Both: {train_metrics['both_accuracy']:.2%}")
+            print(f"  Val   Size - H: {val_metrics['height_accuracy']:.2%}, "
+                  f"W: {val_metrics['width_accuracy']:.2%}, Both: {val_metrics['both_accuracy']:.2%}")
+
         current_metric = val_metrics['color_accuracy']
 
         scheduler.step()
 
-        if current_metric > best_val_metric:
+        # Save checkpoint: either on best metric or every epoch if --use-last-epoch
+        if args.use_last_epoch:
+            # Always save (will use final epoch)
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'args': vars(args),
+                'epoch': epoch,
+                'best_val_metric': current_metric,
+                'is_last_epoch': True,
+            }
+            if critic is not None:
+                checkpoint['critic_state_dict'] = critic.state_dict()
+            torch.save(checkpoint, args.save_path)
+            if current_metric > best_val_metric:
+                best_val_metric = current_metric
+        elif current_metric > best_val_metric:
             best_val_metric = current_metric
             print(f"  [New best color_accuracy: {best_val_metric:.2%}]")
 
@@ -2065,19 +4051,63 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'args': vars(args),
                 'epoch': epoch,
-                'best_val_color_accuracy': best_val_metric,
+                'best_val_metric': best_val_metric,
+                'is_last_epoch': False,
             }
+            if critic is not None:
+                checkpoint['critic_state_dict'] = critic.state_dict()
             torch.save(checkpoint, args.save_path)
+
+        # Early stopping: if we hit 100% validation accuracy, no point continuing
+        # Skip early stopping if --use-last-epoch is set (user wants full training)
+        if best_val_metric >= 1.0 and not args.use_last_epoch:
+            print(f"\n  Early stopping: reached 100% validation accuracy at epoch {epoch + 1}")
+            break
 
     # Final summary
     print("\n" + "="*60)
     print("Training Complete")
     print("="*60)
     print(f"Best color_accuracy: {best_val_metric:.2%}")
+    if args.use_last_epoch:
+        print(f"Using LAST epoch model (--use-last-epoch)")
+    else:
+        print(f"Using BEST checkpoint model")
     print(f"Checkpoint saved to: {args.save_path}")
 
     # Visualize on training data
     visualize_predictions(model, val_dataset, DEVICE)
+
+    # Visualize critic predictions if enabled
+    if critic is not None and args.visualize_critic:
+        print("\n" + "="*60)
+        print("CRITIC VISUALIZATION")
+        print("="*60)
+        model.eval()
+        critic.eval()
+        with torch.no_grad():
+            # Show a few examples from validation set
+            num_viz = min(5, len(val_dataset))
+            for i in range(num_viz):
+                sample = val_dataset[i]
+                input_grid = sample[0].unsqueeze(0).to(DEVICE)
+                output_grid = sample[1].unsqueeze(0).to(DEVICE)
+                target_colors = sample[2].numpy()
+                output_dims = sample[4]
+                out_h, out_w = output_dims[0].item(), output_dims[1].item()
+
+                # Get main model prediction
+                output = model(input_grid, output_grid)
+                pixel_logits = output['pixel_logits'] if isinstance(output, dict) else output
+                pred_colors = pixel_logits.argmax(dim=1)[0].cpu().numpy()
+
+                # Get critic prediction
+                critic_pred = critic.predict_errors(pixel_logits.argmax(dim=1))[0].cpu().numpy().astype(bool)
+
+                visualize_critic_prediction(
+                    pred_colors, target_colors, critic_pred,
+                    out_h, out_w, puzzle_id=f"Sample {i+1}"
+                )
 
     # =========================================================================
     # CRITICAL: Evaluate on held-out test examples
@@ -2088,38 +4118,48 @@ def main():
         print("="*60)
         print("These examples were NOT seen during training (even with augmentation).")
         print("This tests if the CNN learned the actual transformation RULE.\n")
-        
-        # Load best model
+
+        # Load model checkpoint
         checkpoint = torch.load(args.save_path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        
+
+        ckpt_epoch = checkpoint.get('epoch', None)
+        ckpt_metric = checkpoint.get('best_val_metric', None)
+        is_last_epoch = checkpoint.get('is_last_epoch', False)
+        epoch_str = f"{ckpt_epoch + 1}" if ckpt_epoch is not None else "unknown"
+        metric_str = f"{ckpt_metric:.2%}" if ckpt_metric is not None else "unknown"
+        if is_last_epoch:
+            print(f"Loaded LAST epoch model (epoch {epoch_str}/{args.epochs}, val accuracy: {metric_str})")
+        else:
+            print(f"Loaded BEST checkpoint from epoch {epoch_str}/{args.epochs} (val accuracy: {metric_str})")
+
         test_results = evaluate_test_examples(
             model, test_eval_dataset, DEVICE,
             verbose=True, visualize=args.visualize,
             recursive_iters=args.recursive_iters
         )
-        
-        print(f"\n{'â”€'*60}")
+
+        print(f"\n{'-'*60}")
         print(f"TEST SET RESULTS:")
         print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
         print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
-        print(f"{'â”€'*60}")
-        
+        print(f"{'-'*60}")
+
         if test_results['perfect_rate'] == 1.0:
-            print("\nðŸŽ‰ PERFECT GENERALIZATION! The CNN learned the transformation rule!")
+            print("\nPERFECT GENERALIZATION! The CNN learned the transformation rule!")
             print("   This suggests the CNN can solve this puzzle from training examples alone.")
         elif test_results['pixel_accuracy'] > 0.95:
-            print("\nâœ“ Strong generalization - CNN learned most of the rule.")
+            print("\nStrong generalization - CNN learned most of the rule.")
             print("  Minor errors may be edge cases or noise.")
         elif test_results['pixel_accuracy'] > 0.8:
             print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
         else:
-            print("\nâœ— Poor generalization - CNN may have memorized training examples.")
+            print("\nPoor generalization - CNN may have memorized training examples.")
             print("  The transformation rule was not learned.")
-        
+
         # Also show comparison with training examples
-        print("\n" + "â”€"*60)
+        print("\n" + "-"*60)
         print("Comparison - Evaluating on TRAINING examples (sanity check):")
         train_eval_dataset = TestEvalDataset(train_puzzles, test_only=False)
         train_results = evaluate_test_examples(
@@ -2127,24 +4167,27 @@ def main():
             verbose=True, visualize=False,  # Don't visualize training examples
             recursive_iters=args.recursive_iters
         )
-        print(f"\nTRAINING SET RESULTS:")
-        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
-        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
-        
         # Summary comparison
         print("\n" + "="*60)
         print("GENERALIZATION SUMMARY")
         print("="*60)
+
+        print(f"\nTRAINING SET RESULTS:")
+        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
+        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
+
+        print(f"\nComparison:")
         print(f"  Training examples: {train_results['pixel_accuracy']:.2%} accuracy, {train_results['perfect_rate']:.2%} perfect")
         print(f"  Test examples:     {test_results['pixel_accuracy']:.2%} accuracy, {test_results['perfect_rate']:.2%} perfect")
         gap = train_results['pixel_accuracy'] - test_results['pixel_accuracy']
+
         if gap > 0.1:
             print(f"  Gap: {gap:.2%} - significant overfitting to training examples")
         elif gap > 0.02:
             print(f"  Gap: {gap:.2%} - mild overfitting")
         else:
             print(f"  Gap: {gap:.2%} - good generalization!")
-        
+
         # =========================================================================
         # LAYER-WISE ABLATION ANALYSIS
         # =========================================================================
@@ -2152,6 +4195,109 @@ def main():
             ablation_results = run_layer_ablation(
                 model, test_eval_dataset, DEVICE
             )
+
+        # =========================================================================
+        # CRITIC CNN EVALUATION ON TEST PREDICTIONS
+        # =========================================================================
+        if 'critic_state_dict' in checkpoint:
+            print("\n" + "="*60)
+            print("CRITIC CNN EVALUATION ON TEST PREDICTIONS")
+            print("="*60)
+            print("The critic predicts which pixels in the output are wrong.")
+            print("(Only sees the predicted output - no input or ground truth)\n")
+
+            # Load critic from checkpoint
+            saved_args = checkpoint.get('args', {})
+            critic_eval = CriticCNN(
+                hidden_dim=saved_args.get('critic_hidden_dim', 8),
+                num_layers=saved_args.get('critic_num_layers', 1),
+                conv_depth=saved_args.get('conv_depth', 2),
+                kernel_size=saved_args.get('kernel_size', 3),
+            ).to(DEVICE)
+            critic_eval.load_state_dict(checkpoint['critic_state_dict'])
+            critic_eval.eval()
+
+            # Accumulate stats across all test examples
+            total_tp, total_fp, total_fn, total_tn = 0, 0, 0, 0
+            total_actual_errors, total_predicted_errors = 0, 0
+
+            with torch.no_grad():
+                for i in range(len(test_eval_dataset)):
+                    input_grid, output_grid, dims, puzzle_id = test_eval_dataset[i]
+                    _, _, true_out_h, true_out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
+
+                    inp_t = input_grid.unsqueeze(0).to(DEVICE)
+                    target_colors = output_grid.numpy()
+
+                    # Get model prediction (use recursive if specified)
+                    candidate = torch.zeros_like(input_grid).unsqueeze(0).to(DEVICE)
+                    for _ in range(args.recursive_iters):
+                        output = model(inp_t, candidate)
+                        logits = output['pixel_logits'] if isinstance(output, dict) else output
+                        pred_colors = logits.argmax(dim=1)
+                        candidate = pred_colors.long()
+
+                    pred_np = pred_colors[0].cpu().numpy()
+
+                    # Get critic prediction on the model's output
+                    critic_pred = critic_eval.predict_errors(pred_colors)[0].cpu().numpy().astype(bool)
+
+                    # Crop to actual dimensions
+                    pred_region = pred_np[:true_out_h, :true_out_w]
+                    target_region = target_colors[:true_out_h, :true_out_w]
+                    critic_region = critic_pred[:true_out_h, :true_out_w]
+
+                    # Compute actual errors
+                    actual_errors = (pred_region != target_region)
+
+                    # Confusion matrix elements
+                    tp = (critic_region & actual_errors).sum()
+                    fp = (critic_region & ~actual_errors).sum()
+                    fn = (~critic_region & actual_errors).sum()
+                    tn = (~critic_region & ~actual_errors).sum()
+
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+                    total_tn += tn
+                    total_actual_errors += actual_errors.sum()
+                    total_predicted_errors += critic_region.sum()
+
+                    # Visualize if requested
+                    if args.visualize_critic:
+                        visualize_critic_prediction(
+                            pred_np, target_colors, critic_pred,
+                            true_out_h, true_out_w, puzzle_id=puzzle_id
+                        )
+
+            # Summary statistics
+            precision = total_tp / max(total_tp + total_fp, 1)
+            recall = total_tp / max(total_tp + total_fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+            print(f"\n{'-'*60}")
+            print("CRITIC SUMMARY (across all test examples):")
+            print(f"{'-'*60}")
+            print(f"  Precision: {precision:.3f} (of pixels critic flagged, how many were actually wrong)")
+            print(f"  Recall:    {recall:.3f} (of actual errors, how many did critic catch)")
+            print(f"  F1 Score:  {f1:.3f}")
+            print(f"\n  Confusion Matrix:")
+            print(f"    True Positives:  {total_tp:5d} (correctly identified errors)")
+            print(f"    False Positives: {total_fp:5d} (flagged correct pixels as errors)")
+            print(f"    False Negatives: {total_fn:5d} (missed actual errors)")
+            print(f"    True Negatives:  {total_tn:5d} (correctly identified good pixels)")
+            print(f"\n  Total actual errors:    {total_actual_errors}")
+            print(f"  Total predicted errors: {total_predicted_errors}")
+            print(f"{'-'*60}")
+
+            if f1 > 0.8:
+                print("\nExcellent critic! It can reliably identify errors in predictions.")
+            elif f1 > 0.5:
+                print("\nDecent critic - catches some errors but has room for improvement.")
+            elif total_actual_errors == 0:
+                print("\nNo errors to detect (perfect predictions)!")
+            else:
+                print("\nCritic struggles to identify errors reliably.")
 
     print("\nDone!")
     print(f"\nTo test generalization on a single puzzle:")

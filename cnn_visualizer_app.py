@@ -21,10 +21,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from flask import Flask, render_template, jsonify, request
 
 # Import from existing modules
-from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS, SpatialSelfAttention, CrossAttention
+from crm import (
+    PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS,
+    SpatialSelfAttention, CrossAttention, SlotAttention, SlotRoutedCrossAttention
+)
 from visualize_cnn import (
     ActivationCapture,
     get_layer_names_for_model,
@@ -356,6 +360,25 @@ def api_model_info():
     else:
         hidden_dim = model.inc[0].out_channels
 
+    # Slot attention info
+    use_slot_cross_attention = getattr(model, 'use_slot_cross_attention', False)
+    slot_info = {}
+    if use_slot_cross_attention and model.slot_attention is not None:
+        slot_info = {
+            'num_slots': model.num_slots,
+            'slot_dim': model.slot_dim,
+            'slot_iterations': model.slot_iterations,
+        }
+
+    # Cross-attention info
+    cross_attention_info = {}
+    if getattr(model, 'use_cross_attention', False) and model.cross_attention is not None:
+        cross_attention_info = {
+            'num_heads': model.cross_attention.num_heads,
+            'head_dim': model.cross_attention.head_dim,
+            'proj_dim': model.cross_attention.proj_dim,
+        }
+
     return jsonify({
         'checkpoint': checkpoint_path,
         'num_layers': model.num_layers,
@@ -366,6 +389,9 @@ def api_model_info():
         'use_onehot': model.use_onehot,
         'use_attention': getattr(model, 'use_attention', False),
         'use_cross_attention': getattr(model, 'use_cross_attention', False),
+        'cross_attention_info': cross_attention_info,
+        'use_slot_cross_attention': use_slot_cross_attention,
+        'slot_info': slot_info,
         'predict_size': getattr(model, 'predict_size', False),
         'encoding': 'one-hot (11 ch/grid)' if model.use_onehot else 'learned embeddings (16 ch/grid)',
         'num_classes': model.num_classes,
@@ -754,24 +780,72 @@ def compute_pixel_trace(
         with torch.no_grad():
             _ = model(inp_tensor, candidate_tensor)
 
-        attn_weights = model.cross_attention.last_attention_weights  # (1, H*W, H*W)
+        attn_weights = model.cross_attention.last_attention_weights  # (B, num_heads, H*W, H*W)
         model.cross_attention.capture_attention = False
+        num_heads = model.cross_attention.num_heads
 
         if attn_weights is not None:
-            attn_np = attn_weights.squeeze(0).numpy()  # (900, 900)
+            # attn_weights shape: (B, num_heads, N, N) where N = H*W
+            attn_np = attn_weights.squeeze(0).numpy()  # (num_heads, 900, 900)
             H, W = GRID_SIZE, GRID_SIZE
             pixel_idx = row * W + col
 
-            # For cross-attention: rows are OUTPUT pixels, cols are INPUT pixels
-            # Attention FROM this output pixel to all INPUT pixels
-            attn_from_pixel = attn_np[pixel_idx, :]  # (900,) - what input this output looks at
-            attn_from_grid = attn_from_pixel.reshape(H, W)
+            # For multi-head: compute per-head attention and averaged attention
+            if num_heads > 1:
+                # Per-head attention for this pixel
+                per_head_from = []  # (num_heads, H, W)
+                per_head_to = []    # (num_heads, H, W)
+                per_head_stats = []
+                per_head_top_attended = []
 
-            # Attention TO this pixel position from all OUTPUT pixels
-            attn_to_pixel = attn_np[:, pixel_idx]  # (900,) - which outputs look at this input position
+                for h in range(num_heads):
+                    head_attn = attn_np[h]  # (N, N)
+                    # Attention FROM this output pixel to all INPUT pixels
+                    head_from_pixel = head_attn[pixel_idx, :]  # (900,)
+                    head_from_grid = head_from_pixel.reshape(H, W)
+                    per_head_from.append(head_from_grid.tolist())
+
+                    # Attention TO this pixel position from all OUTPUT pixels
+                    head_to_pixel = head_attn[:, pixel_idx]  # (900,)
+                    head_to_grid = head_to_pixel.reshape(H, W)
+                    per_head_to.append(head_to_grid.tolist())
+
+                    # Top INPUT pixels this OUTPUT pixel attends to (per head)
+                    top_from_indices = np.argsort(head_from_pixel)[-5:][::-1]
+                    per_head_top_attended.append([
+                        {
+                            'row': int(idx // W),
+                            'col': int(idx % W),
+                            'weight': float(head_from_pixel[idx])
+                        }
+                        for idx in top_from_indices
+                    ])
+
+                    per_head_stats.append({
+                        'from_max': float(head_from_pixel.max()),
+                        'from_mean': float(head_from_pixel.mean()),
+                        'from_entropy': float(-np.sum(head_from_pixel * np.log(head_from_pixel + 1e-10))),
+                        'to_max': float(head_to_pixel.max()),
+                        'to_mean': float(head_to_pixel.mean()),
+                        'self_attention_weight': float(head_from_pixel[pixel_idx]),
+                    })
+
+                # Average attention across heads for summary view
+                attn_avg = attn_np.mean(axis=0)  # (N, N)
+            else:
+                attn_avg = attn_np[0]  # (N, N) - single head
+                per_head_from = None
+                per_head_to = None
+                per_head_stats = None
+                per_head_top_attended = None
+
+            # Compute averaged attention metrics
+            attn_from_pixel = attn_avg[pixel_idx, :]  # (900,)
+            attn_from_grid = attn_from_pixel.reshape(H, W)
+            attn_to_pixel = attn_avg[:, pixel_idx]  # (900,)
             attn_to_grid = attn_to_pixel.reshape(H, W)
 
-            # Top INPUT pixels this OUTPUT pixel attends to
+            # Top INPUT pixels this OUTPUT pixel attends to (averaged)
             top_from_indices = np.argsort(attn_from_pixel)[-10:][::-1]
             top_attended = [
                 {
@@ -782,7 +856,7 @@ def compute_pixel_trace(
                 for idx in top_from_indices
             ]
 
-            # Top OUTPUT pixels that attend to this INPUT position
+            # Top OUTPUT pixels that attend to this INPUT position (averaged)
             top_to_indices = np.argsort(attn_to_pixel)[-10:][::-1]
             top_attending = [
                 {
@@ -796,11 +870,12 @@ def compute_pixel_trace(
             result['attention'] = {
                 'has_attention': True,
                 'attention_type': 'cross',  # Distinguish from self-attention
-                'attention_from_pixel': attn_from_grid.tolist(),  # This output pixel attends to these input pixels
-                'attention_to_pixel': attn_to_grid.tolist(),      # These output pixels attend to this input position
-                'top_attended': top_attended,   # Top 10 input pixels this output attends to
-                'top_attending': top_attending, # Top 10 output pixels that attend to this input position
-                'self_attention_weight': float(attn_from_pixel[pixel_idx]),  # Attention to same position in input
+                'num_heads': num_heads,
+                'attention_from_pixel': attn_from_grid.tolist(),  # Averaged: this output pixel attends to these input pixels
+                'attention_to_pixel': attn_to_grid.tolist(),      # Averaged: these output pixels attend to this input position
+                'top_attended': top_attended,   # Top 10 input pixels this output attends to (averaged)
+                'top_attending': top_attending, # Top 10 output pixels that attend to this input position (averaged)
+                'self_attention_weight': float(attn_from_pixel[pixel_idx]),  # Attention to same position in input (averaged)
                 'stats': {
                     'from_max': float(attn_from_pixel.max()),
                     'from_mean': float(attn_from_pixel.mean()),
@@ -809,6 +884,15 @@ def compute_pixel_trace(
                     'to_mean': float(attn_to_pixel.mean()),
                 }
             }
+
+            # Add per-head data if multi-head
+            if num_heads > 1:
+                result['attention']['per_head'] = {
+                    'attention_from_pixel': per_head_from,  # List of (H, W) grids per head
+                    'attention_to_pixel': per_head_to,      # List of (H, W) grids per head
+                    'top_attended': per_head_top_attended,  # List of top-5 per head
+                    'stats': per_head_stats,                # List of stats per head
+                }
         else:
             result['attention'] = {'has_attention': False}
 
@@ -877,6 +961,154 @@ def compute_pixel_trace(
             result['attention'] = {'has_attention': False}
     else:
         result['attention'] = {'has_attention': False}
+
+    # Slot-routed cross-attention visualization
+    if getattr(model, 'use_slot_cross_attention', False) and model.slot_attention is not None:
+        with torch.no_grad():
+            # Compute IR features
+            inp_onehot_slot = F.one_hot(inp_tensor.long(), NUM_COLORS).float()
+            inp_onehot_slot = inp_onehot_slot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
+            ir_features_slot = model.ir_encoder(inp_onehot_slot)  # (B, H, W, D)
+
+            # Get slot embeddings and masks
+            slot_embeddings, slot_masks = model.slot_attention(ir_features_slot)
+            # slot_embeddings: (B, K, slot_dim)
+            # slot_masks: (B, K, H, W) - soft assignment of input pixels to slots
+
+            slot_masks_np = slot_masks.squeeze(0).cpu().numpy()  # (K, H, W)
+            slot_embeddings_np = slot_embeddings.squeeze(0).cpu().numpy()  # (K, slot_dim)
+            K = slot_masks_np.shape[0]
+            H_in, W_in = slot_masks_np.shape[1], slot_masks_np.shape[2]
+
+            # Get decoder features (need to run partial forward)
+            # Re-run the U-Net to get decoder output features
+            if model.use_onehot:
+                out_emb_slot = model._encode_grid(candidate_tensor)
+            else:
+                out_emb_slot = model.output_embed(candidate_tensor)
+
+            if model.cross_attention is not None and model.ir_encoder is not None:
+                ir_features_attn = ir_features_slot.permute(0, 3, 1, 2).contiguous()
+                ir_features_attn = model.ir_self_attention(ir_features_attn)
+                ir_features_attn = ir_features_attn.permute(0, 2, 3, 1).contiguous()
+                out_emb_slot = model.cross_attention(query=out_emb_slot, key_value=ir_features_attn)
+
+            if model.use_onehot:
+                inp_emb_slot = model._encode_grid(inp_tensor)
+            else:
+                inp_emb_slot = model.input_embed(inp_tensor)
+
+            x = torch.cat([inp_emb_slot, out_emb_slot], dim=-1)
+            x = x.permute(0, 3, 1, 2).contiguous()
+
+            # U-Net encoder
+            x1 = model.inc(x)
+            if model.num_layers >= 1:
+                x2 = model.down1(x1)
+            if model.num_layers >= 2:
+                x3 = model.down2(x2)
+            if model.num_layers >= 3:
+                x4 = model.down3(x3)
+
+            # Determine bottleneck
+            if model.num_layers == 0:
+                bottleneck = x1
+            elif model.num_layers == 1:
+                bottleneck = x2
+            elif model.num_layers == 2:
+                bottleneck = x3
+            else:
+                bottleneck = x4
+
+            # U-Net decoder
+            if model.num_layers == 0:
+                decoder_out = bottleneck
+            elif model.no_skip:
+                if model.num_layers == 3:
+                    decoder_out = model.up1(bottleneck, target_size=(x3.size(2), x3.size(3)))
+                    decoder_out = model.up2(decoder_out, target_size=(x2.size(2), x2.size(3)))
+                    decoder_out = model.up3(decoder_out, target_size=(x1.size(2), x1.size(3)))
+                elif model.num_layers == 2:
+                    decoder_out = model.up2(bottleneck, target_size=(x2.size(2), x2.size(3)))
+                    decoder_out = model.up3(decoder_out, target_size=(x1.size(2), x1.size(3)))
+                else:
+                    decoder_out = model.up3(bottleneck, target_size=(x1.size(2), x1.size(3)))
+            else:
+                if model.num_layers == 3:
+                    decoder_out = model.up1(bottleneck, x3)
+                    decoder_out = model.up2(decoder_out, x2)
+                    decoder_out = model.up3(decoder_out, x1)
+                elif model.num_layers == 2:
+                    decoder_out = model.up2(bottleneck, x2)
+                    decoder_out = model.up3(decoder_out, x1)
+                else:
+                    decoder_out = model.up3(bottleneck, x1)
+
+            # Apply spatial self-attention if enabled
+            if model.attention is not None:
+                decoder_out = model.attention(decoder_out)
+
+            # Now compute slot-routed cross-attention manually to capture intermediate values
+            decoder_features = decoder_out.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+            B, H_out, W_out, C = decoder_features.shape
+            N_out = H_out * W_out
+            N_in = H_in * W_in
+
+            # Normalize slot masks (sum to 1 over spatial dims)
+            masks_normalized = slot_masks / (slot_masks.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+
+            # Compute slot attention weights
+            q = model.slot_cross_attention.q_proj(decoder_features.reshape(B, N_out, C))
+            k = model.slot_cross_attention.k_proj(slot_embeddings)
+            scale = model.slot_cross_attention.scale
+
+            slot_attn_logits = torch.bmm(q, k.transpose(1, 2)) * scale  # (B, N_out, K)
+            slot_attn = F.softmax(slot_attn_logits, dim=-1)  # (B, N_out, K)
+            slot_attn_np = slot_attn.squeeze(0).cpu().numpy()  # (N_out, K)
+
+            # Get slot attention for the selected pixel
+            pixel_idx = row * W_out + col
+            slot_attn_for_pixel = slot_attn_np[pixel_idx, :]  # (K,)
+
+            # Combine slot attention with normalized masks
+            masks_flat = masks_normalized.reshape(B, K, N_in)
+            combined_attn = torch.bmm(slot_attn, masks_flat)  # (B, N_out, N_in)
+            combined_attn_np = combined_attn.squeeze(0).cpu().numpy()  # (N_out, N_in)
+
+            # Get combined attention for the selected pixel
+            combined_attn_for_pixel = combined_attn_np[pixel_idx, :]  # (N_in,)
+            combined_attn_grid = combined_attn_for_pixel.reshape(H_in, W_in)
+
+            # Top input pixels this output pixel attends to (via slot routing)
+            top_input_indices = np.argsort(combined_attn_for_pixel)[-10:][::-1]
+            top_attended_inputs = [
+                {
+                    'row': int(idx // W_in),
+                    'col': int(idx % W_in),
+                    'weight': float(combined_attn_for_pixel[idx])
+                }
+                for idx in top_input_indices
+            ]
+
+            result['slot_attention'] = {
+                'has_slot_attention': True,
+                'num_slots': K,
+                'slot_dim': int(slot_embeddings_np.shape[1]),
+                'slot_masks': slot_masks_np.tolist(),  # (K, H, W)
+                'slot_masks_normalized': masks_normalized.squeeze(0).cpu().numpy().tolist(),
+                'slot_attention_weights': slot_attn_for_pixel.tolist(),  # (K,) - which slots this pixel attends to
+                'combined_attention': combined_attn_grid.tolist(),  # (H_in, W_in) - final attention over input
+                'top_attended_inputs': top_attended_inputs,
+                'slot_embeddings_norm': [float(np.linalg.norm(slot_embeddings_np[k])) for k in range(K)],
+                'stats': {
+                    'slot_attn_max': float(slot_attn_for_pixel.max()),
+                    'slot_attn_entropy': float(-np.sum(slot_attn_for_pixel * np.log(slot_attn_for_pixel + 1e-10))),
+                    'combined_attn_max': float(combined_attn_for_pixel.max()),
+                    'combined_attn_entropy': float(-np.sum(combined_attn_for_pixel * np.log(combined_attn_for_pixel + 1e-10))),
+                }
+            }
+    else:
+        result['slot_attention'] = {'has_slot_attention': False}
 
     return result
 

@@ -276,6 +276,22 @@ async function loadModelInfo() {
         modelInfo = await response.json();
 
         const container = document.getElementById('model-info');
+        // Build slot attention info string
+        let slotInfo = 'No';
+        if (modelInfo.use_slot_cross_attention && modelInfo.slot_info) {
+            slotInfo = `${modelInfo.slot_info.num_slots} slots`;
+        }
+
+        // Build cross-attention info string
+        let crossAttnInfo = 'No';
+        if (modelInfo.use_cross_attention) {
+            if (modelInfo.cross_attention_info && modelInfo.cross_attention_info.num_heads > 1) {
+                crossAttnInfo = `${modelInfo.cross_attention_info.num_heads} heads`;
+            } else {
+                crossAttnInfo = 'Yes';
+            }
+        }
+
         container.innerHTML = `
             <div class="info-item">
                 <div class="info-label">Layers</div>
@@ -292,6 +308,14 @@ async function loadModelInfo() {
             <div class="info-item">
                 <div class="info-label">Attention</div>
                 <div class="info-value">${modelInfo.use_attention ? 'Yes' : 'No'}</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Cross Attn</div>
+                <div class="info-value" style="color: ${modelInfo.use_cross_attention ? '#2ECC40' : '#888'};">${crossAttnInfo}</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Slot Attn</div>
+                <div class="info-value" style="color: ${modelInfo.use_slot_cross_attention ? '#2ECC40' : '#888'};">${slotInfo}</div>
             </div>
             <div class="info-item">
                 <div class="info-label">Encoding</div>
@@ -941,10 +965,15 @@ function renderPixelTrace(trace) {
         grid.appendChild(createAttentionSection(trace));
     }
 
+    // 5b. Slot Attention Section (if model has slot cross-attention)
+    if (trace.slot_attention && trace.slot_attention.has_slot_attention) {
+        grid.appendChild(createSlotAttentionSection(trace));
+    }
+
     // 6. Final Calculation Section
     grid.appendChild(createFinalCalculationSection(trace));
 
-    // 6. Prediction Summary Section
+    // 7. Prediction Summary Section
     grid.appendChild(createPredictionSummarySection(trace));
 
     content.appendChild(grid);
@@ -1241,8 +1270,12 @@ function createAttentionSection(trace) {
     const attn = trace.attention;
     const pixel = trace.pixel;
     const isCrossAttention = attn.attention_type === 'cross';
+    const numHeads = attn.num_heads || 1;
+    const hasMultiHead = numHeads > 1 && attn.per_head;
 
-    const title = isCrossAttention ? 'Cross-Attention (Output → Input)' : 'Spatial Self-Attention';
+    const title = isCrossAttention
+        ? `Cross-Attention (Output → Input)${hasMultiHead ? ` - ${numHeads} Heads` : ''}`
+        : 'Spatial Self-Attention';
     const description = isCrossAttention
         ? 'Output pixel queries input pixels for global context. Brighter = higher attention weight.'
         : 'This pixel attends to all other pixels. Brighter = higher attention weight.';
@@ -1254,20 +1287,82 @@ function createAttentionSection(trace) {
         </p>
     `;
 
-    // Self-attention weight
+    // Self-attention weight and entropy (averaged if multi-head)
+    const avgLabel = hasMultiHead ? ' (averaged)' : '';
     html += `
         <div class="trace-row">
-            <span class="trace-label">Self-attention weight</span>
+            <span class="trace-label">Self-attention weight${avgLabel}</span>
             <span class="trace-value">${(attn.self_attention_weight * 100).toFixed(2)}%</span>
         </div>
         <div class="trace-row">
-            <span class="trace-label">Attention entropy</span>
+            <span class="trace-label">Attention entropy${avgLabel}</span>
             <span class="trace-value">${attn.stats.from_entropy.toFixed(2)} (higher = more uniform)</span>
         </div>
     `;
 
-    // Attention heatmaps side by side
-    html += `<div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">`;
+    // For multi-head: add head selector tabs
+    if (hasMultiHead) {
+        const tabStyle = 'padding: 4px 10px; border: 1px solid #444; border-radius: 4px; background: #1a2a3a; color: #aaa; cursor: pointer; font-size: 0.8em;';
+        const activeTabStyle = 'padding: 4px 10px; border: 1px solid #00d4ff; border-radius: 4px; background: #0a3040; color: #00d4ff; cursor: pointer; font-size: 0.8em;';
+        html += `
+            <div style="margin: 15px 0 10px 0;">
+                <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Select attention head:</div>
+                <div class="head-tabs" style="display: flex; gap: 4px; flex-wrap: wrap;">
+                    <button class="head-tab active" data-head="avg" style="${activeTabStyle}" onclick="selectAttentionHead(this, 'avg')">Averaged</button>
+        `;
+        for (let h = 0; h < numHeads; h++) {
+            html += `<button class="head-tab" data-head="${h}" style="${tabStyle}" onclick="selectAttentionHead(this, ${h})">Head ${h + 1}</button>`;
+        }
+        html += `</div></div>`;
+    }
+
+    // Store attention data globally for head tab selection
+    window.currentAttentionData = { attn, pixel, isCrossAttention };
+
+    // Attention heatmaps container (will be updated by head selection)
+    html += `<div id="attention-heatmaps-container">`;
+    html += renderAttentionHeatmaps(attn, pixel, isCrossAttention, 'avg');
+    html += `</div>`;
+
+    // Legend
+    const legendFrom = isCrossAttention ? 'Queries (orange)' : 'Attends to (orange)';
+    const legendTo = isCrossAttention ? 'Queried by (blue)' : 'Attended by (blue)';
+    html += `
+        <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> ${legendFrom}</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> ${legendTo}</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
+        </div>
+    `;
+
+    section.innerHTML = html;
+    return section;
+}
+
+// Helper function to render attention heatmaps (used for both averaged and per-head)
+function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
+    let fromGrid, toGrid, maxFrom, maxTo, topAttended, stats;
+
+    if (headIdx === 'avg' || !attn.per_head) {
+        // Use averaged attention
+        fromGrid = attn.attention_from_pixel;
+        toGrid = attn.attention_to_pixel;
+        maxFrom = attn.stats.from_max;
+        maxTo = attn.stats.to_max;
+        topAttended = attn.top_attended;
+        stats = attn.stats;
+    } else {
+        // Use per-head attention
+        const h = parseInt(headIdx);
+        fromGrid = attn.per_head.attention_from_pixel[h];
+        toGrid = attn.per_head.attention_to_pixel[h];
+        stats = attn.per_head.stats[h];
+        maxFrom = stats.from_max;
+        maxTo = stats.to_max;
+        topAttended = attn.per_head.top_attended[h];
+    }
+
+    let html = `<div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">`;
 
     // "Attention FROM this pixel" heatmap
     const fromLabel = isCrossAttention ? 'This output pixel queries input:' : 'This pixel attends to:';
@@ -1277,12 +1372,10 @@ function createAttentionSection(trace) {
             <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
     `;
 
-    const fromGrid = attn.attention_from_pixel;
-    const maxFrom = attn.stats.from_max;
     for (let r = 0; r < 30; r++) {
         for (let c = 0; c < 30; c++) {
             const weight = fromGrid[r][c];
-            const normalized = weight / maxFrom;
+            const normalized = maxFrom > 0 ? weight / maxFrom : 0;
             const intensity = Math.floor(normalized * 255);
             const isSelected = (r === pixel.row && c === pixel.col);
             const border = isSelected ? 'border: 1px solid #ff0;' : '';
@@ -1300,12 +1393,10 @@ function createAttentionSection(trace) {
             <div class="attention-grid" style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
     `;
 
-    const toGrid = attn.attention_to_pixel;
-    const maxTo = attn.stats.to_max;
     for (let r = 0; r < 30; r++) {
         for (let c = 0; c < 30; c++) {
             const weight = toGrid[r][c];
-            const normalized = weight / maxTo;
+            const normalized = maxTo > 0 ? weight / maxTo : 0;
             const intensity = Math.floor(normalized * 255);
             const isSelected = (r === pixel.row && c === pixel.col);
             const border = isSelected ? 'border: 1px solid #ff0;' : '';
@@ -1317,14 +1408,15 @@ function createAttentionSection(trace) {
     html += `</div>`;
 
     // Top attended pixels
-    const topLabel = isCrossAttention ? 'Top 5 input pixels queried:' : 'Top 5 pixels this one attends to:';
+    const topLabel = isCrossAttention ? 'Top input pixels queried:' : 'Top pixels this one attends to:';
     html += `
         <div style="margin-top: 15px;">
             <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">${topLabel}</div>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
     `;
-    for (let i = 0; i < Math.min(5, attn.top_attended.length); i++) {
-        const p = attn.top_attended[i];
+    const numTop = topAttended ? Math.min(5, topAttended.length) : 0;
+    for (let i = 0; i < numTop; i++) {
+        const p = topAttended[i];
         html += `
             <div style="padding: 4px 8px; background: #1a2a3a; border-radius: 4px; font-size: 0.8em;">
                 (${p.row}, ${p.col}): <span style="color: #f90;">${(p.weight * 100).toFixed(1)}%</span>
@@ -1333,13 +1425,188 @@ function createAttentionSection(trace) {
     }
     html += `</div></div>`;
 
+    // Stats for this head/average
+    html += `
+        <div style="margin-top: 10px; font-size: 0.8em; color: #666;">
+            Max: ${(stats.from_max * 100).toFixed(1)}% | Mean: ${(stats.from_mean * 100).toFixed(2)}% | Entropy: ${stats.from_entropy.toFixed(2)}
+        </div>
+    `;
+
+    return html;
+}
+
+// Global function to handle head tab selection
+function selectAttentionHead(button, headIdx) {
+    const tabStyle = 'padding: 4px 10px; border: 1px solid #444; border-radius: 4px; background: #1a2a3a; color: #aaa; cursor: pointer; font-size: 0.8em;';
+    const activeTabStyle = 'padding: 4px 10px; border: 1px solid #00d4ff; border-radius: 4px; background: #0a3040; color: #00d4ff; cursor: pointer; font-size: 0.8em;';
+
+    // Update active tab styling
+    document.querySelectorAll('.head-tab').forEach(tab => {
+        tab.classList.remove('active');
+        tab.style.cssText = tabStyle;
+    });
+    button.classList.add('active');
+    button.style.cssText = activeTabStyle;
+
+    // Get the container for heatmaps
+    const container = document.getElementById('attention-heatmaps-container');
+    if (!container) return;
+
+    // Get the trace data from the globally stored attention data
+    if (window.currentAttentionData) {
+        const attn = window.currentAttentionData.attn;
+        const pixel = window.currentAttentionData.pixel;
+        const isCrossAttention = window.currentAttentionData.isCrossAttention;
+        container.innerHTML = renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx);
+    }
+}
+
+function createSlotAttentionSection(trace) {
+    const section = document.createElement('div');
+    section.className = 'trace-section';
+
+    const slot = trace.slot_attention;
+    const pixel = trace.pixel;
+    const K = slot.num_slots;
+
+    let html = `
+        <h4>Slot-Routed Cross-Attention (${K} slots)</h4>
+        <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
+            Output pixel queries objects via slots. Each slot represents a discovered object/pattern in the input.
+        </p>
+    `;
+
+    // Slot attention weights bar chart
+    html += `
+        <div style="margin-bottom: 15px;">
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Slot Attention Weights (which objects this pixel attends to):</div>
+            <div style="display: flex; align-items: end; gap: 4px; height: 60px;">
+    `;
+
+    const maxSlotWeight = Math.max(...slot.slot_attention_weights);
+    for (let k = 0; k < K; k++) {
+        const weight = slot.slot_attention_weights[k];
+        const height = (weight / maxSlotWeight) * 50;
+        const isMax = weight === maxSlotWeight;
+        const color = isMax ? '#2ECC40' : '#0074D9';
+        html += `
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+                <div style="width: 30px; height: ${height}px; background: ${color}; border-radius: 2px 2px 0 0;"
+                     title="Slot ${k}: ${(weight * 100).toFixed(1)}%"></div>
+                <span style="font-size: 0.7em; color: #888;">S${k}</span>
+                <span style="font-size: 0.65em; color: ${isMax ? '#2ECC40' : '#666'};">${(weight * 100).toFixed(0)}%</span>
+            </div>
+        `;
+    }
+    html += `</div></div>`;
+
+    // Stats
+    html += `
+        <div class="trace-row">
+            <span class="trace-label">Slot attention entropy</span>
+            <span class="trace-value">${slot.stats.slot_attn_entropy.toFixed(2)} (higher = more uniform)</span>
+        </div>
+        <div class="trace-row">
+            <span class="trace-label">Combined attention entropy</span>
+            <span class="trace-value">${slot.stats.combined_attn_entropy.toFixed(2)}</span>
+        </div>
+    `;
+
+    // Slot masks visualization
+    html += `
+        <div style="margin-top: 15px;">
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Slot Masks (what input pixels each slot covers):</div>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+    `;
+
+    for (let k = 0; k < K; k++) {
+        const mask = slot.slot_masks[k];
+        const weight = slot.slot_attention_weights[k];
+        const isTopSlot = weight === maxSlotWeight;
+        const borderStyle = isTopSlot ? 'border: 2px solid #2ECC40;' : 'border: 1px solid #333;';
+
+        // Find max value in mask for normalization
+        let maxMask = 0;
+        for (const row of mask) {
+            for (const val of row) {
+                maxMask = Math.max(maxMask, val);
+            }
+        }
+        if (maxMask === 0) maxMask = 1;
+
+        html += `
+            <div style="${borderStyle} border-radius: 4px; padding: 4px;">
+                <div style="font-size: 0.7em; color: ${isTopSlot ? '#2ECC40' : '#888'}; text-align: center; margin-bottom: 2px;">
+                    Slot ${k} (${(weight * 100).toFixed(0)}%)
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(30, 4px); gap: 0;">
+        `;
+
+        for (let r = 0; r < 30; r++) {
+            for (let c = 0; c < 30; c++) {
+                const val = mask[r] ? (mask[r][c] || 0) : 0;
+                const normalized = val / maxMask;
+                const intensity = Math.floor(normalized * 255);
+                const isSelected = (r === pixel.row && c === pixel.col);
+                const border = isSelected ? 'border: 1px solid #ff0;' : '';
+                html += `<div style="width: 4px; height: 4px; background: rgb(${intensity}, ${Math.floor(intensity * 0.6)}, 0); ${border}"
+                             title="(${r},${c}): ${(val * 100).toFixed(1)}%"></div>`;
+            }
+        }
+
+        html += `</div></div>`;
+    }
+    html += `</div></div>`;
+
+    // Combined attention map (final attention over input pixels)
+    html += `
+        <div style="margin-top: 15px;">
+            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Combined Attention (final attention over input after slot routing):</div>
+            <div style="display: flex; gap: 20px; align-items: start;">
+                <div>
+                    <div style="display: grid; grid-template-columns: repeat(30, 8px); gap: 1px;">
+    `;
+
+    const combinedAttn = slot.combined_attention;
+    const maxCombined = slot.stats.combined_attn_max;
+    for (let r = 0; r < 30; r++) {
+        for (let c = 0; c < 30; c++) {
+            const weight = combinedAttn[r] ? (combinedAttn[r][c] || 0) : 0;
+            const normalized = weight / maxCombined;
+            const intensity = Math.floor(normalized * 255);
+            const isSelected = (r === pixel.row && c === pixel.col);
+            const border = isSelected ? 'border: 1px solid #ff0;' : '';
+            html += `<div style="width: 8px; height: 8px; background: rgb(${intensity}, ${Math.floor(intensity * 0.5)}, 0); ${border}"
+                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
+        }
+    }
+
+    html += `</div></div>`;
+
+    // Top attended input pixels
+    html += `
+                <div>
+                    <div style="font-size: 0.8em; color: #aaa; margin-bottom: 8px;">Top input pixels:</div>
+                    <div style="display: flex; flex-direction: column; gap: 4px;">
+    `;
+
+    for (let i = 0; i < Math.min(5, slot.top_attended_inputs.length); i++) {
+        const p = slot.top_attended_inputs[i];
+        html += `
+            <div style="padding: 4px 8px; background: #1a2a3a; border-radius: 4px; font-size: 0.8em;">
+                (${p.row}, ${p.col}): <span style="color: #f90;">${(p.weight * 100).toFixed(2)}%</span>
+            </div>
+        `;
+    }
+
+    html += `</div></div></div></div>`;
+
     // Legend
-    const legendFrom = isCrossAttention ? 'Queries (orange)' : 'Attends to (orange)';
-    const legendTo = isCrossAttention ? 'Queried by (blue)' : 'Attended by (blue)';
     html += `
         <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> ${legendFrom}</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> ${legendTo}</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> High attention</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 0, 0); border-radius: 2px; border: 1px solid #444;"></span> Low attention</span>
+            <span><span style="display: inline-block; width: 12px; height: 12px; border: 2px solid #2ECC40; border-radius: 2px;"></span> Top slot</span>
             <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
         </div>
     `;

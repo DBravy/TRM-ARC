@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 
 # Import model from training script
-from train_pixel_error_cnn import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS
+from crm import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS
 
 # ARC color palette (0-9)
 ARC_COLORS = [
