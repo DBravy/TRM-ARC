@@ -1082,13 +1082,37 @@ def compute_pixel_trace(
             # This is what the actual SlotRoutedCrossAttention does
             slot_content = torch.bmm(masks_flat, ir_flat)  # (B, K, D)
 
+            # Create binary masks for hard slot boundaries
+            masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
+            masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
+
+            # Detect empty slots (no pixels belong to this slot)
+            slot_pixel_counts = masks_binary.sum(dim=(-2, -1))  # (B, K)
+            empty_slots = (slot_pixel_counts == 0)  # (B, K)
+
             # Compute slot attention weights using the correct projections
             q = model.slot_cross_attention.q_proj(decoder_features.reshape(B, N_out, C))  # (B, N_out, proj_dim)
             k_slots = model.slot_cross_attention.k_slot_proj(slot_content)  # (B, K, proj_dim)
             scale = model.slot_cross_attention.scale
 
             slot_attn_logits = torch.bmm(q, k_slots.transpose(1, 2)) * scale  # (B, N_out, K)
-            slot_attn = F.softmax(slot_attn_logits, dim=-1)  # (B, N_out, K)
+
+            # Mask out empty slots so they're never selected
+            slot_attn_logits = slot_attn_logits.masked_fill(empty_slots.unsqueeze(1), float('-inf'))
+
+            # Top-k slot selection (matching forward pass)
+            top_k_value = getattr(model.slot_cross_attention, 'top_k', 2)
+            num_valid_slots = (~empty_slots).sum(dim=-1).min().item()
+            top_k = min(top_k_value, K, max(1, num_valid_slots))
+            topk_logits, topk_indices = torch.topk(slot_attn_logits, top_k, dim=-1)  # (B, N_out, top_k)
+
+            # Softmax over only the top-k slots (renormalized)
+            topk_attn = F.softmax(topk_logits, dim=-1)  # (B, N_out, top_k)
+            topk_attn = torch.nan_to_num(topk_attn, nan=1.0 / top_k)
+
+            # For visualization, expand back to full K slots (with zeros for non-top-k)
+            slot_attn = torch.zeros(B, N_out, K, device=slot_attn_logits.device)
+            slot_attn.scatter_(2, topk_indices, topk_attn)
             slot_attn_np = slot_attn.squeeze(0).cpu().numpy()  # (N_out, K)
 
             # Get slot attention for the selected pixel
@@ -1099,19 +1123,24 @@ def compute_pixel_trace(
             k_pixels = model.slot_cross_attention.k_pixel_proj(ir_flat)  # (B, N_in, proj_dim)
             pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * scale  # (B, N_out, N_in)
 
-            # Create binary masks for hard slot boundaries
-            masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
-            masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
+            # Gather top-k masks
+            topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, N_in)  # (B, N_out, top_k, N_in)
+            masks_expanded_full = masks_binary_flat.unsqueeze(1).expand(-1, N_out, -1, -1)  # (B, N_out, K, N_in)
+            topk_masks = torch.gather(masks_expanded_full, 2, topk_indices_expanded)  # (B, N_out, top_k, N_in)
 
-            # Compute per-slot pixel attention
+            # Compute per-slot pixel attention (only for top-k slots)
             pixel_logits_expanded = pixel_logits.unsqueeze(2)  # (B, N_out, 1, N_in)
-            masks_expanded = masks_binary_flat.unsqueeze(1)  # (B, 1, K, N_in)
-            masked_logits = pixel_logits_expanded.masked_fill(masks_expanded == 0, float('-inf'))
-            per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, K, N_in)
-            per_slot_pixel_attn = torch.nan_to_num(per_slot_pixel_attn, nan=0.0)
+            masked_logits = pixel_logits_expanded.masked_fill(topk_masks == 0, float('-inf'))  # (B, N_out, top_k, N_in)
+            topk_per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, top_k, N_in)
+            topk_per_slot_pixel_attn = torch.nan_to_num(topk_per_slot_pixel_attn, nan=0.0)
+
+            # Expand back to full K slots for visualization
+            per_slot_pixel_attn = torch.zeros(B, N_out, K, N_in, device=pixel_logits.device)
+            topk_indices_for_scatter = topk_indices.unsqueeze(-1).expand(-1, -1, -1, N_in)
+            per_slot_pixel_attn.scatter_(2, topk_indices_for_scatter, topk_per_slot_pixel_attn)
 
             # Combine slot selection with per-slot pixel attention (matching forward pass)
-            combined_attn = (slot_attn.unsqueeze(-1) * per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
+            combined_attn = (topk_attn.unsqueeze(-1) * topk_per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
             combined_attn_np = combined_attn.squeeze(0).cpu().numpy()  # (N_out, N_in)
 
             # Get combined attention for the selected pixel
@@ -1133,13 +1162,21 @@ def compute_pixel_trace(
             per_slot_pixel_attn_for_pixel = per_slot_pixel_attn.squeeze(0)[pixel_idx].cpu().numpy()  # (K, N_in)
             per_slot_pixel_attn_grids = per_slot_pixel_attn_for_pixel.reshape(K, H_in, W_in)  # (K, H_in, W_in)
 
+            # Get which slots are empty and which are in top-k for this pixel
+            empty_slots_np = empty_slots.squeeze(0).cpu().numpy()  # (K,)
+            topk_indices_for_pixel = topk_indices.squeeze(0)[pixel_idx].cpu().numpy()  # (top_k,)
+
             result['slot_attention'] = {
                 'has_slot_attention': True,
                 'num_slots': K,
+                'top_k': top_k,
+                'top_k_indices': topk_indices_for_pixel.tolist(),  # Which slots are in top-k for this pixel
+                'empty_slots': empty_slots_np.tolist(),  # (K,) - True if slot has no pixels
+                'num_valid_slots': int(num_valid_slots),
                 'slot_dim': int(slot_embeddings_np.shape[1]),
                 'slot_masks': slot_masks_np.tolist(),  # (K, H, W)
                 'slot_masks_normalized': masks_normalized.squeeze(0).cpu().numpy().tolist(),
-                'slot_attention_weights': slot_attn_for_pixel.tolist(),  # (K,) - which slots this pixel attends to
+                'slot_attention_weights': slot_attn_for_pixel.tolist(),  # (K,) - which slots this pixel attends to (0 for non-top-k)
                 'per_slot_pixel_attention': per_slot_pixel_attn_grids.tolist(),  # (K, H_in, W_in) - per-slot pixel attention
                 'combined_attention': combined_attn_grid.tolist(),  # (H_in, W_in) - final attention over input
                 'top_attended_inputs': top_attended_inputs,

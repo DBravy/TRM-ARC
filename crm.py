@@ -908,9 +908,10 @@ class SlotRoutedCrossAttention(nn.Module):
         slot_dim: Dimension of slot embeddings (unused, kept for API compatibility)
         value_dim: Dimension of IR encoder features (D)
         proj_dim: Dimension for attention computation (defaults to slot_dim)
+        top_k: Number of top slots to compute pixel attention for (default 2)
     """
 
-    def __init__(self, query_dim: int, slot_dim: int, value_dim: int, proj_dim: int = None):
+    def __init__(self, query_dim: int, slot_dim: int, value_dim: int, proj_dim: int = None, top_k: int = 2):
         super().__init__()
         proj_dim = proj_dim if proj_dim is not None else slot_dim
 
@@ -919,6 +920,7 @@ class SlotRoutedCrossAttention(nn.Module):
         self.value_dim = value_dim
         self.proj_dim = proj_dim
         self.scale = proj_dim ** -0.5
+        self.top_k = top_k
 
         # Query projection (from decoder features)
         self.q_proj = nn.Linear(query_dim, proj_dim)
@@ -965,46 +967,71 @@ class SlotRoutedCrossAttention(nn.Module):
         k_pixels = self.k_pixel_proj(ir_flat)  # (B, N_in, proj_dim)
         v = self.v_proj(ir_flat)  # (B, N_in, proj_dim)
 
-        # Step 3: Slot selection - which slot(s) should each output pixel attend to?
-        slot_attn_logits = torch.bmm(q, k_slots.transpose(1, 2)) * self.scale  # (B, N_out, K)
-        slot_attn = F.softmax(slot_attn_logits, dim=-1)  # (B, N_out, K)
-
-        # Step 4: Per-pixel attention logits (before masking)
-        pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * self.scale  # (B, N_out, N_in)
-
-        # Step 5: Sequential slot processing to avoid 4D tensor
-        # Process each slot one at a time, accumulating weighted attention
+        # Step 3: Compute binary masks and detect empty slots
         masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
         masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
 
-        # Accumulate combined attention over slots
-        combined_attn = torch.zeros(B, N_out, N_in, device=pixel_logits.device, dtype=pixel_logits.dtype)
+        # Detect empty slots (no pixels belong to this slot)
+        slot_pixel_counts = masks_binary.sum(dim=(-2, -1))  # (B, K)
+        empty_slots = (slot_pixel_counts == 0)  # (B, K)
 
-        for k in range(K):
-            # Get mask for this slot: (B, N_in)
-            mask_k = masks_binary_flat[:, k, :]  # (B, N_in)
+        # Step 4: Slot selection - which slot(s) should each output pixel attend to?
+        slot_attn_logits = torch.bmm(q, k_slots.transpose(1, 2)) * self.scale  # (B, N_out, K)
 
-            # Get slot attention weight for this slot: (B, N_out)
-            slot_weight_k = slot_attn[:, :, k]  # (B, N_out)
+        # Mask out empty slots so they're never selected
+        slot_attn_logits = slot_attn_logits.masked_fill(empty_slots.unsqueeze(1), float('-inf'))
 
-            # Mask pixel logits for this slot
-            # Set non-slot pixels to -inf
-            masked_logits_k = pixel_logits.masked_fill(mask_k.unsqueeze(1) == 0, float('-inf'))  # (B, N_out, N_in)
+        # Step 5: Top-k slot selection to reduce memory
+        # Only compute pixel attention for the top-k most relevant slots per query
+        # Adjust top_k to not exceed number of non-empty slots
+        num_valid_slots = (~empty_slots).sum(dim=-1).min().item()  # Minimum across batch
+        top_k = min(self.top_k, K, max(1, num_valid_slots))  # At least 1 slot
+        topk_logits, topk_indices = torch.topk(slot_attn_logits, top_k, dim=-1)  # (B, N_out, top_k)
 
-            # Softmax over pixels within this slot
-            pixel_attn_k = F.softmax(masked_logits_k, dim=-1)  # (B, N_out, N_in)
+        # Softmax over only the top-k slots (renormalized)
+        topk_attn = F.softmax(topk_logits, dim=-1)  # (B, N_out, top_k)
 
-            # Handle empty slots (all -inf -> nan after softmax)
-            pixel_attn_k = torch.nan_to_num(pixel_attn_k, nan=0.0)
+        # Handle case where all top-k are -inf (all slots empty) -> uniform
+        topk_attn = torch.nan_to_num(topk_attn, nan=1.0 / top_k)
 
-            # Weight by slot attention and accumulate
-            # slot_weight_k: (B, N_out) -> (B, N_out, 1)
-            combined_attn = combined_attn + slot_weight_k.unsqueeze(-1) * pixel_attn_k
+        # Step 6: Per-pixel attention logits (before masking)
+        pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * self.scale  # (B, N_out, N_in)
 
-        # Step 6: Gather values using combined attention
+        # Step 7: Gather top-k masks: use topk_indices to select masks
+        # topk_indices: (B, N_out, top_k) - indices into K dimension
+        # We need to gather from masks_binary_flat: (B, K, N_in)
+        # Expand indices for gathering: (B, N_out, top_k) -> (B, N_out, top_k, N_in)
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, N_in)  # (B, N_out, top_k, N_in)
+
+        # Expand masks for gathering: (B, K, N_in) -> (B, 1, K, N_in) -> (B, N_out, K, N_in)
+        masks_expanded = masks_binary_flat.unsqueeze(1).expand(-1, N_out, -1, -1)  # (B, N_out, K, N_in)
+
+        # Gather top-k masks
+        topk_masks = torch.gather(masks_expanded, 2, topk_indices_expanded)  # (B, N_out, top_k, N_in)
+
+        # Step 8: Compute per-slot masked pixel attention (only for top-k slots)
+        # Expand pixel_logits: (B, N_out, N_in) -> (B, N_out, 1, N_in)
+        pixel_logits_expanded = pixel_logits.unsqueeze(2)  # (B, N_out, 1, N_in)
+
+        # Mask: set non-slot pixels to -inf before softmax
+        masked_logits = pixel_logits_expanded.masked_fill(topk_masks == 0, float('-inf'))  # (B, N_out, top_k, N_in)
+
+        # Softmax over pixels within each slot
+        per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, top_k, N_in)
+
+        # Handle slots with no pixels (all -inf -> nan after softmax)
+        per_slot_pixel_attn = torch.nan_to_num(per_slot_pixel_attn, nan=0.0)
+
+        # Step 9: Combine slot selection with per-slot pixel attention
+        # Weight each slot's pixel attention by how much we attend to that slot
+        # topk_attn: (B, N_out, top_k) -> (B, N_out, top_k, 1)
+        # per_slot_pixel_attn: (B, N_out, top_k, N_in)
+        combined_attn = (topk_attn.unsqueeze(-1) * per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
+
+        # Step 10: Gather values using combined attention
         attended = torch.bmm(combined_attn, v)  # (B, N_out, proj_dim)
 
-        # Step 7: Project back to query_dim
+        # Step 11: Project back to query_dim
         output = self.out_proj(attended)  # (B, N_out, query_dim)
 
         return output.reshape(B, H_out, W_out, self.query_dim)
@@ -1035,7 +1062,8 @@ class PixelErrorCNN(nn.Module):
                  use_slot_cross_attention: bool = False,
                  use_color_slots: bool = False,
                  num_slots: int = 8, slot_dim: int = 64,
-                 slot_iterations: int = 3, slot_mlp_hidden: int = 128):
+                 slot_iterations: int = 3, slot_mlp_hidden: int = 128,
+                 slot_top_k: int = 2):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -1065,6 +1093,7 @@ class PixelErrorCNN(nn.Module):
         self.slot_dim = slot_dim
         self.slot_iterations = slot_iterations
         self.slot_mlp_hidden = slot_mlp_hidden
+        self.slot_top_k = slot_top_k
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -1228,7 +1257,8 @@ class PixelErrorCNN(nn.Module):
                 query_dim=base_ch,
                 slot_dim=slot_dim,
                 value_dim=ir_feature_dim,
-                proj_dim=slot_dim
+                proj_dim=slot_dim,
+                top_k=slot_top_k
             )
 
         # Size prediction head (uses IR encoder features)
@@ -1522,6 +1552,7 @@ class PixelErrorCNN(nn.Module):
         slot_dim = args.get('slot_dim', 64)
         slot_iterations = args.get('slot_iterations', 3)
         slot_mlp_hidden = args.get('slot_mlp_hidden', 128)
+        slot_top_k = args.get('slot_top_k', 2)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -1551,6 +1582,7 @@ class PixelErrorCNN(nn.Module):
             slot_dim=slot_dim,
             slot_iterations=slot_iterations,
             slot_mlp_hidden=slot_mlp_hidden,
+            slot_top_k=slot_top_k,
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -3963,16 +3995,19 @@ def main():
                              "pixels via object-level slot routing. Requires IR encoder.")
     parser.add_argument("--num-slots", type=int, default=8,
                         help="Number of slots for slot attention (default: 8)")
-    parser.add_argument("--slot-dim", type=int, default=64,
-                        help="Dimension of slot embeddings (default: 64)")
+    parser.add_argument("--slot-dim", type=int, default=8,
+                        help="Dimension of slot embeddings (default: 64)") # fewer errors with fewer dimensions
     parser.add_argument("--slot-iterations", type=int, default=3,
                         help="Number of slot attention refinement iterations (default: 3)")
-    parser.add_argument("--slot-mlp-hidden", type=int, default=128,
-                        help="Hidden dimension for slot attention MLP (default: 128)")
+    parser.add_argument("--slot-mlp-hidden", type=int, default=16,
+                        help="Hidden dimension for slot attention MLP (default: 128)") # fewer errors with fewer dimensions
     parser.add_argument("--use-color-slots", action="store_true",
                         help="Use color-based slot attention where each slot corresponds to a "
                              "specific color (0-9). This provides a strong inductive bias that "
                              "continuous regions of the same color are objects. Overrides --num-slots to 10.")
+    parser.add_argument("--slot-top-k", type=int, default=2,
+                        help="Number of top slots to compute pixel attention for (default: 2). "
+                             "Reduces memory by only attending to top-k most relevant slots per query pixel.")
 
     # Joint size prediction (integrated into PixelErrorCNN)
     parser.add_argument("--predict-size", action="store_true",
@@ -4323,6 +4358,7 @@ def main():
         slot_dim=args.slot_dim,
         slot_iterations=args.slot_iterations,
         slot_mlp_hidden=args.slot_mlp_hidden,
+        slot_top_k=args.slot_top_k,
     )
     model = model.to(DEVICE)
 
