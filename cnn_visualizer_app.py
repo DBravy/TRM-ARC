@@ -1071,15 +1071,23 @@ def compute_pixel_trace(
             N_out = H_out * W_out
             N_in = H_in * W_in
 
+            # Flatten IR features for attention computation
+            ir_flat = ir_features_slot.reshape(B, N_in, -1)  # (B, N_in, D)
+
             # Normalize slot masks (sum to 1 over spatial dims)
             masks_normalized = slot_masks / (slot_masks.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+            masks_flat = masks_normalized.reshape(B, K, N_in)  # (B, K, N_in)
 
-            # Compute slot attention weights
-            q = model.slot_cross_attention.q_proj(decoder_features.reshape(B, N_out, C))
-            k = model.slot_cross_attention.k_proj(slot_embeddings)
+            # Step 1: Compute slot content by mean-pooling IR features within each slot
+            # This is what the actual SlotRoutedCrossAttention does
+            slot_content = torch.bmm(masks_flat, ir_flat)  # (B, K, D)
+
+            # Compute slot attention weights using the correct projections
+            q = model.slot_cross_attention.q_proj(decoder_features.reshape(B, N_out, C))  # (B, N_out, proj_dim)
+            k_slots = model.slot_cross_attention.k_slot_proj(slot_content)  # (B, K, proj_dim)
             scale = model.slot_cross_attention.scale
 
-            slot_attn_logits = torch.bmm(q, k.transpose(1, 2)) * scale  # (B, N_out, K)
+            slot_attn_logits = torch.bmm(q, k_slots.transpose(1, 2)) * scale  # (B, N_out, K)
             slot_attn = F.softmax(slot_attn_logits, dim=-1)  # (B, N_out, K)
             slot_attn_np = slot_attn.squeeze(0).cpu().numpy()  # (N_out, K)
 
@@ -1087,9 +1095,23 @@ def compute_pixel_trace(
             pixel_idx = row * W_out + col
             slot_attn_for_pixel = slot_attn_np[pixel_idx, :]  # (K,)
 
-            # Combine slot attention with normalized masks
-            masks_flat = masks_normalized.reshape(B, K, N_in)
-            combined_attn = torch.bmm(slot_attn, masks_flat)  # (B, N_out, N_in)
+            # Compute per-pixel attention within slots (matching forward pass)
+            k_pixels = model.slot_cross_attention.k_pixel_proj(ir_flat)  # (B, N_in, proj_dim)
+            pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * scale  # (B, N_out, N_in)
+
+            # Create binary masks for hard slot boundaries
+            masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
+            masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
+
+            # Compute per-slot pixel attention
+            pixel_logits_expanded = pixel_logits.unsqueeze(2)  # (B, N_out, 1, N_in)
+            masks_expanded = masks_binary_flat.unsqueeze(1)  # (B, 1, K, N_in)
+            masked_logits = pixel_logits_expanded.masked_fill(masks_expanded == 0, float('-inf'))
+            per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, K, N_in)
+            per_slot_pixel_attn = torch.nan_to_num(per_slot_pixel_attn, nan=0.0)
+
+            # Combine slot selection with per-slot pixel attention (matching forward pass)
+            combined_attn = (slot_attn.unsqueeze(-1) * per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
             combined_attn_np = combined_attn.squeeze(0).cpu().numpy()  # (N_out, N_in)
 
             # Get combined attention for the selected pixel
@@ -1107,6 +1129,10 @@ def compute_pixel_trace(
                 for idx in top_input_indices
             ]
 
+            # Per-slot pixel attention for this output pixel (shows attention within each slot)
+            per_slot_pixel_attn_for_pixel = per_slot_pixel_attn.squeeze(0)[pixel_idx].cpu().numpy()  # (K, N_in)
+            per_slot_pixel_attn_grids = per_slot_pixel_attn_for_pixel.reshape(K, H_in, W_in)  # (K, H_in, W_in)
+
             result['slot_attention'] = {
                 'has_slot_attention': True,
                 'num_slots': K,
@@ -1114,9 +1140,11 @@ def compute_pixel_trace(
                 'slot_masks': slot_masks_np.tolist(),  # (K, H, W)
                 'slot_masks_normalized': masks_normalized.squeeze(0).cpu().numpy().tolist(),
                 'slot_attention_weights': slot_attn_for_pixel.tolist(),  # (K,) - which slots this pixel attends to
+                'per_slot_pixel_attention': per_slot_pixel_attn_grids.tolist(),  # (K, H_in, W_in) - per-slot pixel attention
                 'combined_attention': combined_attn_grid.tolist(),  # (H_in, W_in) - final attention over input
                 'top_attended_inputs': top_attended_inputs,
                 'slot_embeddings_norm': [float(np.linalg.norm(slot_embeddings_np[k])) for k in range(K)],
+                'slot_content_norm': [float(np.linalg.norm(slot_content[0, k].cpu().numpy())) for k in range(K)],
                 'stats': {
                     'slot_attn_max': float(slot_attn_for_pixel.max()),
                     'slot_attn_entropy': float(-np.sum(slot_attn_for_pixel * np.log(slot_attn_for_pixel + 1e-10))),
