@@ -581,7 +581,7 @@ class CrossAttention(nn.Module):
     Access via .last_attention_weights after forward pass (B, num_heads, H*W, H*W).
     """
     def __init__(self, query_dim: int, kv_dim: int = None, proj_dim: int = None,
-                 num_heads: int = 1):
+                 num_heads: int = 1, no_softmax: bool = False):
         super().__init__()
         kv_dim = kv_dim if kv_dim is not None else query_dim
         proj_dim = proj_dim if proj_dim is not None else query_dim
@@ -595,6 +595,7 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = proj_dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.no_softmax = no_softmax
 
         # Q comes from output, K/V come from input (possibly different dimensions)
         self.q_proj = nn.Linear(query_dim, proj_dim)  # "What am I looking for?" (output)
@@ -636,7 +637,7 @@ class CrossAttention(nn.Module):
 
         # Attention scores: each output pixel attends to all input pixels (per head)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
-        attn = F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
+        attn = scores if self.no_softmax else F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
 
         # Optionally store attention weights for visualization (all heads)
         if self.capture_attention:
@@ -673,29 +674,44 @@ class SlotAttention(nn.Module):
         num_slots: Number of slots (K)
         num_iterations: Number of refinement iterations
         mlp_hidden_dim: Hidden dimension for slot MLP
+        color_embed_dim: If > 0, add learned color embeddings to keys so that
+                         same-colored pixels produce similar keys, encouraging
+                         continuous color regions to bind to the same slot.
     """
 
     def __init__(self, input_dim: int, slot_dim: int, num_slots: int,
-                 num_iterations: int = 3, mlp_hidden_dim: int = 128):
+                 num_iterations: int = 3, mlp_hidden_dim: int = 128,
+                 color_embed_dim: int = 0):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
         self.num_slots = num_slots
         self.num_iterations = num_iterations
         self.scale = slot_dim ** -0.5
+        self.color_embed_dim = color_embed_dim
 
         # Learnable slot prototypes
         self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim))
         self.slot_log_sigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
 
-        # Layer norms
+        # Color embedding for key augmentation (if enabled)
+        # This makes same-colored pixels produce similar keys, encouraging
+        # them to bind to the same slot
+        self.color_embedding = None
+        if color_embed_dim > 0:
+            self.color_embedding = nn.Embedding(NUM_COLORS, color_embed_dim)
+
+        # Layer norms - input dim includes color embedding if enabled
+        key_input_dim = input_dim + color_embed_dim
         self.norm_inputs = nn.LayerNorm(input_dim)
         self.norm_slots = nn.LayerNorm(slot_dim)
         self.norm_mlp = nn.LayerNorm(slot_dim)
 
         # Projections for attention
+        # Keys are projected from features + color embeddings (if enabled)
+        # Values are projected from features only (color info flows through keys)
         self.to_q = nn.Linear(slot_dim, slot_dim)
-        self.to_k = nn.Linear(input_dim, slot_dim)
+        self.to_k = nn.Linear(key_input_dim, slot_dim)
         self.to_v = nn.Linear(input_dim, slot_dim)
 
         # GRU for slot updates
@@ -708,10 +724,11 @@ class SlotAttention(nn.Module):
             nn.Linear(mlp_hidden_dim, slot_dim),
         )
 
-    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features: torch.Tensor, color_grid: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             features: (B, H, W, D) per-pixel features from IR encoder
+            color_grid: (B, H, W) integer color values 0-9 (optional, used if color_embed_dim > 0)
 
         Returns:
             slots: (B, K, slot_dim) slot embeddings
@@ -722,11 +739,21 @@ class SlotAttention(nn.Module):
 
         # Flatten spatial dimensions
         inputs = features.reshape(B, N, D)  # (B, N, D)
-        inputs = self.norm_inputs(inputs)
+        inputs_normed = self.norm_inputs(inputs)
+
+        # Compute keys: optionally augment with color embeddings
+        if self.color_embedding is not None and color_grid is not None:
+            # Get color embeddings for each pixel
+            color_emb = self.color_embedding(color_grid.long())  # (B, H, W, color_embed_dim)
+            color_emb_flat = color_emb.reshape(B, N, -1)  # (B, N, color_embed_dim)
+            # Concatenate features with color embeddings for key projection
+            key_inputs = torch.cat([inputs_normed, color_emb_flat], dim=-1)  # (B, N, D + color_embed_dim)
+        else:
+            key_inputs = inputs_normed
 
         # Project inputs to keys and values
-        k = self.to_k(inputs)  # (B, N, slot_dim)
-        v = self.to_v(inputs)  # (B, N, slot_dim)
+        k = self.to_k(key_inputs)  # (B, N, slot_dim) - keys include color info
+        v = self.to_v(inputs_normed)  # (B, N, slot_dim) - values are feature-only
 
         # Initialize slots from learnable prototypes with noise
         slots = self.slot_mu + torch.exp(self.slot_log_sigma) * torch.randn_like(
@@ -880,6 +907,7 @@ class PixelErrorCNN(nn.Module):
                  kernel_size: int = 3, use_onehot: bool = False, out_kernel_size: int = 1,
                  use_attention: bool = False, use_cross_attention: bool = False,
                  cross_attention_heads: int = 1, cross_attention_position: str = "late",
+                 cross_attention_no_softmax: bool = False,
                  ir_checkpoint: str = None, use_untrained_ir: bool = False,
                  ir_hidden_dim: int = 128, ir_out_dim: int = 64,
                  ir_num_layers: int = 3, ir_kernel_size: int = 3,
@@ -887,7 +915,8 @@ class PixelErrorCNN(nn.Module):
                  predict_size: bool = False, size_hidden_dim: int = 128,
                  use_slot_cross_attention: bool = False,
                  num_slots: int = 8, slot_dim: int = 64,
-                 slot_iterations: int = 3, slot_mlp_hidden: int = 128):
+                 slot_iterations: int = 3, slot_mlp_hidden: int = 128,
+                 slot_color_embed_dim: int = 0):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -901,6 +930,7 @@ class PixelErrorCNN(nn.Module):
         self.use_cross_attention = use_cross_attention
         self.cross_attention_heads = cross_attention_heads
         self.cross_attention_position = cross_attention_position
+        self.cross_attention_no_softmax = cross_attention_no_softmax
         self.ir_checkpoint = ir_checkpoint
         self.use_untrained_ir = use_untrained_ir
         self.ir_hidden_dim = ir_hidden_dim
@@ -915,6 +945,7 @@ class PixelErrorCNN(nn.Module):
         self.slot_dim = slot_dim
         self.slot_iterations = slot_iterations
         self.slot_mlp_hidden = slot_mlp_hidden
+        self.slot_color_embed_dim = slot_color_embed_dim
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -970,7 +1001,8 @@ class PixelErrorCNN(nn.Module):
                 query_dim=embed_dim,
                 kv_dim=self.ir_feature_dim,
                 proj_dim=embed_dim,
-                num_heads=cross_attention_heads
+                num_heads=cross_attention_heads,
+                no_softmax=cross_attention_no_softmax
             )
         # Late cross-attention is created below after base_ch is defined
 
@@ -1019,7 +1051,8 @@ class PixelErrorCNN(nn.Module):
                 query_dim=base_ch,            # hidden_dim - decoder output channels
                 kv_dim=self.ir_feature_dim,   # IR encoder output dim
                 proj_dim=base_ch,             # Project to hidden_dim (divisible by common head counts)
-                num_heads=cross_attention_heads
+                num_heads=cross_attention_heads,
+                no_softmax=cross_attention_no_softmax
             )
 
         # Slot-routed cross-attention (separate from regular cross-attention)
@@ -1052,7 +1085,8 @@ class PixelErrorCNN(nn.Module):
                 slot_dim=slot_dim,
                 num_slots=num_slots,
                 num_iterations=slot_iterations,
-                mlp_hidden_dim=slot_mlp_hidden
+                mlp_hidden_dim=slot_mlp_hidden,
+                color_embed_dim=slot_color_embed_dim
             )
 
             # SlotRoutedCrossAttention: applies after decoder, before outc
@@ -1210,7 +1244,8 @@ class PixelErrorCNN(nn.Module):
         # Apply slot-routed cross-attention if enabled
         if self.slot_cross_attention is not None:
             # Compute slot embeddings and masks from IR features
-            slot_embeddings, slot_masks = self.slot_attention(ir_features)
+            # Pass input_grid for color-aware slot binding (if color_embed_dim > 0)
+            slot_embeddings, slot_masks = self.slot_attention(ir_features, color_grid=input_grid)
 
             # Permute decoder features for attention: (B, C, H, W) -> (B, H, W, C)
             x_perm = x.permute(0, 2, 3, 1).contiguous()
@@ -1335,6 +1370,7 @@ class PixelErrorCNN(nn.Module):
         use_cross_attention = args.get('use_cross_attention', False)
         cross_attention_heads = args.get('cross_attention_heads', 1)
         cross_attention_position = args.get('cross_attention_position', 'late')
+        cross_attention_no_softmax = args.get('cross_attention_no_softmax', False)
         ir_checkpoint = args.get('ir_checkpoint', None)
         use_untrained_ir = args.get('use_untrained_ir', False)
         ir_hidden_dim = args.get('ir_hidden_dim', 128)
@@ -1344,6 +1380,12 @@ class PixelErrorCNN(nn.Module):
         freeze_ir = args.get('freeze_ir', True)
         predict_size = args.get('predict_size', False)
         size_hidden_dim = args.get('size_hidden_dim', 128)
+        use_slot_cross_attention = args.get('use_slot_cross_attention', False)
+        num_slots = args.get('num_slots', 8)
+        slot_dim = args.get('slot_dim', 64)
+        slot_iterations = args.get('slot_iterations', 3)
+        slot_mlp_hidden = args.get('slot_mlp_hidden', 128)
+        slot_color_embed_dim = args.get('slot_color_embed_dim', 0)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -1357,6 +1399,7 @@ class PixelErrorCNN(nn.Module):
             use_cross_attention=use_cross_attention,
             cross_attention_heads=cross_attention_heads,
             cross_attention_position=cross_attention_position,
+            cross_attention_no_softmax=cross_attention_no_softmax,
             ir_checkpoint=ir_checkpoint,
             use_untrained_ir=use_untrained_ir,
             ir_hidden_dim=ir_hidden_dim,
@@ -1366,6 +1409,12 @@ class PixelErrorCNN(nn.Module):
             freeze_ir=freeze_ir,
             predict_size=predict_size,
             size_hidden_dim=size_hidden_dim,
+            use_slot_cross_attention=use_slot_cross_attention,
+            num_slots=num_slots,
+            slot_dim=slot_dim,
+            slot_iterations=slot_iterations,
+            slot_mlp_hidden=slot_mlp_hidden,
+            slot_color_embed_dim=slot_color_embed_dim,
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -1373,6 +1422,92 @@ class PixelErrorCNN(nn.Module):
         if device:
             model = model.to(device)
         return model
+
+
+# =============================================================================
+# Output Autoencoder - Learns valid output structure for cleanup
+# =============================================================================
+
+class OutputAutoencoder(nn.Module):
+    """
+    Small convolutional autoencoder for learning valid output structure.
+    Trains only on output grids, acts as cleanup for CNN predictions.
+
+    Fully convolutional - handles variable grid sizes.
+    Uses spatial compression bottleneck (AdaptiveAvgPool2d) to prevent
+    memorization with only 2-4 training examples.
+    """
+
+    def __init__(self, hidden_dim: int = 32, bottleneck_size: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.bottleneck_size = bottleneck_size
+
+        # Encoder convs: 10 -> hidden_dim -> hidden_dim*2
+        self.encoder_convs = nn.Sequential(
+            nn.Conv2d(NUM_COLORS, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim * 2),
+            nn.ReLU(inplace=True),
+        )
+        # Separate pooling layer (for MPS compatibility workaround)
+        self.pool = nn.AdaptiveAvgPool2d(bottleneck_size)
+
+        # Decoder: hidden_dim*2 -> hidden_dim -> 10 (logits)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, NUM_COLORS, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor, target_size: Tuple[int, int] = None) -> torch.Tensor:
+        """
+        Args:
+            x: One-hot encoded grid (B, 10, H, W)
+            target_size: Optional (H, W) to upsample to. If None, uses input size.
+        Returns:
+            Logits (B, 10, H, W) - same spatial size as input
+        """
+        if target_size is None:
+            target_size = (x.size(2), x.size(3))
+
+        # Encode through conv layers
+        z = self.encoder_convs(x)  # (B, hidden_dim*2, H, W)
+
+        # Adaptive pooling - handle MPS limitation by moving to CPU if needed
+        orig_device = z.device
+        if z.device.type == 'mps':
+            z = self.pool(z.cpu()).to(orig_device).contiguous()
+        else:
+            z = self.pool(z)  # (B, hidden_dim*2, bottleneck_size, bottleneck_size)
+
+        # Upsample to target size then decode
+        z_upsampled = F.interpolate(z, size=target_size, mode='bilinear', align_corners=False)
+        logits = self.decoder(z_upsampled)  # (B, 10, H, W)
+
+        return logits
+
+    def reconstruct(self, grid: torch.Tensor) -> torch.Tensor:
+        """
+        Convenience method: takes integer grid, returns reconstructed integer grid.
+
+        Args:
+            grid: Integer grid (B, H, W) with values 0-9
+        Returns:
+            Reconstructed grid (B, H, W) with values 0-9
+        """
+        # One-hot encode
+        onehot = F.one_hot(grid.long(), num_classes=NUM_COLORS).float()
+        onehot = onehot.permute(0, 3, 1, 2)  # (B, 10, H, W)
+
+        # Forward pass
+        logits = self.forward(onehot)
+
+        # Argmax to get predicted colors
+        return logits.argmax(dim=1)
 
 
 # =============================================================================
@@ -2056,6 +2191,7 @@ def evaluate_test_examples(
     verbose: bool = True,
     visualize: bool = True,
     recursive_iters: int = 1,
+    autoencoder: nn.Module = None,
 ) -> Dict[str, float]:
     """
     Evaluate model on held-out test examples.
@@ -2065,8 +2201,12 @@ def evaluate_test_examples(
     and iterate, tracking accuracy at each step.
 
     If model.predict_size is True, uses predicted size to constrain pixel predictions.
+
+    If autoencoder is provided, CNN predictions are passed through it for cleanup.
     """
     model.eval()
+    if autoencoder is not None:
+        autoencoder.eval()
 
     # Check if model predicts size
     uses_size_prediction = getattr(model, 'predict_size', False)
@@ -2122,6 +2262,10 @@ def evaluate_test_examples(
                 # Handle dict output when predict_size=True
                 logits = output['pixel_logits'] if isinstance(output, dict) else output  # (1, 10, H, W)
                 pred_colors = logits.argmax(dim=1)  # (1, H, W)
+
+                # Pass through autoencoder for cleanup if provided
+                if autoencoder is not None:
+                    pred_colors = autoencoder.reconstruct(pred_colors)  # (1, H, W)
 
                 # Track accuracy at this iteration using PREDICTED size for cropping
                 pred_np = pred_colors[0].cpu().numpy()
@@ -2858,6 +3002,106 @@ def evaluate(
 
 
 # =============================================================================
+# Output Autoencoder Training
+# =============================================================================
+
+def train_autoencoder(
+    autoencoder: nn.Module,
+    output_grids: List[np.ndarray],
+    device: torch.device,
+    num_steps: int = 150,
+    lr: float = 0.001,
+    use_augment: bool = True,
+    dihedral_only: bool = False,
+    color_only: bool = False,
+) -> Dict[str, float]:
+    """
+    Train autoencoder on augmented output grids only.
+
+    Augmentation respects the same flags as CNN training:
+    - use_augment=False: no augmentation
+    - dihedral_only=True: only rotations/flips, no color permutations
+    - color_only=True: only color permutations, no rotations/flips
+    - Otherwise: full augmentation (dihedral + color)
+
+    Args:
+        autoencoder: OutputAutoencoder model
+        output_grids: List of output grids (numpy arrays) from training examples
+        device: torch device
+        num_steps: Maximum training steps
+        lr: Learning rate
+        use_augment: Whether to use augmentation
+        dihedral_only: Only use dihedral transforms (no color permutations)
+        color_only: Only use color permutations (no dihedral transforms)
+
+    Returns:
+        Dict with training metrics
+    """
+    # Train on CPU to avoid MPS AdaptiveAvgPool2d issues
+    # (Small model + few steps, so CPU is fast enough)
+    train_device = torch.device('cpu')
+    autoencoder = autoencoder.to(train_device)
+    autoencoder.train()
+    optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=lr, weight_decay=0.01)
+
+    # Helper to get augmentation based on flags
+    def get_augmentation():
+        if not use_augment:
+            return 0, np.arange(10, dtype=np.uint8)  # Identity
+        elif dihedral_only:
+            return random.randint(0, 7), np.arange(10, dtype=np.uint8)
+        elif color_only:
+            return 0, random_color_permutation()
+        else:
+            return get_random_augmentation()
+
+    total_loss = 0.0
+    num_batches = 0
+
+    pbar = tqdm(range(num_steps), desc="Training Autoencoder")
+    for _ in pbar:
+        # Sample a random output grid
+        grid = random.choice(output_grids)
+        grid = np.array(grid, dtype=np.uint8)
+
+        # Apply augmentation
+        trans_id, color_map = get_augmentation()
+        aug_grid = apply_augmentation(grid, trans_id, color_map)
+
+        # Convert to tensor and one-hot encode
+        # Note: copy() needed because dihedral transforms can create negative-stride views
+        grid_t = torch.from_numpy(aug_grid.copy()).long().unsqueeze(0)  # (1, H, W) on CPU
+        onehot = F.one_hot(grid_t, num_classes=NUM_COLORS).float()
+        onehot = onehot.permute(0, 3, 1, 2)  # (1, 10, H, W)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = autoencoder(onehot)  # (1, 10, H, W)
+
+        # Reconstruction loss (cross-entropy)
+        loss = F.cross_entropy(logits, grid_t)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+        pbar.set_postfix(loss=loss.item())
+
+    avg_loss = total_loss / max(num_batches, 1)
+    print(f"  Autoencoder training complete: avg_loss={avg_loss:.4f}")
+
+    # Move back to original device for inference
+    autoencoder = autoencoder.to(device)
+
+    return {
+        "loss": avg_loss,
+        "steps": num_batches,
+    }
+
+
+# =============================================================================
 # Size Prediction Training
 # =============================================================================
 
@@ -3558,6 +3802,8 @@ def main():
     parser.add_argument("--cross-attention-position", type=str, default="late",
                         choices=["early", "late"],
                         help="Where to apply cross-attention: 'early' (on embeddings before CNN) or 'late' (on decoder features before outc, default)")
+    parser.add_argument("--cross-attention-no-softmax", action="store_true",
+                        help="Disable softmax in cross-attention (use raw attention scores)")
     parser.add_argument("--ir-checkpoint", type=str, default=None,
                         help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
     parser.add_argument("--use-untrained-ir", action="store_true",
@@ -3587,6 +3833,11 @@ def main():
                         help="Number of slot attention refinement iterations (default: 3)")
     parser.add_argument("--slot-mlp-hidden", type=int, default=128,
                         help="Hidden dimension for slot attention MLP (default: 128)")
+    parser.add_argument("--slot-color-embed-dim", type=int, default=0,
+                        help="Dimension of color embeddings for slot attention keys. "
+                             "If > 0, adds learned color embeddings so that same-colored "
+                             "pixels produce similar keys, biasing slots toward binding "
+                             "continuous color regions as objects. (default: 0 = disabled)")
 
     # Joint size prediction (integrated into PixelErrorCNN)
     parser.add_argument("--predict-size", action="store_true",
@@ -3622,6 +3873,19 @@ def main():
                         help="Learning rate for critic optimizer (default: 1e-3)")
     parser.add_argument("--visualize-critic", action="store_true",
                         help="Visualize critic predictions during evaluation")
+
+    # Output autoencoder arguments
+    parser.add_argument("--use-autoencoder", action="store_true",
+                        help="Train output autoencoder for prediction cleanup. "
+                             "Learns valid output structure from training outputs only.")
+    parser.add_argument("--ae-hidden-dim", type=int, default=64,
+                        help="Hidden dimension for autoencoder (default: 32)")
+    parser.add_argument("--ae-bottleneck-size", type=int, default=16,
+                        help="Spatial bottleneck size for autoencoder (default: 4)")
+    parser.add_argument("--ae-steps", type=int, default=15000,
+                        help="Training steps for autoencoder (default: 150)")
+    parser.add_argument("--ae-lr", type=float, default=1e-3,
+                        help="Learning rate for autoencoder (default: 1e-3)")
 
     args = parser.parse_args()
 
@@ -3908,6 +4172,7 @@ def main():
         use_cross_attention=args.use_cross_attention,
         cross_attention_heads=args.cross_attention_heads,
         cross_attention_position=args.cross_attention_position,
+        cross_attention_no_softmax=args.cross_attention_no_softmax,
         ir_checkpoint=args.ir_checkpoint,
         use_untrained_ir=args.use_untrained_ir,
         ir_hidden_dim=args.ir_hidden_dim,
@@ -3922,6 +4187,7 @@ def main():
         slot_dim=args.slot_dim,
         slot_iterations=args.slot_iterations,
         slot_mlp_hidden=args.slot_mlp_hidden,
+        slot_color_embed_dim=args.slot_color_embed_dim,
     )
     model = model.to(DEVICE)
 
@@ -3952,6 +4218,8 @@ def main():
     if args.use_slot_cross_attention:
         print(f"Slot cross-attention: ENABLED")
         print(f"  Slots: {args.num_slots}, dim={args.slot_dim}, iterations={args.slot_iterations}")
+        if args.slot_color_embed_dim > 0:
+            print(f"  Color embeddings: dim={args.slot_color_embed_dim} (biases slots toward color regions)")
         if args.ir_checkpoint:
             freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
             print(f"  Using IR encoder ({freeze_str}) from {args.ir_checkpoint}")
@@ -4075,6 +4343,55 @@ def main():
         print(f"Using BEST checkpoint model")
     print(f"Checkpoint saved to: {args.save_path}")
 
+    # =========================================================================
+    # Train Output Autoencoder (if enabled)
+    # =========================================================================
+    autoencoder = None
+    if args.use_autoencoder:
+        print("\n" + "="*60)
+        print("Training Output Autoencoder")
+        print("="*60)
+
+        # Collect output grids from training examples
+        output_grids = []
+        for puzzle_id, puzzle in train_puzzles.items():
+            for ex in puzzle['train']:
+                output_grids.append(np.array(ex['output'], dtype=np.uint8))
+        print(f"Training on {len(output_grids)} output grids from training examples")
+
+        # Determine augmentation mode
+        use_augment = not args.no_augment
+        aug_desc = "full" if use_augment and not args.dihedral_only and not args.color_only else \
+                   "dihedral-only" if args.dihedral_only else \
+                   "color-only" if args.color_only else "none"
+        print(f"Augmentation: {aug_desc}")
+
+        autoencoder = OutputAutoencoder(
+            hidden_dim=args.ae_hidden_dim,
+            bottleneck_size=args.ae_bottleneck_size
+        ).to(DEVICE)
+
+        param_count = sum(p.numel() for p in autoencoder.parameters())
+        print(f"Autoencoder parameters: {param_count:,}")
+        print(f"Bottleneck: {args.ae_bottleneck_size}x{args.ae_bottleneck_size} spatial")
+
+        ae_metrics = train_autoencoder(
+            autoencoder, output_grids, DEVICE,
+            num_steps=args.ae_steps,
+            lr=args.ae_lr,
+            use_augment=use_augment,
+            dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+        )
+
+        # Load checkpoint, add autoencoder, and re-save
+        checkpoint = torch.load(args.save_path, map_location=DEVICE, weights_only=False)
+        checkpoint['autoencoder_state_dict'] = autoencoder.state_dict()
+        checkpoint['args']['ae_hidden_dim'] = args.ae_hidden_dim
+        checkpoint['args']['ae_bottleneck_size'] = args.ae_bottleneck_size
+        torch.save(checkpoint, args.save_path)
+        print(f"Autoencoder saved to checkpoint: {args.save_path}")
+
     # Visualize on training data
     visualize_predictions(model, val_dataset, DEVICE)
 
@@ -4134,10 +4451,24 @@ def main():
         else:
             print(f"Loaded BEST checkpoint from epoch {epoch_str}/{args.epochs} (val accuracy: {metric_str})")
 
+        # Load autoencoder from checkpoint if it exists
+        autoencoder_eval = None
+        if 'autoencoder_state_dict' in checkpoint:
+            saved_args = checkpoint.get('args', {})
+            autoencoder_eval = OutputAutoencoder(
+                hidden_dim=saved_args.get('ae_hidden_dim', 32),
+                bottleneck_size=saved_args.get('ae_bottleneck_size', 4),
+            ).to(DEVICE)
+            autoencoder_eval.load_state_dict(checkpoint['autoencoder_state_dict'])
+            autoencoder_eval.eval()
+            print(f"Loaded autoencoder from checkpoint (hidden_dim={saved_args.get('ae_hidden_dim', 32)}, "
+                  f"bottleneck={saved_args.get('ae_bottleneck_size', 4)}x{saved_args.get('ae_bottleneck_size', 4)})")
+
         test_results = evaluate_test_examples(
             model, test_eval_dataset, DEVICE,
             verbose=True, visualize=args.visualize,
-            recursive_iters=args.recursive_iters
+            recursive_iters=args.recursive_iters,
+            autoencoder=autoencoder_eval,
         )
 
         print(f"\n{'-'*60}")
@@ -4165,7 +4496,8 @@ def main():
         train_results = evaluate_test_examples(
             model, train_eval_dataset, DEVICE,
             verbose=True, visualize=False,  # Don't visualize training examples
-            recursive_iters=args.recursive_iters
+            recursive_iters=args.recursive_iters,
+            autoencoder=autoencoder_eval,
         )
         # Summary comparison
         print("\n" + "="*60)

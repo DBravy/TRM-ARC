@@ -290,6 +290,10 @@ async function loadModelInfo() {
             } else {
                 crossAttnInfo = 'Yes';
             }
+            // Append no_softmax indicator if applicable
+            if (modelInfo.cross_attention_info && modelInfo.cross_attention_info.no_softmax) {
+                crossAttnInfo += ' (no softmax)';
+            }
         }
 
         container.innerHTML = `
@@ -1272,12 +1276,15 @@ function createAttentionSection(trace) {
     const isCrossAttention = attn.attention_type === 'cross';
     const numHeads = attn.num_heads || 1;
     const hasMultiHead = numHeads > 1 && attn.per_head;
+    const noSoftmax = attn.no_softmax || false;
 
     const title = isCrossAttention
-        ? `Cross-Attention (Output → Input)${hasMultiHead ? ` - ${numHeads} Heads` : ''}`
+        ? `Cross-Attention (Output → Input)${hasMultiHead ? ` - ${numHeads} Heads` : ''}${noSoftmax ? ' [No Softmax]' : ''}`
         : 'Spatial Self-Attention';
     const description = isCrossAttention
-        ? 'Output pixel queries input pixels for global context. Brighter = higher attention weight.'
+        ? noSoftmax
+            ? 'Output pixel queries input pixels. Raw scores (no softmax). Blue=negative, Red=positive.'
+            : 'Output pixel queries input pixels for global context. Brighter = higher attention weight.'
         : 'This pixel attends to all other pixels. Brighter = higher attention weight.';
 
     let html = `
@@ -1289,14 +1296,21 @@ function createAttentionSection(trace) {
 
     // Self-attention weight and entropy (averaged if multi-head)
     const avgLabel = hasMultiHead ? ' (averaged)' : '';
+    const selfAttnDisplay = noSoftmax
+        ? attn.self_attention_weight.toFixed(4)
+        : `${(attn.self_attention_weight * 100).toFixed(2)}%`;
+    const entropyDisplay = attn.stats.from_entropy !== null
+        ? `${attn.stats.from_entropy.toFixed(2)} (higher = more uniform)`
+        : 'N/A (no softmax)';
+
     html += `
         <div class="trace-row">
             <span class="trace-label">Self-attention weight${avgLabel}</span>
-            <span class="trace-value">${(attn.self_attention_weight * 100).toFixed(2)}%</span>
+            <span class="trace-value">${selfAttnDisplay}</span>
         </div>
         <div class="trace-row">
             <span class="trace-label">Attention entropy${avgLabel}</span>
-            <span class="trace-value">${attn.stats.from_entropy.toFixed(2)} (higher = more uniform)</span>
+            <span class="trace-value">${entropyDisplay}</span>
         </div>
     `;
 
@@ -1317,37 +1331,54 @@ function createAttentionSection(trace) {
     }
 
     // Store attention data globally for head tab selection
-    window.currentAttentionData = { attn, pixel, isCrossAttention };
+    window.currentAttentionData = { attn, pixel, isCrossAttention, noSoftmax };
 
     // Attention heatmaps container (will be updated by head selection)
     html += `<div id="attention-heatmaps-container">`;
-    html += renderAttentionHeatmaps(attn, pixel, isCrossAttention, 'avg');
+    html += renderAttentionHeatmaps(attn, pixel, isCrossAttention, 'avg', noSoftmax);
     html += `</div>`;
 
-    // Legend
-    const legendFrom = isCrossAttention ? 'Queries (orange)' : 'Attends to (orange)';
-    const legendTo = isCrossAttention ? 'Queried by (blue)' : 'Attended by (blue)';
-    html += `
-        <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> ${legendFrom}</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> ${legendTo}</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
-        </div>
-    `;
+    // Legend - different for softmax vs no-softmax
+    let legendHtml;
+    if (noSoftmax) {
+        legendHtml = `
+            <div style="margin-top: 12px; font-size: 0.75em; color: #666;">
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                    <span>Score:</span>
+                    <span style="color: #2166ac;">−</span>
+                    <div style="width: 60px; height: 10px; background: linear-gradient(to right, #2166ac, #f7f7f7, #b2182b); border-radius: 2px;"></div>
+                    <span style="color: #b2182b;">+</span>
+                    <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
+                </div>
+            </div>
+        `;
+    } else {
+        const legendFrom = isCrossAttention ? 'Queries (orange)' : 'Attends to (orange)';
+        const legendTo = isCrossAttention ? 'Queried by (blue)' : 'Attended by (blue)';
+        legendHtml = `
+            <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> ${legendFrom}</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 128, 255); border-radius: 2px;"></span> ${legendTo}</span>
+                <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
+            </div>
+        `;
+    }
+    html += legendHtml;
 
     section.innerHTML = html;
     return section;
 }
 
 // Helper function to render attention heatmaps (used for both averaged and per-head)
-function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
-    let fromGrid, toGrid, maxFrom, maxTo, topAttended, stats;
+function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx, noSoftmax = false) {
+    let fromGrid, toGrid, maxFrom, maxTo, minFrom, topAttended, stats;
 
     if (headIdx === 'avg' || !attn.per_head) {
         // Use averaged attention
         fromGrid = attn.attention_from_pixel;
         toGrid = attn.attention_to_pixel;
         maxFrom = attn.stats.from_max;
+        minFrom = attn.stats.from_min || 0;
         maxTo = attn.stats.to_max;
         topAttended = attn.top_attended;
         stats = attn.stats;
@@ -1358,9 +1389,14 @@ function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
         toGrid = attn.per_head.attention_to_pixel[h];
         stats = attn.per_head.stats[h];
         maxFrom = stats.from_max;
+        minFrom = stats.from_min || 0;
         maxTo = stats.to_max;
         topAttended = attn.per_head.top_attended[h];
     }
+
+    // For no_softmax, we need to normalize to [-1, 1] for diverging colormap
+    const maxAbsFrom = Math.max(Math.abs(maxFrom), Math.abs(minFrom)) || 1;
+    const maxAbsTo = Math.max(Math.abs(maxTo), Math.abs(stats.to_min || 0)) || 1;
 
     let html = `<div style="display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap;">`;
 
@@ -1375,12 +1411,23 @@ function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
     for (let r = 0; r < 30; r++) {
         for (let c = 0; c < 30; c++) {
             const weight = fromGrid[r][c];
-            const normalized = maxFrom > 0 ? weight / maxFrom : 0;
-            const intensity = Math.floor(normalized * 255);
             const isSelected = (r === pixel.row && c === pixel.col);
             const border = isSelected ? 'border: 1px solid #ff0;' : '';
-            html += `<div style="width: 8px; height: 8px; background: rgb(${intensity}, ${Math.floor(intensity*0.5)}, 0); ${border}"
-                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
+
+            let color, title;
+            if (noSoftmax) {
+                // Diverging colormap for raw scores
+                const normalized = weight / maxAbsFrom;
+                color = rdBuColor(normalized);
+                title = `(${r},${c}): ${weight.toFixed(4)}`;
+            } else {
+                // Orange heatmap for probabilities
+                const normalized = maxFrom > 0 ? weight / maxFrom : 0;
+                const intensity = Math.floor(normalized * 255);
+                color = `rgb(${intensity}, ${Math.floor(intensity*0.5)}, 0)`;
+                title = `(${r},${c}): ${(weight * 100).toFixed(2)}%`;
+            }
+            html += `<div style="width: 8px; height: 8px; background: ${color}; ${border}" title="${title}"></div>`;
         }
     }
     html += `</div></div>`;
@@ -1396,12 +1443,23 @@ function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
     for (let r = 0; r < 30; r++) {
         for (let c = 0; c < 30; c++) {
             const weight = toGrid[r][c];
-            const normalized = maxTo > 0 ? weight / maxTo : 0;
-            const intensity = Math.floor(normalized * 255);
             const isSelected = (r === pixel.row && c === pixel.col);
             const border = isSelected ? 'border: 1px solid #ff0;' : '';
-            html += `<div style="width: 8px; height: 8px; background: rgb(0, ${Math.floor(intensity*0.5)}, ${intensity}); ${border}"
-                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
+
+            let color, title;
+            if (noSoftmax) {
+                // Diverging colormap for raw scores
+                const normalized = weight / maxAbsTo;
+                color = rdBuColor(normalized);
+                title = `(${r},${c}): ${weight.toFixed(4)}`;
+            } else {
+                // Blue heatmap for probabilities
+                const normalized = maxTo > 0 ? weight / maxTo : 0;
+                const intensity = Math.floor(normalized * 255);
+                color = `rgb(0, ${Math.floor(intensity*0.5)}, ${intensity})`;
+                title = `(${r},${c}): ${(weight * 100).toFixed(2)}%`;
+            }
+            html += `<div style="width: 8px; height: 8px; background: ${color}; ${border}" title="${title}"></div>`;
         }
     }
     html += `</div></div>`;
@@ -1417,20 +1475,30 @@ function renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx) {
     const numTop = topAttended ? Math.min(5, topAttended.length) : 0;
     for (let i = 0; i < numTop; i++) {
         const p = topAttended[i];
+        const weightDisplay = noSoftmax ? p.weight.toFixed(4) : `${(p.weight * 100).toFixed(1)}%`;
         html += `
             <div style="padding: 4px 8px; background: #1a2a3a; border-radius: 4px; font-size: 0.8em;">
-                (${p.row}, ${p.col}): <span style="color: #f90;">${(p.weight * 100).toFixed(1)}%</span>
+                (${p.row}, ${p.col}): <span style="color: #f90;">${weightDisplay}</span>
             </div>
         `;
     }
     html += `</div></div>`;
 
     // Stats for this head/average
-    html += `
-        <div style="margin-top: 10px; font-size: 0.8em; color: #666;">
-            Max: ${(stats.from_max * 100).toFixed(1)}% | Mean: ${(stats.from_mean * 100).toFixed(2)}% | Entropy: ${stats.from_entropy.toFixed(2)}
-        </div>
-    `;
+    const entropyDisplay = stats.from_entropy !== null ? stats.from_entropy.toFixed(2) : 'N/A';
+    if (noSoftmax) {
+        html += `
+            <div style="margin-top: 10px; font-size: 0.8em; color: #666;">
+                Max: ${stats.from_max.toFixed(4)} | Min: ${(stats.from_min || 0).toFixed(4)} | Mean: ${stats.from_mean.toFixed(4)}
+            </div>
+        `;
+    } else {
+        html += `
+            <div style="margin-top: 10px; font-size: 0.8em; color: #666;">
+                Max: ${(stats.from_max * 100).toFixed(1)}% | Mean: ${(stats.from_mean * 100).toFixed(2)}% | Entropy: ${entropyDisplay}
+            </div>
+        `;
+    }
 
     return html;
 }
@@ -1457,7 +1525,8 @@ function selectAttentionHead(button, headIdx) {
         const attn = window.currentAttentionData.attn;
         const pixel = window.currentAttentionData.pixel;
         const isCrossAttention = window.currentAttentionData.isCrossAttention;
-        container.innerHTML = renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx);
+        const noSoftmax = window.currentAttentionData.noSoftmax || false;
+        container.innerHTML = renderAttentionHeatmaps(attn, pixel, isCrossAttention, headIdx, noSoftmax);
     }
 }
 

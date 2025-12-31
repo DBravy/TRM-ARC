@@ -377,6 +377,7 @@ def api_model_info():
             'num_heads': model.cross_attention.num_heads,
             'head_dim': model.cross_attention.head_dim,
             'proj_dim': model.cross_attention.proj_dim,
+            'no_softmax': getattr(model.cross_attention, 'no_softmax', False),
         }
 
     return jsonify({
@@ -821,10 +822,17 @@ def compute_pixel_trace(
                         for idx in top_from_indices
                     ])
 
+                    # Entropy only valid with softmax (normalized positive values)
+                    no_softmax = getattr(model.cross_attention, 'no_softmax', False)
+                    if no_softmax:
+                        from_entropy = None
+                    else:
+                        from_entropy = float(-np.sum(head_from_pixel * np.log(head_from_pixel + 1e-10)))
+
                     per_head_stats.append({
                         'from_max': float(head_from_pixel.max()),
                         'from_mean': float(head_from_pixel.mean()),
-                        'from_entropy': float(-np.sum(head_from_pixel * np.log(head_from_pixel + 1e-10))),
+                        'from_entropy': from_entropy,
                         'to_max': float(head_to_pixel.max()),
                         'to_mean': float(head_to_pixel.mean()),
                         'self_attention_weight': float(head_from_pixel[pixel_idx]),
@@ -867,10 +875,18 @@ def compute_pixel_trace(
                 for idx in top_to_indices
             ]
 
+            # Check if no_softmax is enabled
+            no_softmax = getattr(model.cross_attention, 'no_softmax', False)
+            if no_softmax:
+                from_entropy = None
+            else:
+                from_entropy = float(-np.sum(attn_from_pixel * np.log(attn_from_pixel + 1e-10)))
+
             result['attention'] = {
                 'has_attention': True,
                 'attention_type': 'cross',  # Distinguish from self-attention
                 'num_heads': num_heads,
+                'no_softmax': no_softmax,
                 'attention_from_pixel': attn_from_grid.tolist(),  # Averaged: this output pixel attends to these input pixels
                 'attention_to_pixel': attn_to_grid.tolist(),      # Averaged: these output pixels attend to this input position
                 'top_attended': top_attended,   # Top 10 input pixels this output attends to (averaged)
@@ -878,8 +894,9 @@ def compute_pixel_trace(
                 'self_attention_weight': float(attn_from_pixel[pixel_idx]),  # Attention to same position in input (averaged)
                 'stats': {
                     'from_max': float(attn_from_pixel.max()),
+                    'from_min': float(attn_from_pixel.min()),  # Useful for no_softmax case
                     'from_mean': float(attn_from_pixel.mean()),
-                    'from_entropy': float(-np.sum(attn_from_pixel * np.log(attn_from_pixel + 1e-10))),
+                    'from_entropy': from_entropy,
                     'to_max': float(attn_to_pixel.max()),
                     'to_mean': float(attn_to_pixel.mean()),
                 }
@@ -1162,6 +1179,7 @@ def api_pixel_trace(puzzle_id: str, example_idx: int, row: int, col: int):
             'use_onehot': model.use_onehot,
             'use_attention': getattr(model, 'use_attention', False),
             'use_cross_attention': getattr(model, 'use_cross_attention', False),
+            'cross_attention_no_softmax': getattr(model.cross_attention, 'no_softmax', False) if model.cross_attention is not None else False,
             'num_classes': model.num_classes
         }
         return jsonify(result)
