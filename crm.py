@@ -972,36 +972,39 @@ class SlotRoutedCrossAttention(nn.Module):
         # Step 4: Per-pixel attention logits (before masking)
         pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * self.scale  # (B, N_out, N_in)
 
-        # Step 5: Compute per-slot masked pixel attention
-        # For each slot, mask the pixel attention to only include pixels in that slot
-        # Use a threshold to create binary masks for hard slot boundaries
+        # Step 5: Sequential slot processing to avoid 4D tensor
+        # Process each slot one at a time, accumulating weighted attention
         masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
         masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
 
-        # Expand for broadcasting: pixel_logits (B, N_out, N_in) -> (B, N_out, 1, N_in)
-        pixel_logits_expanded = pixel_logits.unsqueeze(2)  # (B, N_out, 1, N_in)
-        # masks_binary_flat (B, K, N_in) -> (B, 1, K, N_in)
-        masks_expanded = masks_binary_flat.unsqueeze(1)  # (B, 1, K, N_in)
+        # Accumulate combined attention over slots
+        combined_attn = torch.zeros(B, N_out, N_in, device=pixel_logits.device, dtype=pixel_logits.dtype)
 
-        # Mask: set non-slot pixels to -inf before softmax
-        masked_logits = pixel_logits_expanded.masked_fill(masks_expanded == 0, float('-inf'))  # (B, N_out, K, N_in)
+        for k in range(K):
+            # Get mask for this slot: (B, N_in)
+            mask_k = masks_binary_flat[:, k, :]  # (B, N_in)
 
-        # Softmax over pixels within each slot
-        per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, K, N_in)
+            # Get slot attention weight for this slot: (B, N_out)
+            slot_weight_k = slot_attn[:, :, k]  # (B, N_out)
 
-        # Handle slots with no pixels (all -inf -> nan after softmax)
-        per_slot_pixel_attn = torch.nan_to_num(per_slot_pixel_attn, nan=0.0)
+            # Mask pixel logits for this slot
+            # Set non-slot pixels to -inf
+            masked_logits_k = pixel_logits.masked_fill(mask_k.unsqueeze(1) == 0, float('-inf'))  # (B, N_out, N_in)
 
-        # Step 6: Combine slot selection with per-slot pixel attention
-        # Weight each slot's pixel attention by how much we attend to that slot
-        # slot_attn: (B, N_out, K) -> (B, N_out, K, 1)
-        # per_slot_pixel_attn: (B, N_out, K, N_in)
-        combined_attn = (slot_attn.unsqueeze(-1) * per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
+            # Softmax over pixels within this slot
+            pixel_attn_k = F.softmax(masked_logits_k, dim=-1)  # (B, N_out, N_in)
 
-        # Step 7: Gather values using combined attention
+            # Handle empty slots (all -inf -> nan after softmax)
+            pixel_attn_k = torch.nan_to_num(pixel_attn_k, nan=0.0)
+
+            # Weight by slot attention and accumulate
+            # slot_weight_k: (B, N_out) -> (B, N_out, 1)
+            combined_attn = combined_attn + slot_weight_k.unsqueeze(-1) * pixel_attn_k
+
+        # Step 6: Gather values using combined attention
         attended = torch.bmm(combined_attn, v)  # (B, N_out, proj_dim)
 
-        # Step 8: Project back to query_dim
+        # Step 7: Project back to query_dim
         output = self.out_proj(attended)  # (B, N_out, query_dim)
 
         return output.reshape(B, H_out, W_out, self.query_dim)
