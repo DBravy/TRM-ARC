@@ -60,7 +60,7 @@ def build_command(combo: Dict, seed: int) -> List[str]:
     cmd = [
         sys.executable, "crm.py",
         "--single-puzzle", PUZZLE_ID,
-        "--epochs", "50",
+        "--epochs", "100",
         "--num-negatives", "200",
         "--eval-on-test",
         "--visualize",
