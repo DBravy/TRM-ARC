@@ -988,7 +988,7 @@ def compute_pixel_trace(
             ir_features_slot = model.ir_encoder(inp_onehot_slot)  # (B, H, W, D)
 
             # Get slot embeddings and masks
-            slot_embeddings, slot_masks = model.slot_attention(ir_features_slot)
+            slot_embeddings, slot_masks = model.slot_attention(ir_features_slot, color_grid=inp_tensor)
             # slot_embeddings: (B, K, slot_dim)
             # slot_masks: (B, K, H, W) - soft assignment of input pixels to slots
 

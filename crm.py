@@ -674,44 +674,29 @@ class SlotAttention(nn.Module):
         num_slots: Number of slots (K)
         num_iterations: Number of refinement iterations
         mlp_hidden_dim: Hidden dimension for slot MLP
-        color_embed_dim: If > 0, add learned color embeddings to keys so that
-                         same-colored pixels produce similar keys, encouraging
-                         continuous color regions to bind to the same slot.
     """
 
     def __init__(self, input_dim: int, slot_dim: int, num_slots: int,
-                 num_iterations: int = 3, mlp_hidden_dim: int = 128,
-                 color_embed_dim: int = 0):
+                 num_iterations: int = 3, mlp_hidden_dim: int = 128):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
         self.num_slots = num_slots
         self.num_iterations = num_iterations
         self.scale = slot_dim ** -0.5
-        self.color_embed_dim = color_embed_dim
 
         # Learnable slot prototypes
         self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim))
         self.slot_log_sigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
 
-        # Color embedding for key augmentation (if enabled)
-        # This makes same-colored pixels produce similar keys, encouraging
-        # them to bind to the same slot
-        self.color_embedding = None
-        if color_embed_dim > 0:
-            self.color_embedding = nn.Embedding(NUM_COLORS, color_embed_dim)
-
-        # Layer norms - input dim includes color embedding if enabled
-        key_input_dim = input_dim + color_embed_dim
+        # Layer norms
         self.norm_inputs = nn.LayerNorm(input_dim)
         self.norm_slots = nn.LayerNorm(slot_dim)
         self.norm_mlp = nn.LayerNorm(slot_dim)
 
         # Projections for attention
-        # Keys are projected from features + color embeddings (if enabled)
-        # Values are projected from features only (color info flows through keys)
         self.to_q = nn.Linear(slot_dim, slot_dim)
-        self.to_k = nn.Linear(key_input_dim, slot_dim)
+        self.to_k = nn.Linear(input_dim, slot_dim)
         self.to_v = nn.Linear(input_dim, slot_dim)
 
         # GRU for slot updates
@@ -724,11 +709,10 @@ class SlotAttention(nn.Module):
             nn.Linear(mlp_hidden_dim, slot_dim),
         )
 
-    def forward(self, features: torch.Tensor, color_grid: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             features: (B, H, W, D) per-pixel features from IR encoder
-            color_grid: (B, H, W) integer color values 0-9 (optional, used if color_embed_dim > 0)
 
         Returns:
             slots: (B, K, slot_dim) slot embeddings
@@ -739,21 +723,11 @@ class SlotAttention(nn.Module):
 
         # Flatten spatial dimensions
         inputs = features.reshape(B, N, D)  # (B, N, D)
-        inputs_normed = self.norm_inputs(inputs)
-
-        # Compute keys: optionally augment with color embeddings
-        if self.color_embedding is not None and color_grid is not None:
-            # Get color embeddings for each pixel
-            color_emb = self.color_embedding(color_grid.long())  # (B, H, W, color_embed_dim)
-            color_emb_flat = color_emb.reshape(B, N, -1)  # (B, N, color_embed_dim)
-            # Concatenate features with color embeddings for key projection
-            key_inputs = torch.cat([inputs_normed, color_emb_flat], dim=-1)  # (B, N, D + color_embed_dim)
-        else:
-            key_inputs = inputs_normed
+        inputs = self.norm_inputs(inputs)
 
         # Project inputs to keys and values
-        k = self.to_k(key_inputs)  # (B, N, slot_dim) - keys include color info
-        v = self.to_v(inputs_normed)  # (B, N, slot_dim) - values are feature-only
+        k = self.to_k(inputs)  # (B, N, slot_dim)
+        v = self.to_v(inputs)  # (B, N, slot_dim)
 
         # Initialize slots from learnable prototypes with noise
         slots = self.slot_mu + torch.exp(self.slot_log_sigma) * torch.randn_like(
@@ -805,21 +779,133 @@ class SlotAttention(nn.Module):
         return slots, masks
 
 
+class ColorSlotAttention(nn.Module):
+    """
+    Color-based Slot Attention where each slot corresponds to a specific color.
+
+    Instead of learning to discover objects through competition, this module
+    assigns slots to colors directly:
+    - Slot 0 -> all pixels of color 0
+    - Slot 1 -> all pixels of color 1
+    - ... etc.
+
+    This provides a strong inductive bias that "continuous regions of the same
+    color" should be treated as coherent units.
+
+    The slot embeddings are computed by aggregating IR features from pixels
+    of each color, giving a learned representation of "what color k looks like
+    in this context."
+
+    Args:
+        input_dim: Dimension of input features (D) from IR encoder
+        slot_dim: Dimension of slot embeddings (output)
+        num_colors: Number of color slots (default 10 for colors 0-9)
+        use_mlp: Whether to apply MLP refinement to slot embeddings
+        mlp_hidden_dim: Hidden dimension for slot MLP
+    """
+
+    def __init__(self, input_dim: int, slot_dim: int, num_colors: int = NUM_COLORS,
+                 use_mlp: bool = True, mlp_hidden_dim: int = 128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.slot_dim = slot_dim
+        self.num_slots = num_colors  # One slot per color
+
+        # Layer norms
+        self.norm_inputs = nn.LayerNorm(input_dim)
+        self.norm_slots = nn.LayerNorm(slot_dim)
+
+        # Project input features to slot dimension for aggregation
+        self.to_v = nn.Linear(input_dim, slot_dim)
+
+        # Learnable color embeddings - each slot has a base embedding for its color
+        # These act as "priors" that get combined with aggregated features
+        self.color_embeddings = nn.Parameter(torch.randn(1, num_colors, slot_dim) * 0.02)
+
+        # Optional MLP refinement
+        self.use_mlp = use_mlp
+        if use_mlp:
+            self.mlp = nn.Sequential(
+                nn.Linear(slot_dim, mlp_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(mlp_hidden_dim, slot_dim),
+            )
+            self.norm_mlp = nn.LayerNorm(slot_dim)
+
+    def forward(self, features: torch.Tensor, color_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            features: (B, H, W, D) per-pixel features from IR encoder
+            color_grid: (B, H, W) integer color values 0-9
+
+        Returns:
+            slots: (B, K, slot_dim) slot embeddings (K = num_colors)
+            masks: (B, K, H, W) hard pixel-to-slot assignments based on color
+        """
+        B, H, W, D = features.shape
+
+        # Normalize input features
+        inputs = self.norm_inputs(features.reshape(B, H * W, D))  # (B, N, D)
+        inputs = inputs.reshape(B, H, W, D)
+
+        # Project to slot dimension
+        v = self.to_v(inputs)  # (B, H, W, slot_dim)
+
+        # Create hard masks based on color identity
+        # masks[b, k, h, w] = 1 if color_grid[b, h, w] == k, else 0
+        masks = torch.zeros(B, self.num_slots, H, W, device=features.device, dtype=features.dtype)
+        for k in range(self.num_slots):
+            masks[:, k] = (color_grid == k).float()
+
+        # Compute slot embeddings by aggregating features from same-color pixels
+        # For each slot k, average the features of all pixels with color k
+        slots = torch.zeros(B, self.num_slots, self.slot_dim, device=features.device, dtype=features.dtype)
+
+        for k in range(self.num_slots):
+            # mask_k: (B, H, W) binary mask for color k
+            mask_k = masks[:, k]  # (B, H, W)
+
+            # Count pixels of this color per batch element
+            counts = mask_k.sum(dim=(1, 2), keepdim=True).clamp(min=1)  # (B, 1, 1)
+
+            # Weighted sum of features (mask as weight)
+            # v: (B, H, W, slot_dim), mask_k: (B, H, W)
+            weighted = v * mask_k.unsqueeze(-1)  # (B, H, W, slot_dim)
+            aggregated = weighted.sum(dim=(1, 2)) / counts.squeeze(-1)  # (B, slot_dim)
+
+            slots[:, k] = aggregated
+
+        # Add learnable color embeddings as prior
+        slots = slots + self.color_embeddings.expand(B, -1, -1)
+
+        # Normalize slots
+        slots = self.norm_slots(slots)
+
+        # Optional MLP refinement
+        if self.use_mlp:
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        return slots, masks
+
+
 class SlotRoutedCrossAttention(nn.Module):
     """
     Cross-attention where output pixels attend to input pixels via slot routing.
 
-    Each output pixel:
-    1. Attends to K slots (using decoder features as query, slots as keys)
-    2. Combines slot attention with slot masks to get input pixel attention
-    3. Gathers values from IR encoder features
+    Two-level attention that preserves pixel granularity:
+    1. Slot selection: Query pixels attend to slot content (mean-pooled IR features)
+       to decide which object/slot is relevant
+    2. Pixel selection: Within each slot, query pixels attend to specific pixels
+       using per-pixel IR features as keys
 
-    This allows output pixels to attend to input pixels through object-level
-    slot selection, enabling structured reasoning about objects.
+    This allows output pixels to:
+    - Route attention through object-level slot selection
+    - While preserving the ability to attend to specific informative pixels
+      within the selected slot (e.g., 1-2 pixels that capture shape)
 
     Args:
         query_dim: Dimension of decoder features (C)
-        slot_dim: Dimension of slot embeddings
+        slot_dim: Dimension of slot embeddings (unused, kept for API compatibility)
         value_dim: Dimension of IR encoder features (D)
         proj_dim: Dimension for attention computation (defaults to slot_dim)
     """
@@ -836,8 +922,10 @@ class SlotRoutedCrossAttention(nn.Module):
 
         # Query projection (from decoder features)
         self.q_proj = nn.Linear(query_dim, proj_dim)
-        # Key projection (from slot embeddings)
-        self.k_proj = nn.Linear(slot_dim, proj_dim)
+        # Key projection for slot selection (from slot content - mean-pooled IR features)
+        self.k_slot_proj = nn.Linear(value_dim, proj_dim)
+        # Key projection for pixel selection (from per-pixel IR features)
+        self.k_pixel_proj = nn.Linear(value_dim, proj_dim)
         # Value projection (from IR features)
         self.v_proj = nn.Linear(value_dim, proj_dim)
         # Output projection (back to query_dim for residual)
@@ -848,7 +936,7 @@ class SlotRoutedCrossAttention(nn.Module):
         """
         Args:
             decoder_features: (B, H_out, W_out, C) from U-Net decoder
-            slot_embeddings: (B, K, slot_dim) from SlotAttention
+            slot_embeddings: (B, K, slot_dim) from SlotAttention (unused in this implementation)
             slot_masks: (B, K, H_in, W_in) from SlotAttention
             ir_features: (B, H_in, W_in, D) from IR encoder
 
@@ -860,32 +948,60 @@ class SlotRoutedCrossAttention(nn.Module):
         N_out = H_out * W_out
         N_in = H_in * W_in
 
-        # Step 1: Normalize slot masks (sum to 1 over spatial dimensions)
-        # This ensures attending to large vs small objects produces comparable magnitudes
+        # Flatten IR features
+        ir_flat = ir_features.reshape(B, N_in, -1)  # (B, N_in, D)
+
+        # Step 1: Compute slot content by mean-pooling IR features within each slot
+        # Normalize masks for weighted average
         masks_normalized = slot_masks / (slot_masks.sum(dim=(-2, -1), keepdim=True) + 1e-8)  # (B, K, H_in, W_in)
-
-        # Step 2: Compute slot attention weights
-        # Query from decoder features, keys from slot embeddings
-        q = self.q_proj(decoder_features.reshape(B, N_out, C))  # (B, N_out, proj_dim)
-        k = self.k_proj(slot_embeddings)  # (B, K, proj_dim)
-
-        # Attention scores over slots for each output pixel
-        slot_attn = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N_out, K)
-        slot_attn = F.softmax(slot_attn, dim=-1)  # (B, N_out, K)
-
-        # Step 3: Combine slot attention with slot masks via einsum
-        # For each output pixel, weight the slot masks by slot attention
-        # Result: attention distribution over input pixels for each output pixel
         masks_flat = masks_normalized.reshape(B, K, N_in)  # (B, K, N_in)
-        # einsum: (B, N_out, K) x (B, K, N_in) -> (B, N_out, N_in)
-        combined_attn = torch.bmm(slot_attn, masks_flat)  # (B, N_out, N_in)
 
-        # Step 4: Gather values from IR encoder features
-        v = self.v_proj(ir_features.reshape(B, N_in, -1))  # (B, N_in, proj_dim)
-        # Weighted sum of input features for each output pixel
+        # Weighted average of IR features per slot: (B, K, N_in) @ (B, N_in, D) -> (B, K, D)
+        slot_content = torch.bmm(masks_flat, ir_flat)  # (B, K, D)
+
+        # Step 2: Compute queries and keys
+        q = self.q_proj(decoder_features.reshape(B, N_out, C))  # (B, N_out, proj_dim)
+        k_slots = self.k_slot_proj(slot_content)  # (B, K, proj_dim)
+        k_pixels = self.k_pixel_proj(ir_flat)  # (B, N_in, proj_dim)
+        v = self.v_proj(ir_flat)  # (B, N_in, proj_dim)
+
+        # Step 3: Slot selection - which slot(s) should each output pixel attend to?
+        slot_attn_logits = torch.bmm(q, k_slots.transpose(1, 2)) * self.scale  # (B, N_out, K)
+        slot_attn = F.softmax(slot_attn_logits, dim=-1)  # (B, N_out, K)
+
+        # Step 4: Per-pixel attention logits (before masking)
+        pixel_logits = torch.bmm(q, k_pixels.transpose(1, 2)) * self.scale  # (B, N_out, N_in)
+
+        # Step 5: Compute per-slot masked pixel attention
+        # For each slot, mask the pixel attention to only include pixels in that slot
+        # Use a threshold to create binary masks for hard slot boundaries
+        masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
+        masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
+
+        # Expand for broadcasting: pixel_logits (B, N_out, N_in) -> (B, N_out, 1, N_in)
+        pixel_logits_expanded = pixel_logits.unsqueeze(2)  # (B, N_out, 1, N_in)
+        # masks_binary_flat (B, K, N_in) -> (B, 1, K, N_in)
+        masks_expanded = masks_binary_flat.unsqueeze(1)  # (B, 1, K, N_in)
+
+        # Mask: set non-slot pixels to -inf before softmax
+        masked_logits = pixel_logits_expanded.masked_fill(masks_expanded == 0, float('-inf'))  # (B, N_out, K, N_in)
+
+        # Softmax over pixels within each slot
+        per_slot_pixel_attn = F.softmax(masked_logits, dim=-1)  # (B, N_out, K, N_in)
+
+        # Handle slots with no pixels (all -inf -> nan after softmax)
+        per_slot_pixel_attn = torch.nan_to_num(per_slot_pixel_attn, nan=0.0)
+
+        # Step 6: Combine slot selection with per-slot pixel attention
+        # Weight each slot's pixel attention by how much we attend to that slot
+        # slot_attn: (B, N_out, K) -> (B, N_out, K, 1)
+        # per_slot_pixel_attn: (B, N_out, K, N_in)
+        combined_attn = (slot_attn.unsqueeze(-1) * per_slot_pixel_attn).sum(dim=2)  # (B, N_out, N_in)
+
+        # Step 7: Gather values using combined attention
         attended = torch.bmm(combined_attn, v)  # (B, N_out, proj_dim)
 
-        # Step 5: Project back to query_dim
+        # Step 8: Project back to query_dim
         output = self.out_proj(attended)  # (B, N_out, query_dim)
 
         return output.reshape(B, H_out, W_out, self.query_dim)
@@ -914,9 +1030,9 @@ class PixelErrorCNN(nn.Module):
                  freeze_ir: bool = True,
                  predict_size: bool = False, size_hidden_dim: int = 128,
                  use_slot_cross_attention: bool = False,
+                 use_color_slots: bool = False,
                  num_slots: int = 8, slot_dim: int = 64,
-                 slot_iterations: int = 3, slot_mlp_hidden: int = 128,
-                 slot_color_embed_dim: int = 0):
+                 slot_iterations: int = 3, slot_mlp_hidden: int = 128):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -941,11 +1057,11 @@ class PixelErrorCNN(nn.Module):
         self.predict_size = predict_size
         self.size_hidden_dim = size_hidden_dim
         self.use_slot_cross_attention = use_slot_cross_attention
+        self.use_color_slots = use_color_slots
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.slot_iterations = slot_iterations
         self.slot_mlp_hidden = slot_mlp_hidden
-        self.slot_color_embed_dim = slot_color_embed_dim
 
         if use_onehot:
             # One-hot (10) + nonzero mask (1) = 11 channels per grid
@@ -1080,14 +1196,28 @@ class PixelErrorCNN(nn.Module):
                 ir_feature_dim = self.ir_encoder.out_dim
 
             # SlotAttention: discovers slots from IR features
-            self.slot_attention = SlotAttention(
-                input_dim=ir_feature_dim,
-                slot_dim=slot_dim,
-                num_slots=num_slots,
-                num_iterations=slot_iterations,
-                mlp_hidden_dim=slot_mlp_hidden,
-                color_embed_dim=slot_color_embed_dim
-            )
+            # Use ColorSlotAttention if use_color_slots is True
+            if use_color_slots:
+                # Color-based slots: one slot per color (10 slots for colors 0-9)
+                self.slot_attention = ColorSlotAttention(
+                    input_dim=ir_feature_dim,
+                    slot_dim=slot_dim,
+                    num_colors=NUM_COLORS,  # 10 colors
+                    use_mlp=True,
+                    mlp_hidden_dim=slot_mlp_hidden
+                )
+                # Override num_slots to match color count
+                actual_num_slots = NUM_COLORS
+            else:
+                # Standard learned slot attention
+                self.slot_attention = SlotAttention(
+                    input_dim=ir_feature_dim,
+                    slot_dim=slot_dim,
+                    num_slots=num_slots,
+                    num_iterations=slot_iterations,
+                    mlp_hidden_dim=slot_mlp_hidden
+                )
+                actual_num_slots = num_slots
 
             # SlotRoutedCrossAttention: applies after decoder, before outc
             # query_dim = base_ch (decoder output channels)
@@ -1244,8 +1374,11 @@ class PixelErrorCNN(nn.Module):
         # Apply slot-routed cross-attention if enabled
         if self.slot_cross_attention is not None:
             # Compute slot embeddings and masks from IR features
-            # Pass input_grid for color-aware slot binding (if color_embed_dim > 0)
-            slot_embeddings, slot_masks = self.slot_attention(ir_features, color_grid=input_grid)
+            # ColorSlotAttention needs the color grid, standard SlotAttention doesn't
+            if self.use_color_slots:
+                slot_embeddings, slot_masks = self.slot_attention(ir_features, input_grid)
+            else:
+                slot_embeddings, slot_masks = self.slot_attention(ir_features)
 
             # Permute decoder features for attention: (B, C, H, W) -> (B, H, W, C)
             x_perm = x.permute(0, 2, 3, 1).contiguous()
@@ -1381,11 +1514,11 @@ class PixelErrorCNN(nn.Module):
         predict_size = args.get('predict_size', False)
         size_hidden_dim = args.get('size_hidden_dim', 128)
         use_slot_cross_attention = args.get('use_slot_cross_attention', False)
+        use_color_slots = args.get('use_color_slots', False)
         num_slots = args.get('num_slots', 8)
         slot_dim = args.get('slot_dim', 64)
         slot_iterations = args.get('slot_iterations', 3)
         slot_mlp_hidden = args.get('slot_mlp_hidden', 128)
-        slot_color_embed_dim = args.get('slot_color_embed_dim', 0)
 
         model = cls(
             hidden_dim=hidden_dim,
@@ -1410,11 +1543,11 @@ class PixelErrorCNN(nn.Module):
             predict_size=predict_size,
             size_hidden_dim=size_hidden_dim,
             use_slot_cross_attention=use_slot_cross_attention,
+            use_color_slots=use_color_slots,
             num_slots=num_slots,
             slot_dim=slot_dim,
             slot_iterations=slot_iterations,
             slot_mlp_hidden=slot_mlp_hidden,
-            slot_color_embed_dim=slot_color_embed_dim,
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
@@ -3833,11 +3966,10 @@ def main():
                         help="Number of slot attention refinement iterations (default: 3)")
     parser.add_argument("--slot-mlp-hidden", type=int, default=128,
                         help="Hidden dimension for slot attention MLP (default: 128)")
-    parser.add_argument("--slot-color-embed-dim", type=int, default=0,
-                        help="Dimension of color embeddings for slot attention keys. "
-                             "If > 0, adds learned color embeddings so that same-colored "
-                             "pixels produce similar keys, biasing slots toward binding "
-                             "continuous color regions as objects. (default: 0 = disabled)")
+    parser.add_argument("--use-color-slots", action="store_true",
+                        help="Use color-based slot attention where each slot corresponds to a "
+                             "specific color (0-9). This provides a strong inductive bias that "
+                             "continuous regions of the same color are objects. Overrides --num-slots to 10.")
 
     # Joint size prediction (integrated into PixelErrorCNN)
     parser.add_argument("--predict-size", action="store_true",
@@ -4183,11 +4315,11 @@ def main():
         predict_size=args.predict_size,
         size_hidden_dim=args.size_hidden_dim,
         use_slot_cross_attention=args.use_slot_cross_attention,
+        use_color_slots=args.use_color_slots,
         num_slots=args.num_slots,
         slot_dim=args.slot_dim,
         slot_iterations=args.slot_iterations,
         slot_mlp_hidden=args.slot_mlp_hidden,
-        slot_color_embed_dim=args.slot_color_embed_dim,
     )
     model = model.to(DEVICE)
 
@@ -4217,9 +4349,12 @@ def main():
             print("  Note: IR encoder will be created for size prediction")
     if args.use_slot_cross_attention:
         print(f"Slot cross-attention: ENABLED")
-        print(f"  Slots: {args.num_slots}, dim={args.slot_dim}, iterations={args.slot_iterations}")
-        if args.slot_color_embed_dim > 0:
-            print(f"  Color embeddings: dim={args.slot_color_embed_dim} (biases slots toward color regions)")
+        if args.use_color_slots:
+            print(f"  Mode: COLOR-BASED slots (one slot per color, 10 slots total)")
+            print(f"  Slot dim={args.slot_dim}")
+        else:
+            print(f"  Mode: LEARNED slots")
+            print(f"  Slots: {args.num_slots}, dim={args.slot_dim}, iterations={args.slot_iterations}")
         if args.ir_checkpoint:
             freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
             print(f"  Using IR encoder ({freeze_str}) from {args.ir_checkpoint}")
