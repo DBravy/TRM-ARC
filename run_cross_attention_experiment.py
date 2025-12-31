@@ -19,8 +19,10 @@ import subprocess
 import re
 import os
 import sys
+import argparse
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+from multiprocessing import Pool, cpu_count
 import statistics
 
 # =============================================================================
@@ -60,7 +62,7 @@ def build_command(combo: Dict, seed: int) -> List[str]:
     cmd = [
         sys.executable, "crm.py",
         "--single-puzzle", PUZZLE_ID,
-        "--epochs", "100",
+        "--epochs", "200",
         "--num-negatives", "200",
         "--eval-on-test",
         "--visualize",
@@ -127,11 +129,12 @@ def parse_results(output: str) -> Dict:
     return results
 
 
-def run_trial(combo: Dict, seed: int, trial_num: int, total_trials: int) -> Tuple[str, Dict]:
+def run_trial(combo: Dict, seed: int, trial_num: int, total_trials: int, quiet: bool = False) -> Tuple[str, Dict]:
     """Run a single trial and capture output."""
     cmd = build_command(combo, seed)
 
-    print(f"  [{trial_num}/{total_trials}] Running {combo['name']} with seed {seed}...", end=" ", flush=True)
+    if not quiet:
+        print(f"  [{trial_num}/{total_trials}] Running {combo['name']} with seed {seed}...", end=" ", flush=True)
 
     try:
         result = subprocess.run(
@@ -144,19 +147,21 @@ def run_trial(combo: Dict, seed: int, trial_num: int, total_trials: int) -> Tupl
         parsed = parse_results(output)
 
         # Print quick status
-        if parsed["pixel_accuracy"] is not None:
-            perfect = "PERFECT" if parsed["perfect_rate"] == 1.0 else f"{parsed['pixel_accuracy']:.1f}%"
-            epoch_info = f"epoch {parsed['final_epoch']}"
-            if parsed["early_stopped"]:
-                epoch_info += " (early stop)"
-            print(f"{perfect} @ {epoch_info}")
-        else:
-            print("PARSE ERROR")
+        if not quiet:
+            if parsed["pixel_accuracy"] is not None:
+                perfect = "PERFECT" if parsed["perfect_rate"] == 1.0 else f"{parsed['pixel_accuracy']:.1f}%"
+                epoch_info = f"epoch {parsed['final_epoch']}"
+                if parsed["early_stopped"]:
+                    epoch_info += " (early stop)"
+                print(f"{perfect} @ {epoch_info}")
+            else:
+                print("PARSE ERROR")
 
         return output, parsed
 
     except subprocess.TimeoutExpired:
-        print("TIMEOUT")
+        if not quiet:
+            print("TIMEOUT")
         return "TIMEOUT: Trial exceeded 10 minutes", {
             "pixel_accuracy": None,
             "perfect_count": None,
@@ -167,7 +172,8 @@ def run_trial(combo: Dict, seed: int, trial_num: int, total_trials: int) -> Tupl
             "error": "timeout"
         }
     except Exception as e:
-        print(f"ERROR: {e}")
+        if not quiet:
+            print(f"ERROR: {e}")
         return f"ERROR: {e}", {
             "pixel_accuracy": None,
             "perfect_count": None,
@@ -177,6 +183,38 @@ def run_trial(combo: Dict, seed: int, trial_num: int, total_trials: int) -> Tupl
             "early_stopped": False,
             "error": str(e)
         }
+
+
+def run_trial_worker(args: Tuple) -> Dict:
+    """Worker function for parallel execution."""
+    combo, seed, trial_idx, total_trials = args
+    output, parsed = run_trial(combo, seed, trial_idx, total_trials, quiet=True)
+
+    # Format result status for printing
+    if parsed.get("pixel_accuracy") is not None:
+        if parsed["perfect_rate"] == 1.0:
+            status = "PERFECT"
+        else:
+            status = f"{parsed['pixel_accuracy']:.1f}%"
+        epoch_info = f"epoch {parsed['final_epoch']}"
+        if parsed["early_stopped"]:
+            epoch_info += " (early stop)"
+        status_str = f"{status} @ {epoch_info}"
+    elif parsed.get("error") == "timeout":
+        status_str = "TIMEOUT"
+    elif parsed.get("error"):
+        status_str = f"ERROR: {parsed['error']}"
+    else:
+        status_str = "PARSE ERROR"
+
+    return {
+        "combo_name": combo["name"],
+        "seed": seed,
+        "output": output,
+        "parsed": parsed,
+        "status_str": status_str,
+        "trial_idx": trial_idx,
+    }
 
 
 def classify_stability(accuracies: List[float]) -> str:
@@ -418,26 +456,28 @@ def generate_summary_report(all_results: Dict, output_path: str):
             f.write(f"**Worst avg accuracy:** {worst_avg[0]} ({worst_avg[1]['avg_accuracy']:.1f}%)\n")
 
 
-def main():
-    """Main experiment runner."""
-    print("=" * 60)
-    print("CROSS-ATTENTION EXPERIMENT")
-    print(f"Puzzle: {PUZZLE_ID}")
-    print(f"Combinations: {len(COMBINATIONS)}")
-    print(f"Seeds: {SEEDS}")
-    print(f"Total trials: {len(COMBINATIONS) * len(SEEDS)}")
-    print("=" * 60)
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run cross-attention experiments with optional parallelization"
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1 for sequential execution)"
+    )
+    parser.add_argument(
+        "--max-workers",
+        action="store_true",
+        help="Use maximum available CPU cores as workers"
+    )
+    return parser.parse_args()
 
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Store all results
-    all_results = {}
-
-    total_trials = len(COMBINATIONS) * len(SEEDS)
+def run_sequential(all_results: Dict, total_trials: int):
+    """Run trials sequentially (original behavior)."""
     trial_num = 0
-
-    # Run all trials
     for combo in COMBINATIONS:
         name = combo["name"]
         print(f"\n--- {name} ---")
@@ -450,6 +490,76 @@ def main():
                 "output": output,
                 "parsed": parsed,
             }
+
+
+def run_parallel(all_results: Dict, total_trials: int, num_workers: int):
+    """Run trials in parallel using multiprocessing."""
+    # Build list of all trial arguments
+    trial_args = []
+    trial_idx = 0
+    for combo in COMBINATIONS:
+        for seed in SEEDS:
+            trial_idx += 1
+            trial_args.append((combo, seed, trial_idx, total_trials))
+
+    print(f"\nRunning {total_trials} trials with {num_workers} parallel workers...")
+    print("-" * 60)
+
+    # Initialize results structure
+    for combo in COMBINATIONS:
+        all_results[combo["name"]] = {}
+
+    # Run trials in parallel with progress reporting
+    completed = 0
+    with Pool(processes=num_workers) as pool:
+        for result in pool.imap_unordered(run_trial_worker, trial_args):
+            completed += 1
+            combo_name = result["combo_name"]
+            seed = result["seed"]
+            status_str = result["status_str"]
+
+            print(f"  [{completed}/{total_trials}] {combo_name} seed={seed}: {status_str}")
+
+            all_results[combo_name][seed] = {
+                "output": result["output"],
+                "parsed": result["parsed"],
+            }
+
+
+def main():
+    """Main experiment runner."""
+    args = parse_args()
+
+    # Determine number of workers
+    if args.max_workers:
+        num_workers = cpu_count()
+    else:
+        num_workers = args.workers
+
+    # Clamp workers to reasonable range
+    num_workers = max(1, min(num_workers, cpu_count()))
+
+    print("=" * 60)
+    print("CROSS-ATTENTION EXPERIMENT")
+    print(f"Puzzle: {PUZZLE_ID}")
+    print(f"Combinations: {len(COMBINATIONS)}")
+    print(f"Seeds: {SEEDS}")
+    print(f"Total trials: {len(COMBINATIONS) * len(SEEDS)}")
+    print(f"Workers: {num_workers}" + (" (parallel)" if num_workers > 1 else " (sequential)"))
+    print("=" * 60)
+
+    # Create output directory
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Store all results
+    all_results = {}
+    total_trials = len(COMBINATIONS) * len(SEEDS)
+
+    # Run trials
+    if num_workers == 1:
+        run_sequential(all_results, total_trials)
+    else:
+        run_parallel(all_results, total_trials, num_workers)
 
     # Generate reports
     print("\n" + "=" * 60)
