@@ -365,9 +365,10 @@ def api_model_info():
     slot_info = {}
     if use_slot_cross_attention and model.slot_attention is not None:
         slot_info = {
-            'num_slots': model.num_slots,
+            'num_slots': getattr(model, 'num_slots', getattr(model.slot_attention, 'num_slots', 10)),
             'slot_dim': model.slot_dim,
-            'slot_iterations': model.slot_iterations,
+            'slot_iterations': getattr(model, 'slot_iterations', None),  # None for color/affinity slots
+            'slot_type': 'affinity' if getattr(model, 'use_affinity_slots', False) else ('color' if getattr(model, 'use_color_slots', False) else 'learned'),
         }
 
     # Cross-attention info
@@ -1166,8 +1167,12 @@ def compute_pixel_trace(
             empty_slots_np = empty_slots.squeeze(0).cpu().numpy()  # (K,)
             topk_indices_for_pixel = topk_indices.squeeze(0)[pixel_idx].cpu().numpy()  # (top_k,)
 
+            # Determine slot type
+            slot_type = 'affinity' if getattr(model, 'use_affinity_slots', False) else ('color' if getattr(model, 'use_color_slots', False) else 'learned')
+
             result['slot_attention'] = {
                 'has_slot_attention': True,
+                'slot_type': slot_type,
                 'num_slots': K,
                 'top_k': top_k,
                 'top_k_indices': topk_indices_for_pixel.tolist(),  # Which slots are in top-k for this pixel

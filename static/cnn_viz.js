@@ -279,7 +279,9 @@ async function loadModelInfo() {
         // Build slot attention info string
         let slotInfo = 'No';
         if (modelInfo.use_slot_cross_attention && modelInfo.slot_info) {
-            slotInfo = `${modelInfo.slot_info.num_slots} slots`;
+            const slotType = modelInfo.slot_info.slot_type || 'learned';
+            const typeLabel = slotType === 'affinity' ? 'affinity' : (slotType === 'color' ? 'color' : 'learned');
+            slotInfo = `${modelInfo.slot_info.num_slots} ${typeLabel}`;
         }
 
         // Build cross-attention info string
@@ -1537,11 +1539,15 @@ function createSlotAttentionSection(trace) {
     const slot = trace.slot_attention;
     const pixel = trace.pixel;
     const K = slot.num_slots;
+    const slotType = slot.slot_type || 'learned';
+    const typeDesc = slotType === 'affinity' ? 'affinity-grouped' : (slotType === 'color' ? 'color-based' : 'learned');
 
     let html = `
-        <h4>Slot-Routed Cross-Attention (${K} slots)</h4>
+        <h4>Slot-Routed Cross-Attention (${K} ${typeDesc} slots)</h4>
         <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
-            Output pixel queries objects via slots. Each slot represents a discovered object/pattern in the input.
+            ${slotType === 'affinity' ? 'Slots represent merged connected components grouped by spatial affinity.' :
+              slotType === 'color' ? 'Each slot corresponds to one color (0-9).' :
+              'Slots are discovered objects/patterns via learned attention.'}
         </p>
     `;
 
