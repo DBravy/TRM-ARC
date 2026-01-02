@@ -956,7 +956,7 @@ class AffinitySlotAttention(nn.Module):
     def __init__(self, input_dim: int, slot_dim: int, max_slots: int = 40,
                  use_mlp: bool = True, mlp_hidden_dim: int = 128,
                  w_color: float = 1.0, w_adjacent: float = 1.0, w_bbox: float = 1.0,
-                 merge_threshold: float = 10.5):
+                 merge_threshold: float = 1.5):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
