@@ -291,6 +291,10 @@ class NConvWithCrossAttention(nn.Module):
         cross_attention_modules: Either a single CrossAttention/SlotRoutedCrossAttention module (shared)
                                  or a ModuleList of modules (one per layer)
         is_slot_attention: If True, use SlotRoutedCrossAttention interface
+
+    For visualization:
+        Set capture_attention=True to store attention weights for each layer.
+        Access via .last_attention_weights (list of per-layer attention weights).
     """
     def __init__(self, in_ch: int, out_ch: int, depth: int = 2, kernel_size: int = 3,
                  cross_attention_modules=None, is_slot_attention: bool = False):
@@ -311,6 +315,10 @@ class NConvWithCrossAttention(nn.Module):
         self.cross_attentions = cross_attention_modules
         self.shared_attention = not isinstance(cross_attention_modules, nn.ModuleList)
 
+        # For visualization: capture attention weights per layer
+        self.capture_attention = False
+        self.last_attention_weights = None  # List of (layer_idx, attention_weights) when captured
+
     def forward(self, x, ir_features=None, slot_embeddings=None, slot_masks=None):
         """
         Args:
@@ -319,6 +327,9 @@ class NConvWithCrossAttention(nn.Module):
             slot_embeddings: Slot embeddings (B, K, slot_dim) for slot cross-attention
             slot_masks: Slot masks (B, K, H_ir, W_ir) for slot cross-attention
         """
+        if self.capture_attention:
+            self.last_attention_weights = []
+
         for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
             x = F.relu(bn(conv(x)), inplace=True)
 
@@ -355,6 +366,10 @@ class NConvWithCrossAttention(nn.Module):
         else:
             ca = self.cross_attentions[layer_idx]
 
+        # Enable attention capture on the cross-attention module if we're capturing
+        if self.capture_attention and hasattr(ca, 'capture_attention'):
+            ca.capture_attention = True
+
         # Apply cross-attention: x is (B, C, H, W), need (B, H, W, C)
         x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
 
@@ -371,6 +386,18 @@ class NConvWithCrossAttention(nn.Module):
         else:
             # Regular CrossAttention interface
             x_perm = ca(query=x_perm, key_value=ir_interp)
+
+        # Capture attention weights if enabled
+        if self.capture_attention and hasattr(ca, 'last_attention_weights') and ca.last_attention_weights is not None:
+            self.last_attention_weights.append({
+                'layer_idx': layer_idx,
+                'attention_weights': ca.last_attention_weights,
+                'spatial_size': (H, W),
+                'is_slot_attention': self.is_slot_attention
+            })
+            # Disable capture on the module after grabbing weights
+            if hasattr(ca, 'capture_attention'):
+                ca.capture_attention = False
 
         return x_perm.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
 
