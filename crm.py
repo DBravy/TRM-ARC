@@ -3268,8 +3268,8 @@ def masked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, mask: torc
     Returns:
         Scalar loss averaged over masked pixels
     """
-    # Compute per-pixel loss
-    per_pixel_loss = F.cross_entropy(logits, targets, reduction='none')  # (B, H, W)
+    # Compute per-pixel loss (ignore_index=10 for padding sentinel)
+    per_pixel_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=10)  # (B, H, W)
 
     # Apply mask and compute mean over content pixels only
     masked_loss = per_pixel_loss * mask
