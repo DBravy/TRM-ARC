@@ -84,7 +84,7 @@ def compute_per_color_kernel_response(model: DorsalCNN) -> Dict:
     Compute effective kernel response for each of the 10 ARC colors.
 
     For embedding models: Uses 16-dim learned embeddings for each color.
-    For one-hot models: Uses fixed 11-dim one-hot + nonzero mask encoding.
+    For one-hot models: Uses fixed 11-dim one-hot + content mask encoding.
 
     For each color, we compute the "effective kernel" - the kernel's response
     when that color is present in both input and output (correct match).
@@ -104,11 +104,12 @@ def compute_per_color_kernel_response(model: DorsalCNN) -> Dict:
     responses = []
     for c in range(NUM_COLORS):
         if model.use_onehot:
-            # One-hot encoding: 10 one-hot + 1 nonzero mask = 11 dims per grid
+            # One-hot encoding: 10 one-hot + 1 content mask = 11 dims per grid
+            # Content mask is 1 for all real colors (0-9), 0 for padding (10)
             # Input encoding
             ie = torch.zeros(11, device=kernel.device)
             ie[c] = 1.0  # one-hot
-            ie[10] = 1.0 if c > 0 else 0.0  # nonzero mask
+            ie[10] = 1.0  # content mask (always 1 for actual colors 0-9)
             # Output encoding (same for matching colors)
             oe = ie.clone()
             # Combined: [input(11), output(11)] = 22 channels
@@ -552,14 +553,15 @@ def api_compare_colors():
         return jsonify({'error': 'Model not loaded'}), 500
 
     if model.use_onehot:
-        # One-hot encoding: fixed 11-dim vectors (10 one-hot + 1 nonzero mask)
+        # One-hot encoding: fixed 11-dim vectors (10 one-hot + 1 content mask)
+        # Content mask is 1 for all real colors (0-9), 0 for padding (10)
         inp_embed = np.zeros((NUM_COLORS, 11), dtype=np.float32)
         out_embed = np.zeros((NUM_COLORS, 11), dtype=np.float32)
         for c in range(NUM_COLORS):
             inp_embed[c, c] = 1.0  # one-hot
-            inp_embed[c, 10] = 1.0 if c > 0 else 0.0  # nonzero mask
+            inp_embed[c, 10] = 1.0  # content mask (always 1 for actual colors 0-9)
             out_embed[c, c] = 1.0
-            out_embed[c, 10] = 1.0 if c > 0 else 0.0
+            out_embed[c, 10] = 1.0  # content mask
     else:
         inp_embed = model.input_embed.weight.detach().cpu().numpy()  # (10, 16)
         out_embed = model.output_embed.weight.detach().cpu().numpy()  # (10, 16)

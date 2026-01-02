@@ -5,6 +5,7 @@ Visualize how different merge thresholds affect component grouping in ARC puzzle
 Usage:
     python visualize_merge_thresholds.py --single-puzzle 00d62c1b
     python visualize_merge_thresholds.py --single-puzzle 00d62c1b --thresholds 0.5 1.0 1.5 2.0 2.5 3.0
+    python visualize_merge_thresholds.py --single-puzzle 00d62c1b --no-background-detection
 """
 
 import argparse
@@ -65,44 +66,172 @@ def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined") -> dict:
     return all_puzzles
 
 
-def compute_connected_components(color_grid: np.ndarray):
+def detect_background_color(grid: np.ndarray, min_coverage: float = 0.1) -> int | None:
+    """
+    Detect the background color using the largest edge-connected component heuristic.
+    
+    Args:
+        grid: The color grid (H, W) with integer color values
+        min_coverage: Minimum fraction of grid that must be covered to be considered background
+        
+    Returns:
+        The background color (0-9), or None if no clear background is detected
+    """
+    H, W = grid.shape
+    total_cells = H * W
+    
+    # Get colors that touch any edge
+    edge_colors = set()
+    edge_colors.update(grid[0, :].tolist())      # top
+    edge_colors.update(grid[H-1, :].tolist())    # bottom
+    edge_colors.update(grid[:, 0].tolist())      # left
+    edge_colors.update(grid[:, W-1].tolist())    # right
+    
+    best_color = None
+    best_size = 0
+    
+    for color in edge_colors:
+        mask = (grid == color)
+        labeled, num_features = ndimage.label(mask)
+        
+        # Find components that touch the edge
+        for comp_id in range(1, num_features + 1):
+            comp_mask = (labeled == comp_id)
+            
+            touches_edge = (
+                comp_mask[0, :].any() or comp_mask[H-1, :].any() or
+                comp_mask[:, 0].any() or comp_mask[:, W-1].any()
+            )
+            
+            if touches_edge:
+                size = comp_mask.sum()
+                if size > best_size:
+                    best_size = size
+                    best_color = color
+    
+    # Only return as background if it covers enough of the grid
+    if best_color is not None and best_size / total_cells >= min_coverage:
+        return best_color
+    
+    return None
+
+
+def compute_exterior_mask(grid: np.ndarray, background_color: int) -> np.ndarray:
+    """
+    Compute which pixels of the background color are "exterior" (reachable from edges)
+    using 4-connectivity. This allows diagonal lines to act as enclosing barriers.
+    
+    Args:
+        grid: The color grid (H, W)
+        background_color: The detected background color
+        
+    Returns:
+        Boolean mask (H, W) where True = exterior background pixel
+    """
+    H, W = grid.shape
+    
+    # Create mask of background-colored pixels
+    bg_mask = (grid == background_color)
+    
+    # Use 4-connectivity to find what's reachable from edges
+    # Start by marking edge pixels of background color
+    seed = np.zeros((H, W), dtype=bool)
+    seed[0, :] = bg_mask[0, :]       # top edge
+    seed[H-1, :] = bg_mask[H-1, :]   # bottom edge
+    seed[:, 0] = bg_mask[:, 0]       # left edge
+    seed[:, W-1] = bg_mask[:, W-1]   # right edge
+    
+    # 4-connectivity structure (no diagonals)
+    structure_4conn = np.array([[0, 1, 0],
+                                 [1, 1, 1],
+                                 [0, 1, 0]], dtype=np.int32)
+    
+    # Flood fill from edge seeds within background mask using 4-connectivity
+    # This finds all background pixels reachable from edges without crossing diagonals
+    exterior_mask = ndimage.binary_dilation(seed, structure=structure_4conn, 
+                                             iterations=-1, mask=bg_mask)
+    
+    return exterior_mask
+
+
+def compute_connected_components(color_grid: np.ndarray, background_color: int | None = None):
     """
     Compute connected components for a color grid.
 
+    Args:
+        color_grid: The color grid (H, W)
+        background_color: If provided, this color uses 4-connectivity (so diagonal 
+                         enclosures create separate regions), while other colors 
+                         use 8-connectivity (so diagonal lines are solid shapes).
+                         Components of this color are marked as background only if 
+                         they are "exterior" (reachable from edges via 4-connectivity).
+        
     Returns:
         component_labels: (H, W) component IDs (0 = no component, 1+ = component IDs)
         component_colors: list of colors for each component
         component_bboxes: list of (min_row, min_col, max_row, max_col) for each component
+        component_is_background: list of booleans indicating if each component is background
     """
     H, W = color_grid.shape
     all_labels = np.zeros((H, W), dtype=np.int32)
     component_colors = []
     component_bboxes = []
+    component_is_background = []
     component_id = 0
+
+    # 8-connectivity structure (includes diagonals) for foreground objects
+    structure_8conn = np.array([[1, 1, 1],
+                                 [1, 1, 1],
+                                 [1, 1, 1]], dtype=np.int32)
+    
+    # 4-connectivity structure (no diagonals) for background color
+    structure_4conn = np.array([[0, 1, 0],
+                                 [1, 1, 1],
+                                 [0, 1, 0]], dtype=np.int32)
+    
+    # Compute exterior mask if we have a background color
+    # This uses 4-connectivity to determine what's reachable from edges
+    exterior_mask = None
+    if background_color is not None:
+        exterior_mask = compute_exterior_mask(color_grid, background_color)
 
     for c in range(NUM_COLORS):
         mask = (color_grid == c)
         if not mask.any():
             continue
 
-        labeled, num_features = ndimage.label(mask)
+        # Use 4-connectivity for background color, 8-connectivity for others
+        if c == background_color:
+            labeled, num_features = ndimage.label(mask, structure=structure_4conn)
+        else:
+            labeled, num_features = ndimage.label(mask, structure=structure_8conn)
 
         for comp in range(1, num_features + 1):
             component_id += 1
             comp_mask = (labeled == comp)
             all_labels[comp_mask] = component_id
             component_colors.append(c)
+            
+            # Check if this component is part of the background
+            # A background component must be the background color AND be exterior
+            # (reachable from edges via 4-connectivity)
+            is_bg = False
+            if background_color is not None and c == background_color and exterior_mask is not None:
+                # Check if any pixel of this component is in the exterior mask
+                is_bg = (comp_mask & exterior_mask).any()
+            component_is_background.append(is_bg)
 
             rows, cols = np.where(comp_mask)
             bbox = (rows.min(), cols.min(), rows.max(), cols.max())
             component_bboxes.append(bbox)
 
-    return all_labels, component_colors, component_bboxes
+    return all_labels, component_colors, component_bboxes, component_is_background
 
 
 def compute_pairwise_affinity(component_labels: np.ndarray,
                                component_colors: list,
                                component_bboxes: list,
+                               component_is_background: list = None,
                                w_color: float = 1.0,
                                w_adjacent: float = 1.0,
                                w_bbox: float = 1.0):
@@ -113,12 +242,18 @@ def compute_pairwise_affinity(component_labels: np.ndarray,
     - Same color: +w_color
     - Spatial adjacency (8-connected): +w_adjacent
     - Bounding box containment: +w_bbox
+    
+    Background components only have affinity with other background components.
     """
     H, W = component_labels.shape
     num_components = len(component_colors)
 
     if num_components == 0:
         return np.zeros((0, 0), dtype=np.float32)
+    
+    # Default: no components are background
+    if component_is_background is None:
+        component_is_background = [False] * num_components
 
     affinity = np.zeros((num_components, num_components), dtype=np.float32)
 
@@ -141,6 +276,16 @@ def compute_pairwise_affinity(component_labels: np.ndarray,
 
     for i in range(num_components):
         for j in range(i + 1, num_components):
+            # Key change: no affinity between background and non-background components
+            i_is_bg = component_is_background[i]
+            j_is_bg = component_is_background[j]
+            
+            if i_is_bg != j_is_bg:
+                # One is background, one is not - no affinity
+                affinity[i, j] = 0.0
+                affinity[j, i] = 0.0
+                continue
+            
             score = 0.0
 
             # Same color
@@ -249,7 +394,8 @@ def plot_grid(ax, grid, title, cmap=None, show_grid_lines=True):
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
 
 
-def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: list, output_path: str = None):
+def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: list, 
+                                 output_path: str = None, use_background_detection: bool = True):
     """
     Visualize component grouping at different merge thresholds for a puzzle.
     """
@@ -263,10 +409,22 @@ def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: l
     input_grid = np.array(example["input"], dtype=np.int32)
     output_grid = np.array(example["output"], dtype=np.int32) if "output" in example else None
 
+    # Detect background color
+    background_color = None
+    if use_background_detection:
+        background_color = detect_background_color(input_grid)
+        if background_color is not None:
+            print(f"Detected background color: {background_color}")
+        else:
+            print("No clear background detected")
+
     # Compute components and affinity for input grid
-    component_labels, component_colors, component_bboxes = compute_connected_components(input_grid)
-    affinity = compute_pairwise_affinity(component_labels, component_colors, component_bboxes)
+    component_labels, component_colors, component_bboxes, component_is_background = \
+        compute_connected_components(input_grid, background_color)
+    affinity = compute_pairwise_affinity(component_labels, component_colors, component_bboxes, 
+                                          component_is_background)
     num_components = len(component_colors)
+    num_background_components = sum(component_is_background)
 
     # Create figure
     n_thresholds = len(thresholds)
@@ -277,7 +435,9 @@ def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: l
     if n_rows == 1:
         axes = axes.reshape(1, -1)
 
-    fig.suptitle(f"Puzzle: {puzzle_id} (test input) | {num_components} connected components", fontsize=14)
+    bg_str = f" | bg={background_color}" if background_color is not None else ""
+    fig.suptitle(f"Puzzle: {puzzle_id} (test input) | {num_components} components ({num_background_components} bg){bg_str}", 
+                 fontsize=14)
 
     # Create a colormap for groups (distinct colors)
     group_cmap = plt.cm.get_cmap('tab20', 20)
@@ -312,8 +472,15 @@ def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: l
 
     # Row 1: Test output grid analysis (if available)
     if output_grid is not None:
-        out_component_labels, out_component_colors, out_component_bboxes = compute_connected_components(output_grid)
-        out_affinity = compute_pairwise_affinity(out_component_labels, out_component_colors, out_component_bboxes)
+        # Detect background for output grid separately
+        out_background_color = None
+        if use_background_detection:
+            out_background_color = detect_background_color(output_grid)
+            
+        out_component_labels, out_component_colors, out_component_bboxes, out_component_is_background = \
+            compute_connected_components(output_grid, out_background_color)
+        out_affinity = compute_pairwise_affinity(out_component_labels, out_component_colors, 
+                                                  out_component_bboxes, out_component_is_background)
         out_num_components = len(out_component_colors)
 
         plot_grid(axes[1, 0], output_grid, "Test Output (colors)")
@@ -349,13 +516,19 @@ def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: l
     # Print affinity matrix summary
     print(f"\n=== Affinity Analysis for {puzzle_id} ===")
     print(f"Number of connected components: {num_components}")
+    print(f"Background components: {num_background_components}")
+    if background_color is not None:
+        print(f"Background color: {background_color}")
+    
     if num_components > 0 and num_components <= 20:
         print("\nAffinity matrix (non-zero values):")
         for i in range(num_components):
             for j in range(i + 1, num_components):
                 if affinity[i, j] > 0:
-                    print(f"  Component {i+1} (color {component_colors[i]}) <-> "
-                          f"Component {j+1} (color {component_colors[j]}): {affinity[i, j]:.1f}")
+                    bg_i = " [BG]" if component_is_background[i] else ""
+                    bg_j = " [BG]" if component_is_background[j] else ""
+                    print(f"  Component {i+1} (color {component_colors[i]}{bg_i}) <-> "
+                          f"Component {j+1} (color {component_colors[j]}{bg_j}): {affinity[i, j]:.1f}")
 
     print("\nGroups at each threshold:")
     for threshold in thresholds:
@@ -376,6 +549,8 @@ def main():
                         help="Merge thresholds to visualize")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path to save the visualization")
+    parser.add_argument("--no-background-detection", action="store_true",
+                        help="Disable automatic background detection")
 
     args = parser.parse_args()
 
@@ -391,8 +566,15 @@ def main():
     puzzle_data = puzzles[args.single_puzzle]
     print(f"Loaded puzzle {args.single_puzzle}")
     print(f"Thresholds to visualize: {args.thresholds}")
+    print(f"Background detection: {'disabled' if args.no_background_detection else 'enabled'}")
 
-    visualize_puzzle_thresholds(args.single_puzzle, puzzle_data, args.thresholds, args.output)
+    visualize_puzzle_thresholds(
+        args.single_puzzle, 
+        puzzle_data, 
+        args.thresholds, 
+        args.output,
+        use_background_detection=not args.no_background_detection
+    )
 
 
 if __name__ == "__main__":

@@ -956,12 +956,15 @@ class AffinitySlotAttention(nn.Module):
         w_adjacent: Weight for spatial adjacency affinity cue
         w_bbox: Weight for bounding box containment affinity cue
         merge_threshold: Threshold for merging components (affinity > threshold)
+        use_background_detection: Whether to detect and isolate background components
+        min_bg_coverage: Minimum fraction of grid that must be covered to be considered background
     """
 
     def __init__(self, input_dim: int, slot_dim: int, max_slots: int = 40,
                  use_mlp: bool = True, mlp_hidden_dim: int = 128,
                  w_color: float = 1.0, w_adjacent: float = 1.0, w_bbox: float = 1.0,
-                 merge_threshold: float = 2.5):
+                 merge_threshold: float = 2.5,
+                 use_background_detection: bool = True, min_bg_coverage: float = 0.1):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
@@ -973,6 +976,10 @@ class AffinitySlotAttention(nn.Module):
         self.w_adjacent = w_adjacent
         self.w_bbox = w_bbox
         self.merge_threshold = merge_threshold
+
+        # Background detection parameters
+        self.use_background_detection = use_background_detection
+        self.min_bg_coverage = min_bg_coverage
 
         # Layer norms
         self.norm_inputs = nn.LayerNorm(input_dim)
@@ -991,17 +998,114 @@ class AffinitySlotAttention(nn.Module):
             )
             self.norm_mlp = nn.LayerNorm(slot_dim)
 
-    def _compute_connected_components(self, color_grid: torch.Tensor) -> Tuple[torch.Tensor, List[List[int]], List[List[Tuple[int, int, int, int]]]]:
+    def _detect_background_color(self, grid: np.ndarray) -> int | None:
+        """
+        Detect the background color using the largest edge-connected component heuristic.
+
+        Args:
+            grid: The color grid (H, W) with integer color values
+
+        Returns:
+            The background color (0-9), or None if no clear background is detected
+        """
+        from scipy import ndimage
+
+        H, W = grid.shape
+        total_cells = H * W
+
+        # Get colors that touch any edge
+        edge_colors = set()
+        edge_colors.update(grid[0, :].tolist())      # top
+        edge_colors.update(grid[H-1, :].tolist())    # bottom
+        edge_colors.update(grid[:, 0].tolist())      # left
+        edge_colors.update(grid[:, W-1].tolist())    # right
+
+        best_color = None
+        best_size = 0
+
+        for color in edge_colors:
+            mask = (grid == color)
+            labeled, num_features = ndimage.label(mask)
+
+            # Find components that touch the edge
+            for comp_id in range(1, num_features + 1):
+                comp_mask = (labeled == comp_id)
+
+                touches_edge = (
+                    comp_mask[0, :].any() or comp_mask[H-1, :].any() or
+                    comp_mask[:, 0].any() or comp_mask[:, W-1].any()
+                )
+
+                if touches_edge:
+                    size = comp_mask.sum()
+                    if size > best_size:
+                        best_size = size
+                        best_color = color
+
+        # Only return as background if it covers enough of the grid
+        if best_color is not None and best_size / total_cells >= self.min_bg_coverage:
+            return best_color
+
+        return None
+
+    def _compute_exterior_mask(self, grid: np.ndarray, background_color: int) -> np.ndarray:
+        """
+        Compute which pixels of the background color are "exterior" (reachable from edges)
+        using 4-connectivity. This allows diagonal lines to act as enclosing barriers.
+
+        Args:
+            grid: The color grid (H, W)
+            background_color: The detected background color
+
+        Returns:
+            Boolean mask (H, W) where True = exterior background pixel
+        """
+        from scipy import ndimage
+
+        H, W = grid.shape
+
+        # Create mask of background-colored pixels
+        bg_mask = (grid == background_color)
+
+        # Use 4-connectivity to find what's reachable from edges
+        # Start by marking edge pixels of background color
+        seed = np.zeros((H, W), dtype=bool)
+        seed[0, :] = bg_mask[0, :]       # top edge
+        seed[H-1, :] = bg_mask[H-1, :]   # bottom edge
+        seed[:, 0] = bg_mask[:, 0]       # left edge
+        seed[:, W-1] = bg_mask[:, W-1]   # right edge
+
+        # 4-connectivity structure (no diagonals)
+        structure_4conn = np.array([[0, 1, 0],
+                                     [1, 1, 1],
+                                     [0, 1, 0]], dtype=np.int32)
+
+        # Flood fill from edge seeds within background mask using 4-connectivity
+        # This finds all background pixels reachable from edges without crossing diagonals
+        exterior_mask = ndimage.binary_dilation(seed, structure=structure_4conn,
+                                                 iterations=-1, mask=bg_mask)
+
+        return exterior_mask
+
+    def _compute_connected_components(self, color_grid: torch.Tensor,
+                                        background_colors: List[int | None] = None
+                                        ) -> Tuple[torch.Tensor, List[List[int]], List[List[Tuple[int, int, int, int]]], List[List[bool]]]:
         """
         Compute connected components for each batch element.
 
         Args:
             color_grid: (B, H, W) integer color values 0-9
+            background_colors: Optional list of background colors per batch element.
+                              If provided, background color uses 4-connectivity while
+                              other colors use 8-connectivity. Components of the background
+                              color are marked as background only if they are "exterior"
+                              (reachable from edges via 4-connectivity).
 
         Returns:
-            component_labels: (B, H, W) component IDs (0 = background/no component, 1+ = component IDs)
+            component_labels: (B, H, W) component IDs (0 = no component, 1+ = component IDs)
             component_colors: List[List[int]] - color for each component per batch
             component_bboxes: List[List[Tuple]] - (min_row, min_col, max_row, max_col) for each component
+            component_is_background: List[List[bool]] - whether each component is background
         """
         from scipy import ndimage
 
@@ -1011,24 +1115,49 @@ class AffinitySlotAttention(nn.Module):
         # Move to CPU for scipy
         color_np = color_grid.cpu().numpy()
 
+        # Default: no background colors
+        if background_colors is None:
+            background_colors = [None] * B
+
         all_labels = np.zeros((B, H, W), dtype=np.int32)
         all_colors = []  # List of lists: component colors per batch
         all_bboxes = []  # List of lists: bboxes per batch
+        all_is_background = []  # List of lists: is_background per batch
+
+        # 8-connectivity structure (includes diagonals) for foreground objects
+        structure_8conn = np.array([[1, 1, 1],
+                                     [1, 1, 1],
+                                     [1, 1, 1]], dtype=np.int32)
+
+        # 4-connectivity structure (no diagonals) for background color
+        structure_4conn = np.array([[0, 1, 0],
+                                     [1, 1, 1],
+                                     [0, 1, 0]], dtype=np.int32)
 
         for b in range(B):
             batch_colors = []
             batch_bboxes = []
+            batch_is_background = []
             component_id = 0
 
-            # Skip color 0 (background) - it should not form components
+            background_color = background_colors[b]
+
+            # Compute exterior mask if we have a background color for this batch element
+            exterior_mask = None
+            if background_color is not None:
+                exterior_mask = self._compute_exterior_mask(color_np[b], background_color)
+
             for c in range(0, NUM_COLORS):
                 # Binary mask for this color
                 mask = (color_np[b] == c)
                 if not mask.any():
                     continue
 
-                # Find connected components for this color
-                labeled, num_features = ndimage.label(mask)
+                # Use 4-connectivity for background color, 8-connectivity for others
+                if c == background_color:
+                    labeled, num_features = ndimage.label(mask, structure=structure_4conn)
+                else:
+                    labeled, num_features = ndimage.label(mask, structure=structure_8conn)
 
                 for comp in range(1, num_features + 1):
                     component_id += 1
@@ -1038,6 +1167,15 @@ class AffinitySlotAttention(nn.Module):
                     # Store color for this component
                     batch_colors.append(c)
 
+                    # Check if this component is part of the background
+                    # A background component must be the background color AND be exterior
+                    # (reachable from edges via 4-connectivity)
+                    is_bg = False
+                    if background_color is not None and c == background_color and exterior_mask is not None:
+                        # Check if any pixel of this component is in the exterior mask
+                        is_bg = bool((comp_mask & exterior_mask).any())
+                    batch_is_background.append(is_bg)
+
                     # Compute bounding box
                     rows, cols = np.where(comp_mask)
                     bbox = (rows.min(), cols.min(), rows.max(), cols.max())
@@ -1045,20 +1183,30 @@ class AffinitySlotAttention(nn.Module):
 
             all_colors.append(batch_colors)
             all_bboxes.append(batch_bboxes)
+            all_is_background.append(batch_is_background)
 
         component_labels = torch.from_numpy(all_labels).to(device)
-        return component_labels, all_colors, all_bboxes
+        return component_labels, all_colors, all_bboxes, all_is_background
 
     def _compute_pairwise_affinity(self, component_labels: torch.Tensor,
                                     component_colors: List[List[int]],
-                                    component_bboxes: List[List[Tuple[int, int, int, int]]]) -> List[np.ndarray]:
+                                    component_bboxes: List[List[Tuple[int, int, int, int]]],
+                                    component_is_background: List[List[bool]] = None) -> List[np.ndarray]:
         """
         Compute pairwise affinity matrix for each batch element.
+
+        Affinity is based on:
+        - Same color: +w_color
+        - Spatial adjacency (8-connected): +w_adjacent
+        - Bounding box containment: +w_bbox
+
+        Background components only have affinity with other background components.
 
         Args:
             component_labels: (B, H, W) component IDs
             component_colors: List[List[int]] - color per component per batch
             component_bboxes: List[List[Tuple]] - bbox per component per batch
+            component_is_background: List[List[bool]] - whether each component is background
 
         Returns:
             List of affinity matrices (num_components x num_components) per batch
@@ -1078,7 +1226,10 @@ class AffinitySlotAttention(nn.Module):
             colors = component_colors[b]
             bboxes = component_bboxes[b]
 
-            # Precompute adjacency: check if any pixel of component i is 4-adjacent to component j
+            # Get background flags for this batch, default to all False
+            is_background = component_is_background[b] if component_is_background is not None else [False] * num_components
+
+            # Precompute adjacency: check if any pixel of component i is 8-adjacent to component j
             # Build a set of (component_id, neighbor_component_id) pairs
             adjacent_pairs = set()
             for row in range(H):
@@ -1099,6 +1250,16 @@ class AffinitySlotAttention(nn.Module):
 
             for i in range(num_components):
                 for j in range(i + 1, num_components):
+                    # Key change: no affinity between background and non-background components
+                    i_is_bg = is_background[i]
+                    j_is_bg = is_background[j]
+
+                    if i_is_bg != j_is_bg:
+                        # One is background, one is not - no affinity
+                        affinity[i, j] = 0.0
+                        affinity[j, i] = 0.0
+                        continue
+
                     score = 0.0
 
                     # Same color
@@ -1112,13 +1273,13 @@ class AffinitySlotAttention(nn.Module):
                     # Bounding box containment
                     bbox_i = bboxes[i]
                     bbox_j = bboxes[j]
-                    # Check if bbox_i is inside bbox_j
-                    i_in_j = (bbox_i[0] >= bbox_j[0] and bbox_i[1] >= bbox_j[1] and
-                              bbox_i[2] <= bbox_j[2] and bbox_i[3] <= bbox_j[3])
-                    # Check if bbox_j is inside bbox_i
-                    j_in_i = (bbox_j[0] >= bbox_i[0] and bbox_j[1] >= bbox_i[1] and
-                              bbox_j[2] <= bbox_i[2] and bbox_j[3] <= bbox_i[3])
-                    if i_in_j or j_in_i:
+                    # Check if bbox_i contains bbox_j
+                    i_contains_j = (bbox_i[0] <= bbox_j[0] and bbox_i[1] <= bbox_j[1] and
+                                    bbox_i[2] >= bbox_j[2] and bbox_i[3] >= bbox_j[3])
+                    # Check if bbox_j contains bbox_i
+                    j_contains_i = (bbox_j[0] <= bbox_i[0] and bbox_j[1] <= bbox_i[1] and
+                                    bbox_j[2] >= bbox_i[2] and bbox_j[3] >= bbox_i[3])
+                    if i_contains_j or j_contains_i:
                         score += self.w_bbox
 
                     affinity[i, j] = score
@@ -1201,12 +1362,23 @@ class AffinitySlotAttention(nn.Module):
         inputs = inputs.reshape(B, H, W, D)
         v = self.to_v(inputs)  # (B, H, W, slot_dim)
 
+        # Step 1.5: Detect background colors if enabled
+        background_colors = None
+        if self.use_background_detection:
+            color_np = color_grid.cpu().numpy()
+            background_colors = []
+            for b in range(B):
+                bg_color = self._detect_background_color(color_np[b])
+                background_colors.append(bg_color)
+
         # Step 2: Compute connected components
-        component_labels, component_colors, component_bboxes = self._compute_connected_components(color_grid)
+        component_labels, component_colors, component_bboxes, component_is_background = \
+            self._compute_connected_components(color_grid, background_colors)
 
         # Step 3: Compute pairwise affinity
         num_components_per_batch = [len(colors) for colors in component_colors]
-        affinity_matrices = self._compute_pairwise_affinity(component_labels, component_colors, component_bboxes)
+        affinity_matrices = self._compute_pairwise_affinity(
+            component_labels, component_colors, component_bboxes, component_is_background)
 
         # Step 4: Merge components based on affinity
         group_mappings = self._merge_components(affinity_matrices, num_components_per_batch)
@@ -1438,7 +1610,8 @@ class DorsalCNN(nn.Module):
                  slot_iterations: int = 3, slot_mlp_hidden: int = 128,
                  slot_top_k: int = 2,
                  affinity_max_slots: int = 40,
-                 merge_threshold: float = 2.5):
+                 merge_threshold: float = 2.5,
+                 use_background_detection: bool = True):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -1468,6 +1641,7 @@ class DorsalCNN(nn.Module):
         self.use_affinity_slots = use_affinity_slots
         self.affinity_max_slots = affinity_max_slots
         self.merge_threshold = merge_threshold
+        self.use_background_detection = use_background_detection
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.slot_iterations = slot_iterations
@@ -1475,13 +1649,13 @@ class DorsalCNN(nn.Module):
         self.slot_top_k = slot_top_k
 
         if use_onehot:
-            # One-hot (10) + nonzero mask (1) = 11 channels per grid
+            # One-hot (10) + content mask (1) = 11 channels per grid
             embed_dim = 11
         else:
-            # Learned embeddings
+            # Learned embeddings (11 entries: 0-9 colors + padding sentinel)
             embed_dim = 16
-            self.input_embed = nn.Embedding(NUM_COLORS, 16)
-            self.output_embed = nn.Embedding(NUM_COLORS, 16)
+            self.input_embed = nn.Embedding(NUM_COLORS + 1, 16, padding_idx=10)
+            self.output_embed = nn.Embedding(NUM_COLORS + 1, 16, padding_idx=10)
 
         self.embed_dim = embed_dim
 
@@ -1751,7 +1925,8 @@ class DorsalCNN(nn.Module):
                     max_slots=affinity_max_slots,
                     use_mlp=True,
                     mlp_hidden_dim=slot_mlp_hidden,
-                    merge_threshold=merge_threshold
+                    merge_threshold=merge_threshold,
+                    use_background_detection=use_background_detection
                 )
                 actual_num_slots = affinity_max_slots
             elif use_color_slots:
@@ -1787,12 +1962,19 @@ class DorsalCNN(nn.Module):
             )
 
     def _encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
-        """Encode grid to (B, H, W, 11) one-hot + nonzero mask."""
-        # One-hot: (B, H, W) -> (B, H, W, 10)
-        onehot = F.one_hot(grid.long(), num_classes=NUM_COLORS).float()
-        # Nonzero mask: (B, H, W) -> (B, H, W, 1)
-        nonzero = (grid > 0).float().unsqueeze(-1)
-        return torch.cat([onehot, nonzero], dim=-1)
+        """Encode grid to (B, H, W, 11): one-hot for colors 0-9 + content mask.
+        
+        Padding pixels (value 10) get a zero vector for colors and 0 in the content mask.
+        Actual black pixels (value 0) get one-hot [1,0,0,...] and 1 in the content mask.
+        """
+        # Clamp padding sentinel (10) to 0 for one-hot encoding
+        clamped = grid.clamp(max=9)
+        onehot = F.one_hot(clamped.long(), num_classes=NUM_COLORS).float()  # (B, H, W, 10)
+        # Content mask: 1 where actual content (0-9), 0 where padding (10)
+        content_mask = (grid < 10).float().unsqueeze(-1)  # (B, H, W, 1)
+        # Zero out the one-hot for padding pixels (they shouldn't claim to be color 0)
+        onehot = onehot * content_mask
+        return torch.cat([onehot, content_mask], dim=-1)
 
     def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor):
         """
@@ -1803,7 +1985,11 @@ class DorsalCNN(nn.Module):
         """
         # Compute IR features for cross-attention
         if self.ir_encoder is not None:
-            inp_onehot = F.one_hot(input_grid.long(), NUM_COLORS).float()
+            # Clamp padding sentinel (10) to 0 and zero out padding positions
+            inp_clamped = input_grid.clamp(max=9)
+            inp_onehot = F.one_hot(inp_clamped.long(), NUM_COLORS).float()
+            content_mask = (input_grid < 10).float().unsqueeze(-1)  # (B, H, W, 1)
+            inp_onehot = inp_onehot * content_mask  # Zero out padding
             inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
             ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
 
@@ -2019,6 +2205,9 @@ class DorsalCNN(nn.Module):
         use_color_slots = args.get('use_color_slots', False)
         use_affinity_slots = args.get('use_affinity_slots', False)
         affinity_max_slots = args.get('affinity_max_slots', 40)
+        # Handle both old and new arg naming for backward compatibility
+        use_background_detection = args.get('use_background_detection',
+                                             not args.get('no_affinity_background_detection', False))
         num_slots = args.get('num_slots', 8)
         slot_dim = args.get('slot_dim', 64)
         slot_iterations = args.get('slot_iterations', 3)
@@ -2053,6 +2242,7 @@ class DorsalCNN(nn.Module):
             use_affinity_slots=use_affinity_slots,
             num_slots=num_slots,
             affinity_max_slots=affinity_max_slots,
+            use_background_detection=use_background_detection,
             slot_dim=slot_dim,
             slot_iterations=slot_iterations,
             slot_mlp_hidden=slot_mlp_hidden,
@@ -2245,7 +2435,7 @@ class CorrespondenceDataset(Dataset):
 
     def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
         h, w = grid.shape
-        padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        padded = np.full((GRID_SIZE, GRID_SIZE), 10, dtype=np.uint8)  # 10 = padding sentinel
         padded[:h, :w] = grid
         return padded
 
@@ -2512,7 +2702,7 @@ class TestEvalDataset(Dataset):
     
     def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
         h, w = grid.shape
-        padded = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        padded = np.full((GRID_SIZE, GRID_SIZE), 10, dtype=np.uint8)  # 10 = padding sentinel
         padded[:h, :w] = grid
         return padded
     
@@ -3911,6 +4101,10 @@ def main():
                         help="Maximum number of slots for affinity-based slot attention (default: 40)")
     parser.add_argument("--merge-threshold", type=float, default=2.5,
                         help="Threshold for merging components in affinity slots (affinity > threshold)")
+    parser.add_argument("--no-affinity-background-detection", action="store_true",
+                        help="Disable automatic background detection in affinity slots. "
+                             "By default, background is detected using largest edge-connected component "
+                             "and isolated from foreground components (no affinity between them).")
     parser.add_argument("--slot-top-k", type=int, default=2,
                         help="Number of top slots to compute pixel attention for (default: 2). "
                              "Reduces memory by only attending to top-k most relevant slots per query pixel.")
@@ -4148,6 +4342,7 @@ def main():
         num_slots=args.num_slots,
         affinity_max_slots=args.affinity_max_slots,
         merge_threshold=args.merge_threshold,
+        use_background_detection=not args.no_affinity_background_detection,
         slot_dim=args.slot_dim,
         slot_iterations=args.slot_iterations,
         slot_mlp_hidden=args.slot_mlp_hidden,

@@ -4,7 +4,7 @@
  * Handles rendering of ARC grids, kernel heatmaps, and layer activations.
  */
 
-// ARC color palette (0-9)
+// ARC color palette (0-9) + padding sentinel (10)
 const ARC_COLORS = [
     '#000000',  // 0: black
     '#0074D9',  // 1: blue
@@ -15,13 +15,15 @@ const ARC_COLORS = [
     '#F012BE',  // 6: magenta
     '#FF851B',  // 7: orange
     '#7FDBFF',  // 8: cyan
-    '#870C25'   // 9: brown
+    '#870C25',  // 9: brown
+    '#1a1a2e'   // 10: padding (dark blue-gray, distinct from black)
 ];
 
 // Color names for display
 const COLOR_NAMES = [
     'Black', 'Blue', 'Red', 'Green', 'Yellow',
-    'Gray', 'Magenta', 'Orange', 'Cyan', 'Brown'
+    'Gray', 'Magenta', 'Orange', 'Cyan', 'Brown',
+    'Padding'
 ];
 
 // RdBu diverging colormap for kernel visualization
@@ -1135,7 +1137,7 @@ function createEmbeddingsSection(trace) {
     let html = `
         <h4>${isOnehot ? 'One-Hot Encoding' : 'Embedding Vectors'} (${embedDim}-dim each)</h4>
         <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
-            ${isOnehot ? 'Fixed one-hot + nonzero mask encoding for colors.' : 'Learned vector representations for the colors at this position.'}
+            ${isOnehot ? 'Fixed one-hot + content mask encoding for colors. Content mask is 1 for actual content (0-9), 0 for padding.' : 'Learned vector representations for the colors at this position.'}
         </p>
     `;
 

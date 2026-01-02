@@ -410,9 +410,13 @@ def visualize_activation_statistics(
 # =============================================================================
 
 def pad_to_grid_size(grid: np.ndarray, size: int = GRID_SIZE) -> np.ndarray:
-    """Pad grid to standard size."""
+    """Pad grid to standard size using padding sentinel value 10.
+
+    Padding pixels (value 10) are distinguished from actual black pixels (value 0)
+    via the content mask in the model's encoding.
+    """
     h, w = grid.shape
-    padded = np.zeros((size, size), dtype=grid.dtype)
+    padded = np.full((size, size), 10, dtype=np.uint8)  # 10 = padding sentinel
     padded[:h, :w] = grid
     return padded
 
