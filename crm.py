@@ -281,19 +281,23 @@ class NConvWithCrossAttention(nn.Module):
     Unlike NConv which uses nn.Sequential, this class stores individual layers
     and applies cross-attention between them.
 
+    Supports both regular CrossAttention and SlotRoutedCrossAttention.
+
     Args:
         in_ch: Input channels
         out_ch: Output channels
         depth: Number of conv layers
         kernel_size: Kernel size for all convolutions
-        cross_attention_modules: Either a single CrossAttention module (shared)
+        cross_attention_modules: Either a single CrossAttention/SlotRoutedCrossAttention module (shared)
                                  or a ModuleList of modules (one per layer)
+        is_slot_attention: If True, use SlotRoutedCrossAttention interface
     """
     def __init__(self, in_ch: int, out_ch: int, depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None):
+                 cross_attention_modules=None, is_slot_attention: bool = False):
         super().__init__()
         self.depth = depth
         self.out_ch = out_ch
+        self.is_slot_attention = is_slot_attention
         padding = (kernel_size - 1) // 2
 
         # Store individual layers instead of Sequential
@@ -307,21 +311,23 @@ class NConvWithCrossAttention(nn.Module):
         self.cross_attentions = cross_attention_modules
         self.shared_attention = not isinstance(cross_attention_modules, nn.ModuleList)
 
-    def forward(self, x, ir_features=None):
+    def forward(self, x, ir_features=None, slot_embeddings=None, slot_masks=None):
         """
         Args:
             x: Input tensor (B, C, H, W)
             ir_features: IR encoder features (B, H_ir, W_ir, D) for cross-attention
+            slot_embeddings: Slot embeddings (B, K, slot_dim) for slot cross-attention
+            slot_masks: Slot masks (B, K, H_ir, W_ir) for slot cross-attention
         """
         for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
             x = F.relu(bn(conv(x)), inplace=True)
 
             # Apply cross-attention after each layer if available
             if self.cross_attentions is not None and ir_features is not None:
-                x = self._apply_cross_attention(x, ir_features, i)
+                x = self._apply_cross_attention(x, ir_features, i, slot_embeddings, slot_masks)
         return x
 
-    def _apply_cross_attention(self, x, ir_features, layer_idx):
+    def _apply_cross_attention(self, x, ir_features, layer_idx, slot_embeddings=None, slot_masks=None):
         """Apply cross-attention with spatial interpolation if needed."""
         _, _, H, W = x.shape
         H_ir, W_ir = ir_features.shape[1], ir_features.shape[2]
@@ -332,8 +338,16 @@ class NConvWithCrossAttention(nn.Module):
             ir_interp = ir_features.permute(0, 3, 1, 2)  # (B, D, H_ir, W_ir)
             ir_interp = F.interpolate(ir_interp, size=(H, W), mode='bilinear', align_corners=False)
             ir_interp = ir_interp.permute(0, 2, 3, 1)  # (B, H, W, D)
+
+            # Also interpolate slot masks if using slot attention
+            if self.is_slot_attention and slot_masks is not None:
+                # slot_masks is (B, K, H_ir, W_ir)
+                slot_masks_interp = F.interpolate(slot_masks, size=(H, W), mode='bilinear', align_corners=False)
+            else:
+                slot_masks_interp = slot_masks
         else:
             ir_interp = ir_features
+            slot_masks_interp = slot_masks
 
         # Get appropriate cross-attention module
         if self.shared_attention:
@@ -343,59 +357,73 @@ class NConvWithCrossAttention(nn.Module):
 
         # Apply cross-attention: x is (B, C, H, W), need (B, H, W, C)
         x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
-        x_perm = ca(query=x_perm, key_value=ir_interp)
+
+        if self.is_slot_attention:
+            # SlotRoutedCrossAttention interface
+            attended = ca(
+                decoder_features=x_perm,
+                slot_embeddings=slot_embeddings,
+                slot_masks=slot_masks_interp,
+                ir_features=ir_interp
+            )
+            # Add residual connection (matching behavior from DorsalCNN.forward)
+            x_perm = x_perm + attended
+        else:
+            # Regular CrossAttention interface
+            x_perm = ca(query=x_perm, key_value=ir_interp)
+
         return x_perm.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
 
 
 class DownWithCrossAttention(nn.Module):
     """Encoder block with per-layer cross-attention."""
     def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None):
+                 cross_attention_modules=None, is_slot_attention: bool = False):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
         self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules)
+                                            cross_attention_modules, is_slot_attention)
 
-    def forward(self, x, ir_features=None):
-        return self.conv(self.pool(x), ir_features)
+    def forward(self, x, ir_features=None, slot_embeddings=None, slot_masks=None):
+        return self.conv(self.pool(x), ir_features, slot_embeddings, slot_masks)
 
 
 class UpWithCrossAttention(nn.Module):
     """Decoder block with skip connections and per-layer cross-attention."""
     def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None):
+                 cross_attention_modules=None, is_slot_attention: bool = False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
         self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules)
+                                            cross_attention_modules, is_slot_attention)
 
-    def forward(self, x1, x2, ir_features=None):
+    def forward(self, x1, x2, ir_features=None, slot_embeddings=None, slot_masks=None):
         x1 = self.up(x1)
         diff_h = x2.size(2) - x1.size(2)
         diff_w = x2.size(3) - x1.size(3)
         x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2,
                        diff_h // 2, diff_h - diff_h // 2])
         x = torch.cat([x2, x1], dim=1)
-        return self.conv(x, ir_features)
+        return self.conv(x, ir_features, slot_embeddings, slot_masks)
 
 
 class UpNoSkipWithCrossAttention(nn.Module):
     """Decoder block without skip connections but with per-layer cross-attention."""
     def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None):
+                 cross_attention_modules=None, is_slot_attention: bool = False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
         self.conv = NConvWithCrossAttention(out_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules)
+                                            cross_attention_modules, is_slot_attention)
 
-    def forward(self, x, target_size=None, ir_features=None):
+    def forward(self, x, target_size=None, ir_features=None, slot_embeddings=None, slot_masks=None):
         x = self.up(x)
         if target_size is not None:
             diff_h = target_size[0] - x.size(2)
             diff_w = target_size[1] - x.size(3)
             x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2,
                          diff_h // 2, diff_h - diff_h // 2])
-        return self.conv(x, ir_features)
+        return self.conv(x, ir_features, slot_embeddings, slot_masks)
 
 
 class VentralCNN(nn.Module):
@@ -1479,27 +1507,35 @@ class DorsalCNN(nn.Module):
         # Per-layer cross-attention modules (created before blocks so blocks can reference them)
         self.per_layer_cross_attentions = None
         self.shared_cross_attention = None
+        self.per_layer_slot_cross_attentions = None
+        self.shared_slot_cross_attention = None
 
-        if use_cross_attention and cross_attention_per_layer:
-            # Block configurations: (name, output_channels)
-            # inc always exists, down/up blocks depend on num_layers
-            block_configs = [('inc', base_ch)]
-            if num_layers >= 1:
-                block_configs.append(('down1', base_ch * 2))
-            if num_layers >= 2:
-                block_configs.append(('down2', base_ch * 4))
-            if num_layers >= 3:
-                block_configs.append(('down3', base_ch * 8))
-            if num_layers >= 3:
-                block_configs.append(('up1', base_ch * 4))
-            if num_layers >= 2:
-                block_configs.append(('up2', base_ch * 2))
-            if num_layers >= 1:
-                block_configs.append(('up3', base_ch))
+        # Determine if we're using per-layer cross-attention (regular or slot-routed)
+        use_per_layer_regular = use_cross_attention and cross_attention_per_layer
+        use_per_layer_slot = use_slot_cross_attention and cross_attention_per_layer
+        use_per_layer = use_per_layer_regular or use_per_layer_slot
+        self.use_per_layer_slot = use_per_layer_slot  # Store for forward pass
 
+        # Block configurations: (name, output_channels)
+        # inc always exists, down/up blocks depend on num_layers
+        block_configs = [('inc', base_ch)]
+        if num_layers >= 1:
+            block_configs.append(('down1', base_ch * 2))
+        if num_layers >= 2:
+            block_configs.append(('down2', base_ch * 4))
+        if num_layers >= 3:
+            block_configs.append(('down3', base_ch * 8))
+        if num_layers >= 3:
+            block_configs.append(('up1', base_ch * 4))
+        if num_layers >= 2:
+            block_configs.append(('up2', base_ch * 2))
+        if num_layers >= 1:
+            block_configs.append(('up3', base_ch))
+
+        # Create regular CrossAttention modules for per-layer use
+        if use_per_layer_regular:
             if cross_attention_shared:
                 # Single shared cross-attention module
-                # Use base_ch as query_dim - will need channel projection for other sizes
                 self.shared_cross_attention = CrossAttention(
                     query_dim=base_ch,
                     kv_dim=self.ir_feature_dim,
@@ -1521,33 +1557,69 @@ class DorsalCNN(nn.Module):
                             no_softmax=cross_attention_no_softmax
                         )
 
+        # Create SlotRoutedCrossAttention modules for per-layer use
+        # Note: SlotAttention is created later in the use_slot_cross_attention block
+        if use_per_layer_slot:
+            if cross_attention_shared:
+                # Single shared slot cross-attention module
+                self.shared_slot_cross_attention = SlotRoutedCrossAttention(
+                    query_dim=base_ch,
+                    slot_dim=slot_dim,
+                    value_dim=self.ir_feature_dim if self.ir_feature_dim else ir_out_dim,
+                    proj_dim=slot_dim,
+                    top_k=slot_top_k
+                )
+            else:
+                # Separate slot cross-attention modules per block per layer
+                self.per_layer_slot_cross_attentions = nn.ModuleDict()
+                for block_name, out_ch in block_configs:
+                    for layer_idx in range(conv_depth):
+                        key = f"{block_name}_layer{layer_idx}"
+                        self.per_layer_slot_cross_attentions[key] = SlotRoutedCrossAttention(
+                            query_dim=out_ch,
+                            slot_dim=slot_dim,
+                            value_dim=self.ir_feature_dim if self.ir_feature_dim else ir_out_dim,
+                            proj_dim=slot_dim,
+                            top_k=slot_top_k
+                        )
+
         def _get_cross_attention_modules(block_name):
             """Helper to get cross-attention modules for a block."""
-            if not (use_cross_attention and cross_attention_per_layer):
-                return None
-            if cross_attention_shared:
-                return self.shared_cross_attention
-            else:
-                # Return ModuleList of this block's cross-attention modules
-                modules = nn.ModuleList([
-                    self.per_layer_cross_attentions[f"{block_name}_layer{i}"]
-                    for i in range(conv_depth)
-                ])
-                return modules
+            if use_per_layer_slot:
+                # Use slot cross-attention modules
+                if cross_attention_shared:
+                    return self.shared_slot_cross_attention
+                else:
+                    modules = nn.ModuleList([
+                        self.per_layer_slot_cross_attentions[f"{block_name}_layer{i}"]
+                        for i in range(conv_depth)
+                    ])
+                    return modules
+            elif use_per_layer_regular:
+                # Use regular cross-attention modules
+                if cross_attention_shared:
+                    return self.shared_cross_attention
+                else:
+                    modules = nn.ModuleList([
+                        self.per_layer_cross_attentions[f"{block_name}_layer{i}"]
+                        for i in range(conv_depth)
+                    ])
+                    return modules
+            return None
 
         # Encoder - create layers based on num_layers
-        if use_cross_attention and cross_attention_per_layer:
+        if use_per_layer:
             self.inc = NConvWithCrossAttention(in_channels, base_ch, conv_depth, kernel_size,
-                                               _get_cross_attention_modules('inc'))
+                                               _get_cross_attention_modules('inc'), is_slot_attention=use_per_layer_slot)
             if num_layers >= 1:
                 self.down1 = DownWithCrossAttention(base_ch, base_ch * 2, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down1'))
+                                                    _get_cross_attention_modules('down1'), is_slot_attention=use_per_layer_slot)
             if num_layers >= 2:
                 self.down2 = DownWithCrossAttention(base_ch * 2, base_ch * 4, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down2'))
+                                                    _get_cross_attention_modules('down2'), is_slot_attention=use_per_layer_slot)
             if num_layers >= 3:
                 self.down3 = DownWithCrossAttention(base_ch * 4, base_ch * 8, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down3'))
+                                                    _get_cross_attention_modules('down3'), is_slot_attention=use_per_layer_slot)
         else:
             self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
             if num_layers >= 1:
@@ -1559,25 +1631,25 @@ class DorsalCNN(nn.Module):
 
         # Decoder - create layers based on num_layers (no up layers needed for num_layers=0)
         if num_layers >= 1:
-            if use_cross_attention and cross_attention_per_layer:
+            if use_per_layer:
                 if no_skip:
                     if num_layers >= 3:
                         self.up1 = UpNoSkipWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
-                                                              _get_cross_attention_modules('up1'))
+                                                              _get_cross_attention_modules('up1'), is_slot_attention=use_per_layer_slot)
                     if num_layers >= 2:
                         self.up2 = UpNoSkipWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
-                                                              _get_cross_attention_modules('up2'))
+                                                              _get_cross_attention_modules('up2'), is_slot_attention=use_per_layer_slot)
                     self.up3 = UpNoSkipWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
-                                                          _get_cross_attention_modules('up3'))
+                                                          _get_cross_attention_modules('up3'), is_slot_attention=use_per_layer_slot)
                 else:
                     if num_layers >= 3:
                         self.up1 = UpWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
-                                                        _get_cross_attention_modules('up1'))
+                                                        _get_cross_attention_modules('up1'), is_slot_attention=use_per_layer_slot)
                     if num_layers >= 2:
                         self.up2 = UpWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
-                                                        _get_cross_attention_modules('up2'))
+                                                        _get_cross_attention_modules('up2'), is_slot_attention=use_per_layer_slot)
                     self.up3 = UpWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('up3'))
+                                                    _get_cross_attention_modules('up3'), is_slot_attention=use_per_layer_slot)
             elif no_skip:
                 # No skip connections - all info must flow through bottleneck
                 if num_layers >= 3:
@@ -1722,17 +1794,30 @@ class DorsalCNN(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()
 
         # Get ir_features for per-layer cross-attention (None if not using)
-        ir_feat = ir_features if (self.cross_attention_per_layer and self.ir_encoder is not None) else None
+        # Must have (use_cross_attention OR use_slot_cross_attention) AND cross_attention_per_layer
+        use_per_layer_regular = self.use_cross_attention and self.cross_attention_per_layer
+        use_per_layer = use_per_layer_regular or self.use_per_layer_slot
+        ir_feat = ir_features if (use_per_layer and self.ir_encoder is not None) else None
+
+        # Compute slots early for per-layer slot cross-attention
+        slot_emb = None
+        slot_masks = None
+        if self.use_per_layer_slot and self.slot_attention is not None:
+            # Compute slot embeddings and masks from IR features
+            if self.use_color_slots or self.use_affinity_slots:
+                slot_emb, slot_masks = self.slot_attention(ir_features, input_grid)
+            else:
+                slot_emb, slot_masks = self.slot_attention(ir_features)
 
         # U-Net forward - encoder
-        if self.cross_attention_per_layer:
-            x1 = self.inc(x, ir_feat)
+        if use_per_layer:
+            x1 = self.inc(x, ir_feat, slot_emb, slot_masks)
             if self.num_layers >= 1:
-                x2 = self.down1(x1, ir_feat)
+                x2 = self.down1(x1, ir_feat, slot_emb, slot_masks)
             if self.num_layers >= 2:
-                x3 = self.down2(x2, ir_feat)
+                x3 = self.down2(x2, ir_feat, slot_emb, slot_masks)
             if self.num_layers >= 3:
-                x4 = self.down3(x3, ir_feat)
+                x4 = self.down3(x3, ir_feat, slot_emb, slot_masks)
         else:
             x1 = self.inc(x)
             if self.num_layers >= 1:
@@ -1756,28 +1841,28 @@ class DorsalCNN(nn.Module):
         if self.num_layers == 0:
             # No encoder/decoder layers - just use bottleneck (which is x1) directly
             x = bottleneck
-        elif self.cross_attention_per_layer and self.no_skip:
+        elif use_per_layer and self.no_skip:
             # Per-layer cross-attention with no skip connections
             if self.num_layers == 3:
-                x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)), ir_features=ir_feat)
-                x = self.up2(x, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat)
-                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
+                x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
+                x = self.up2(x, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
             elif self.num_layers == 2:
-                x = self.up2(bottleneck, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat)
-                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
+                x = self.up2(bottleneck, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
             else:  # num_layers == 1
-                x = self.up3(bottleneck, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
-        elif self.cross_attention_per_layer:
+                x = self.up3(bottleneck, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
+        elif use_per_layer:
             # Per-layer cross-attention with skip connections
             if self.num_layers == 3:
-                x = self.up1(bottleneck, x3, ir_feat)
-                x = self.up2(x, x2, ir_feat)
-                x = self.up3(x, x1, ir_feat)
+                x = self.up1(bottleneck, x3, ir_feat, slot_emb, slot_masks)
+                x = self.up2(x, x2, ir_feat, slot_emb, slot_masks)
+                x = self.up3(x, x1, ir_feat, slot_emb, slot_masks)
             elif self.num_layers == 2:
-                x = self.up2(bottleneck, x2, ir_feat)
-                x = self.up3(x, x1, ir_feat)
+                x = self.up2(bottleneck, x2, ir_feat, slot_emb, slot_masks)
+                x = self.up3(x, x1, ir_feat, slot_emb, slot_masks)
             else:  # num_layers == 1
-                x = self.up3(bottleneck, x1, ir_feat)
+                x = self.up3(bottleneck, x1, ir_feat, slot_emb, slot_masks)
         elif self.no_skip:
             # No skip connections - pass target sizes for proper upsampling
             if self.num_layers == 3:
