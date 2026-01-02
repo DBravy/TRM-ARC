@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -582,16 +583,18 @@ class SpatialSelfAttention(nn.Module):
         k = self.k_proj(x_flat)  # (B, N, C) - "what do I have to offer?"
         v = self.v_proj(x_flat)  # (B, N, C) - "what info to pass along?"
 
-        # Attention scores
-        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
-        attn = F.softmax(scores, dim=-1)
-
-        # Optionally store attention weights for visualization
         if self.capture_attention:
+            # Manual attention to capture weights for visualization
+            scores = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, N, N)
+            attn = F.softmax(scores, dim=-1)
             self.last_attention_weights = attn.detach().cpu()
-
-        # Apply attention to values
-        attended = torch.bmm(attn, v)  # (B, N, C)
+            attended = torch.bmm(attn, v)  # (B, N, C)
+        else:
+            # Use optimized scaled_dot_product_attention
+            # Reshape for SDPA: (B, N, C) -> (B, 1, N, C) to treat as single-head
+            attended = scaled_dot_product_attention(
+                q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+            ).squeeze(1)  # (B, N, C)
 
         # Residual connection
         out = x_flat + attended
@@ -675,16 +678,18 @@ class CrossAttention(nn.Module):
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
 
-        # Attention scores: each output pixel attends to all input pixels (per head)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
-        attn = scores if self.no_softmax else F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
+        if self.no_softmax or self.capture_attention:
+            # Manual attention for no_softmax mode or when capturing weights
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
+            attn = scores if self.no_softmax else F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
 
-        # Optionally store attention weights for visualization (all heads)
-        if self.capture_attention:
-            self.last_attention_weights = attn.detach().cpu()  # (B, num_heads, N, N)
+            if self.capture_attention:
+                self.last_attention_weights = attn.detach().cpu()  # (B, num_heads, N, N)
 
-        # Apply attention: gather information from input based on attention
-        attended = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+            attended = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+        else:
+            # Use optimized scaled_dot_product_attention
+            attended = scaled_dot_product_attention(q, k, v)  # (B, num_heads, N, head_dim)
 
         # Concatenate heads: (B, num_heads, N, head_dim) -> (B, N, proj_dim)
         attended = attended.transpose(1, 2).contiguous().view(B, N, self.proj_dim)
@@ -956,7 +961,7 @@ class AffinitySlotAttention(nn.Module):
     def __init__(self, input_dim: int, slot_dim: int, max_slots: int = 40,
                  use_mlp: bool = True, mlp_hidden_dim: int = 128,
                  w_color: float = 1.0, w_adjacent: float = 1.0, w_bbox: float = 1.0,
-                 merge_threshold: float = 1.5):
+                 merge_threshold: float = 2.5):
         super().__init__()
         self.input_dim = input_dim
         self.slot_dim = slot_dim
@@ -1432,7 +1437,8 @@ class DorsalCNN(nn.Module):
                  num_slots: int = 8, slot_dim: int = 64,
                  slot_iterations: int = 3, slot_mlp_hidden: int = 128,
                  slot_top_k: int = 2,
-                 affinity_max_slots: int = 40):
+                 affinity_max_slots: int = 40,
+                 merge_threshold: float = 2.5):
         super().__init__()
 
         self.num_classes = NUM_COLORS  # Always 10 for color prediction
@@ -1461,6 +1467,7 @@ class DorsalCNN(nn.Module):
         self.use_color_slots = use_color_slots
         self.use_affinity_slots = use_affinity_slots
         self.affinity_max_slots = affinity_max_slots
+        self.merge_threshold = merge_threshold
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.slot_iterations = slot_iterations
@@ -1743,7 +1750,8 @@ class DorsalCNN(nn.Module):
                     slot_dim=slot_dim,
                     max_slots=affinity_max_slots,
                     use_mlp=True,
-                    mlp_hidden_dim=slot_mlp_hidden
+                    mlp_hidden_dim=slot_mlp_hidden,
+                    merge_threshold=merge_threshold
                 )
                 actual_num_slots = affinity_max_slots
             elif use_color_slots:
@@ -3901,6 +3909,8 @@ def main():
                              "Each merged group becomes a slot. Overrides --use-color-slots.")
     parser.add_argument("--affinity-max-slots", type=int, default=40,
                         help="Maximum number of slots for affinity-based slot attention (default: 40)")
+    parser.add_argument("--merge-threshold", type=float, default=2.5,
+                        help="Threshold for merging components in affinity slots (affinity > threshold)")
     parser.add_argument("--slot-top-k", type=int, default=2,
                         help="Number of top slots to compute pixel attention for (default: 2). "
                              "Reduces memory by only attending to top-k most relevant slots per query pixel.")
@@ -4137,6 +4147,7 @@ def main():
         use_affinity_slots=args.use_affinity_slots,
         num_slots=args.num_slots,
         affinity_max_slots=args.affinity_max_slots,
+        merge_threshold=args.merge_threshold,
         slot_dim=args.slot_dim,
         slot_iterations=args.slot_iterations,
         slot_mlp_hidden=args.slot_mlp_hidden,
