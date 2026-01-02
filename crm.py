@@ -276,184 +276,6 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
-class NConvWithCrossAttention(nn.Module):
-    """N consecutive convolutions with cross-attention after each layer.
-
-    Unlike NConv which uses nn.Sequential, this class stores individual layers
-    and applies cross-attention between them.
-
-    Supports both regular CrossAttention and SlotRoutedCrossAttention.
-
-    Args:
-        in_ch: Input channels
-        out_ch: Output channels
-        depth: Number of conv layers
-        kernel_size: Kernel size for all convolutions
-        cross_attention_modules: Either a single CrossAttention/SlotRoutedCrossAttention module (shared)
-                                 or a ModuleList of modules (one per layer)
-        is_slot_attention: If True, use SlotRoutedCrossAttention interface
-
-    For visualization:
-        Set capture_attention=True to store attention weights for each layer.
-        Access via .last_attention_weights (list of per-layer attention weights).
-    """
-    def __init__(self, in_ch: int, out_ch: int, depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None, is_slot_attention: bool = False):
-        super().__init__()
-        self.depth = depth
-        self.out_ch = out_ch
-        self.is_slot_attention = is_slot_attention
-        padding = (kernel_size - 1) // 2
-
-        # Store individual layers instead of Sequential
-        self.convs = nn.ModuleList()
-        self.bns = nn.ModuleList()
-        for i in range(depth):
-            self.convs.append(nn.Conv2d(in_ch if i == 0 else out_ch, out_ch, kernel_size, padding=padding))
-            self.bns.append(nn.BatchNorm2d(out_ch))
-
-        # Cross-attention modules (ModuleList for separate, single module for shared)
-        self.cross_attentions = cross_attention_modules
-        self.shared_attention = not isinstance(cross_attention_modules, nn.ModuleList)
-
-        # For visualization: capture attention weights per layer
-        self.capture_attention = False
-        self.last_attention_weights = None  # List of (layer_idx, attention_weights) when captured
-
-    def forward(self, x, ir_features=None, slot_embeddings=None, slot_masks=None):
-        """
-        Args:
-            x: Input tensor (B, C, H, W)
-            ir_features: IR encoder features (B, H_ir, W_ir, D) for cross-attention
-            slot_embeddings: Slot embeddings (B, K, slot_dim) for slot cross-attention
-            slot_masks: Slot masks (B, K, H_ir, W_ir) for slot cross-attention
-        """
-        if self.capture_attention:
-            self.last_attention_weights = []
-
-        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-            x = F.relu(bn(conv(x)), inplace=True)
-
-            # Apply cross-attention after each layer if available
-            if self.cross_attentions is not None and ir_features is not None:
-                x = self._apply_cross_attention(x, ir_features, i, slot_embeddings, slot_masks)
-        return x
-
-    def _apply_cross_attention(self, x, ir_features, layer_idx, slot_embeddings=None, slot_masks=None):
-        """Apply cross-attention with spatial interpolation if needed."""
-        _, _, H, W = x.shape
-        H_ir, W_ir = ir_features.shape[1], ir_features.shape[2]
-
-        # Interpolate IR features if spatial mismatch
-        if H != H_ir or W != W_ir:
-            # ir_features is (B, H_ir, W_ir, D), need to interpolate spatial dims
-            ir_interp = ir_features.permute(0, 3, 1, 2)  # (B, D, H_ir, W_ir)
-            ir_interp = F.interpolate(ir_interp, size=(H, W), mode='bilinear', align_corners=False)
-            ir_interp = ir_interp.permute(0, 2, 3, 1)  # (B, H, W, D)
-
-            # Also interpolate slot masks if using slot attention
-            if self.is_slot_attention and slot_masks is not None:
-                # slot_masks is (B, K, H_ir, W_ir)
-                slot_masks_interp = F.interpolate(slot_masks, size=(H, W), mode='bilinear', align_corners=False)
-            else:
-                slot_masks_interp = slot_masks
-        else:
-            ir_interp = ir_features
-            slot_masks_interp = slot_masks
-
-        # Get appropriate cross-attention module
-        if self.shared_attention:
-            ca = self.cross_attentions
-        else:
-            ca = self.cross_attentions[layer_idx]
-
-        # Enable attention capture on the cross-attention module if we're capturing
-        if self.capture_attention and hasattr(ca, 'capture_attention'):
-            ca.capture_attention = True
-
-        # Apply cross-attention: x is (B, C, H, W), need (B, H, W, C)
-        x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
-
-        if self.is_slot_attention:
-            # SlotRoutedCrossAttention interface
-            attended = ca(
-                decoder_features=x_perm,
-                slot_embeddings=slot_embeddings,
-                slot_masks=slot_masks_interp,
-                ir_features=ir_interp
-            )
-            # Add residual connection (matching behavior from DorsalCNN.forward)
-            x_perm = x_perm + attended
-        else:
-            # Regular CrossAttention interface
-            x_perm = ca(query=x_perm, key_value=ir_interp)
-
-        # Capture attention weights if enabled
-        if self.capture_attention and hasattr(ca, 'last_attention_weights') and ca.last_attention_weights is not None:
-            self.last_attention_weights.append({
-                'layer_idx': layer_idx,
-                'attention_weights': ca.last_attention_weights,
-                'spatial_size': (H, W),
-                'is_slot_attention': self.is_slot_attention
-            })
-            # Disable capture on the module after grabbing weights
-            if hasattr(ca, 'capture_attention'):
-                ca.capture_attention = False
-
-        return x_perm.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
-
-
-class DownWithCrossAttention(nn.Module):
-    """Encoder block with per-layer cross-attention."""
-    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None, is_slot_attention: bool = False):
-        super().__init__()
-        self.pool = nn.MaxPool2d(2)
-        self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules, is_slot_attention)
-
-    def forward(self, x, ir_features=None, slot_embeddings=None, slot_masks=None):
-        return self.conv(self.pool(x), ir_features, slot_embeddings, slot_masks)
-
-
-class UpWithCrossAttention(nn.Module):
-    """Decoder block with skip connections and per-layer cross-attention."""
-    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None, is_slot_attention: bool = False):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
-        self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules, is_slot_attention)
-
-    def forward(self, x1, x2, ir_features=None, slot_embeddings=None, slot_masks=None):
-        x1 = self.up(x1)
-        diff_h = x2.size(2) - x1.size(2)
-        diff_w = x2.size(3) - x1.size(3)
-        x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2,
-                       diff_h // 2, diff_h - diff_h // 2])
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x, ir_features, slot_embeddings, slot_masks)
-
-
-class UpNoSkipWithCrossAttention(nn.Module):
-    """Decoder block without skip connections but with per-layer cross-attention."""
-    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
-                 cross_attention_modules=None, is_slot_attention: bool = False):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.conv = NConvWithCrossAttention(out_ch, out_ch, conv_depth, kernel_size,
-                                            cross_attention_modules, is_slot_attention)
-
-    def forward(self, x, target_size=None, ir_features=None, slot_embeddings=None, slot_masks=None):
-        x = self.up(x)
-        if target_size is not None:
-            diff_h = target_size[0] - x.size(2)
-            diff_w = target_size[1] - x.size(3)
-            x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2,
-                         diff_h // 2, diff_h - diff_h // 2])
-        return self.conv(x, ir_features, slot_embeddings, slot_masks)
-
-
 class VentralCNN(nn.Module):
     """
     Instance Recognition encoder - produces features per pixel.
@@ -651,11 +473,14 @@ class CrossAttention(nn.Module):
         self.capture_attention = False
         self.last_attention_weights = None  # (B, num_heads, H*W, H*W) when captured
 
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor,
+                query_content_mask: torch.Tensor = None, kv_content_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             query: Output embeddings (B, H, W, query_dim) - queries come from here
             key_value: Input embeddings (B, H, W, kv_dim) - keys and values come from here
+            query_content_mask: (B, H, W) binary mask, 1 for content, 0 for padding (optional)
+            kv_content_mask: (B, H, W) binary mask for key/value positions (optional)
 
         Returns:
             Attended output embeddings (B, H, W, query_dim)
@@ -678,9 +503,25 @@ class CrossAttention(nn.Module):
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, N, head_dim)
 
+        # Build attention mask from content masks if provided
+        # Queries from content should only attend to content key/value positions
+        attn_mask = None
+        if kv_content_mask is not None:
+            # kv_content_mask: (B, H, W) -> (B, N) -> (B, 1, 1, N) for broadcasting
+            kv_mask_flat = kv_content_mask.reshape(B, N)  # (B, N)
+            # Mask for keys: queries can only attend to valid key positions
+            attn_mask = kv_mask_flat.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
+            # Convert to additive mask: 0 for valid, -inf for padding
+            attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, 0.0)
+
         if self.no_softmax or self.capture_attention:
             # Manual attention for no_softmax mode or when capturing weights
             scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
+
+            # Apply attention mask if provided
+            if attn_mask is not None:
+                scores = scores + attn_mask
+
             attn = scores if self.no_softmax else F.softmax(scores, dim=-1)  # (B, num_heads, N, N)
 
             if self.capture_attention:
@@ -689,7 +530,7 @@ class CrossAttention(nn.Module):
             attended = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
         else:
             # Use optimized scaled_dot_product_attention
-            attended = scaled_dot_product_attention(q, k, v)  # (B, num_heads, N, head_dim)
+            attended = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (B, num_heads, N, head_dim)
 
         # Concatenate heads: (B, num_heads, N, head_dim) -> (B, N, proj_dim)
         attended = attended.transpose(1, 2).contiguous().view(B, N, self.proj_dim)
@@ -754,10 +595,11 @@ class SlotAttention(nn.Module):
             nn.Linear(mlp_hidden_dim, slot_dim),
         )
 
-    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features: torch.Tensor, content_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             features: (B, H, W, D) per-pixel features from IR encoder
+            content_mask: (B, H, W) binary mask, 1 for content, 0 for padding (optional)
 
         Returns:
             slots: (B, K, slot_dim) slot embeddings
@@ -773,6 +615,12 @@ class SlotAttention(nn.Module):
         # Project inputs to keys and values
         k = self.to_k(inputs)  # (B, N, slot_dim)
         v = self.to_v(inputs)  # (B, N, slot_dim)
+
+        # Prepare content mask for attention if provided
+        # content_mask_flat: (B, N) where 1 = valid content, 0 = padding
+        content_mask_flat = None
+        if content_mask is not None:
+            content_mask_flat = content_mask.reshape(B, N).float()  # (B, N)
 
         # Initialize slots from learnable prototypes with noise
         slots = self.slot_mu + torch.exp(self.slot_log_sigma) * torch.randn_like(
@@ -799,9 +647,15 @@ class SlotAttention(nn.Module):
             # Softmax over slots (competition) - each pixel picks which slot(s)
             attn = F.softmax(attn_logits, dim=-1)  # (B, N, K)
 
+            # Mask out padding pixels - they shouldn't contribute to slot updates
+            if content_mask_flat is not None:
+                # Zero out attention from padding pixels
+                attn = attn * content_mask_flat.unsqueeze(-1)  # (B, N, K)
+
             # Weighted mean: aggregate inputs to each slot
             # attn_weights: (B, K, N) - for each slot, weights over pixels
             attn_weights = attn.transpose(1, 2)  # (B, K, N)
+            # Normalize by sum of weights (only content pixels contribute)
             attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
 
             # Aggregate values to slots
@@ -1477,13 +1331,15 @@ class SlotRoutedCrossAttention(nn.Module):
         self.out_proj = nn.Linear(proj_dim, query_dim)
 
     def forward(self, decoder_features: torch.Tensor, slot_embeddings: torch.Tensor,
-                slot_masks: torch.Tensor, ir_features: torch.Tensor) -> torch.Tensor:
+                slot_masks: torch.Tensor, ir_features: torch.Tensor,
+                content_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             decoder_features: (B, H_out, W_out, C) from U-Net decoder
             slot_embeddings: (B, K, slot_dim) from SlotAttention (unused in this implementation)
             slot_masks: (B, K, H_in, W_in) from SlotAttention
             ir_features: (B, H_in, W_in, D) from IR encoder
+            content_mask: (B, H_in, W_in) binary mask, 1 for content, 0 for padding (optional)
 
         Returns:
             output: (B, H_out, W_out, C) attended features for residual addition
@@ -1512,6 +1368,9 @@ class SlotRoutedCrossAttention(nn.Module):
 
         # Step 3: Compute binary masks and detect empty slots
         masks_binary = (slot_masks > 0.1).float()  # (B, K, H_in, W_in)
+        # Also mask out padding pixels if content_mask provided
+        if content_mask is not None:
+            masks_binary = masks_binary * content_mask.unsqueeze(1)  # (B, K, H_in, W_in)
         masks_binary_flat = masks_binary.reshape(B, K, N_in)  # (B, K, N_in)
 
         # Detect empty slots (no pixels belong to this slot)
@@ -1596,8 +1455,6 @@ class DorsalCNN(nn.Module):
                  use_attention: bool = False, use_cross_attention: bool = False,
                  cross_attention_heads: int = 1, cross_attention_position: str = "late",
                  cross_attention_no_softmax: bool = False,
-                 cross_attention_per_layer: bool = False,
-                 cross_attention_shared: bool = False,
                  ir_checkpoint: str = None, use_untrained_ir: bool = False,
                  ir_hidden_dim: int = 128, ir_out_dim: int = 64,
                  ir_num_layers: int = 3, ir_kernel_size: int = 3,
@@ -1610,7 +1467,7 @@ class DorsalCNN(nn.Module):
                  slot_iterations: int = 3, slot_mlp_hidden: int = 128,
                  slot_top_k: int = 2,
                  affinity_max_slots: int = 40,
-                 merge_threshold: float = 2.5,
+                 merge_threshold: float = 1.0,
                  use_background_detection: bool = True):
         super().__init__()
 
@@ -1626,8 +1483,6 @@ class DorsalCNN(nn.Module):
         self.cross_attention_heads = cross_attention_heads
         self.cross_attention_position = cross_attention_position
         self.cross_attention_no_softmax = cross_attention_no_softmax
-        self.cross_attention_per_layer = cross_attention_per_layer
-        self.cross_attention_shared = cross_attention_shared
         self.ir_checkpoint = ir_checkpoint
         self.use_untrained_ir = use_untrained_ir
         self.ir_hidden_dim = ir_hidden_dim
@@ -1712,153 +1567,18 @@ class DorsalCNN(nn.Module):
 
         base_ch = hidden_dim
 
-        # Per-layer cross-attention modules (created before blocks so blocks can reference them)
-        self.per_layer_cross_attentions = None
-        self.shared_cross_attention = None
-        self.per_layer_slot_cross_attentions = None
-        self.shared_slot_cross_attention = None
-
-        # Determine if we're using per-layer cross-attention (regular or slot-routed)
-        use_per_layer_regular = use_cross_attention and cross_attention_per_layer
-        use_per_layer_slot = use_slot_cross_attention and cross_attention_per_layer
-        use_per_layer = use_per_layer_regular or use_per_layer_slot
-        self.use_per_layer_slot = use_per_layer_slot  # Store for forward pass
-
-        # Block configurations: (name, output_channels)
-        # inc always exists, down/up blocks depend on num_layers
-        block_configs = [('inc', base_ch)]
-        if num_layers >= 1:
-            block_configs.append(('down1', base_ch * 2))
-        if num_layers >= 2:
-            block_configs.append(('down2', base_ch * 4))
-        if num_layers >= 3:
-            block_configs.append(('down3', base_ch * 8))
-        if num_layers >= 3:
-            block_configs.append(('up1', base_ch * 4))
-        if num_layers >= 2:
-            block_configs.append(('up2', base_ch * 2))
-        if num_layers >= 1:
-            block_configs.append(('up3', base_ch))
-
-        # Create regular CrossAttention modules for per-layer use
-        if use_per_layer_regular:
-            if cross_attention_shared:
-                # Single shared cross-attention module
-                self.shared_cross_attention = CrossAttention(
-                    query_dim=base_ch,
-                    kv_dim=self.ir_feature_dim,
-                    proj_dim=base_ch,
-                    num_heads=cross_attention_heads,
-                    no_softmax=cross_attention_no_softmax
-                )
-            else:
-                # Separate cross-attention modules per block per layer
-                self.per_layer_cross_attentions = nn.ModuleDict()
-                for block_name, out_ch in block_configs:
-                    for layer_idx in range(conv_depth):
-                        key = f"{block_name}_layer{layer_idx}"
-                        self.per_layer_cross_attentions[key] = CrossAttention(
-                            query_dim=out_ch,
-                            kv_dim=self.ir_feature_dim,
-                            proj_dim=out_ch,
-                            num_heads=cross_attention_heads,
-                            no_softmax=cross_attention_no_softmax
-                        )
-
-        # Create SlotRoutedCrossAttention modules for per-layer use
-        # Note: SlotAttention is created later in the use_slot_cross_attention block
-        if use_per_layer_slot:
-            if cross_attention_shared:
-                # Single shared slot cross-attention module
-                self.shared_slot_cross_attention = SlotRoutedCrossAttention(
-                    query_dim=base_ch,
-                    slot_dim=slot_dim,
-                    value_dim=self.ir_feature_dim if self.ir_feature_dim else ir_out_dim,
-                    proj_dim=slot_dim,
-                    top_k=slot_top_k
-                )
-            else:
-                # Separate slot cross-attention modules per block per layer
-                self.per_layer_slot_cross_attentions = nn.ModuleDict()
-                for block_name, out_ch in block_configs:
-                    for layer_idx in range(conv_depth):
-                        key = f"{block_name}_layer{layer_idx}"
-                        self.per_layer_slot_cross_attentions[key] = SlotRoutedCrossAttention(
-                            query_dim=out_ch,
-                            slot_dim=slot_dim,
-                            value_dim=self.ir_feature_dim if self.ir_feature_dim else ir_out_dim,
-                            proj_dim=slot_dim,
-                            top_k=slot_top_k
-                        )
-
-        def _get_cross_attention_modules(block_name):
-            """Helper to get cross-attention modules for a block."""
-            if use_per_layer_slot:
-                # Use slot cross-attention modules
-                if cross_attention_shared:
-                    return self.shared_slot_cross_attention
-                else:
-                    modules = nn.ModuleList([
-                        self.per_layer_slot_cross_attentions[f"{block_name}_layer{i}"]
-                        for i in range(conv_depth)
-                    ])
-                    return modules
-            elif use_per_layer_regular:
-                # Use regular cross-attention modules
-                if cross_attention_shared:
-                    return self.shared_cross_attention
-                else:
-                    modules = nn.ModuleList([
-                        self.per_layer_cross_attentions[f"{block_name}_layer{i}"]
-                        for i in range(conv_depth)
-                    ])
-                    return modules
-            return None
-
         # Encoder - create layers based on num_layers
-        if use_per_layer:
-            self.inc = NConvWithCrossAttention(in_channels, base_ch, conv_depth, kernel_size,
-                                               _get_cross_attention_modules('inc'), is_slot_attention=use_per_layer_slot)
-            if num_layers >= 1:
-                self.down1 = DownWithCrossAttention(base_ch, base_ch * 2, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down1'), is_slot_attention=use_per_layer_slot)
-            if num_layers >= 2:
-                self.down2 = DownWithCrossAttention(base_ch * 2, base_ch * 4, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down2'), is_slot_attention=use_per_layer_slot)
-            if num_layers >= 3:
-                self.down3 = DownWithCrossAttention(base_ch * 4, base_ch * 8, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('down3'), is_slot_attention=use_per_layer_slot)
-        else:
-            self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
-            if num_layers >= 1:
-                self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
-            if num_layers >= 2:
-                self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
-            if num_layers >= 3:
-                self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
+        self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
+        if num_layers >= 1:
+            self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
+        if num_layers >= 2:
+            self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
+        if num_layers >= 3:
+            self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
 
         # Decoder - create layers based on num_layers (no up layers needed for num_layers=0)
         if num_layers >= 1:
-            if use_per_layer:
-                if no_skip:
-                    if num_layers >= 3:
-                        self.up1 = UpNoSkipWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
-                                                              _get_cross_attention_modules('up1'), is_slot_attention=use_per_layer_slot)
-                    if num_layers >= 2:
-                        self.up2 = UpNoSkipWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
-                                                              _get_cross_attention_modules('up2'), is_slot_attention=use_per_layer_slot)
-                    self.up3 = UpNoSkipWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
-                                                          _get_cross_attention_modules('up3'), is_slot_attention=use_per_layer_slot)
-                else:
-                    if num_layers >= 3:
-                        self.up1 = UpWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
-                                                        _get_cross_attention_modules('up1'), is_slot_attention=use_per_layer_slot)
-                    if num_layers >= 2:
-                        self.up2 = UpWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
-                                                        _get_cross_attention_modules('up2'), is_slot_attention=use_per_layer_slot)
-                    self.up3 = UpWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
-                                                    _get_cross_attention_modules('up3'), is_slot_attention=use_per_layer_slot)
-            elif no_skip:
+            if no_skip:
                 # No skip connections - all info must flow through bottleneck
                 if num_layers >= 3:
                     self.up1 = UpNoSkip(base_ch * 8, base_ch * 4, conv_depth, kernel_size)
@@ -1983,13 +1703,18 @@ class DorsalCNN(nn.Module):
         Returns:
             pixel_logits (B, 10, H, W)
         """
+        # Create content mask for attention efficiency (mask out padding pixels)
+        # content_mask: (B, H, W) where 1 = valid content, 0 = padding
+        input_content_mask = (input_grid < 10).float()  # (B, H, W)
+        output_content_mask = (output_grid < 10).float()  # (B, H, W)
+
         # Compute IR features for cross-attention
         if self.ir_encoder is not None:
             # Clamp padding sentinel (10) to 0 and zero out padding positions
             inp_clamped = input_grid.clamp(max=9)
             inp_onehot = F.one_hot(inp_clamped.long(), NUM_COLORS).float()
-            content_mask = (input_grid < 10).float().unsqueeze(-1)  # (B, H, W, 1)
-            inp_onehot = inp_onehot * content_mask  # Zero out padding
+            content_mask_expanded = input_content_mask.unsqueeze(-1)  # (B, H, W, 1)
+            inp_onehot = inp_onehot * content_mask_expanded  # Zero out padding
             inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
             ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
 
@@ -2001,7 +1726,10 @@ class DorsalCNN(nn.Module):
 
         # Early cross-attention: output embeddings attend to IR features (before CNN)
         if self.cross_attention is not None and self.cross_attention_position == "early":
-            out_emb = self.cross_attention(query=out_emb, key_value=ir_features)
+            out_emb = self.cross_attention(
+                query=out_emb, key_value=ir_features,
+                query_content_mask=output_content_mask, kv_content_mask=input_content_mask
+            )
 
         # Encode input grid for U-Net concatenation (always use original embeddings)
         if self.use_onehot:
@@ -2014,39 +1742,14 @@ class DorsalCNN(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous()
 
-        # Get ir_features for per-layer cross-attention (None if not using)
-        # Must have (use_cross_attention OR use_slot_cross_attention) AND cross_attention_per_layer
-        use_per_layer_regular = self.use_cross_attention and self.cross_attention_per_layer
-        use_per_layer = use_per_layer_regular or self.use_per_layer_slot
-        ir_feat = ir_features if (use_per_layer and self.ir_encoder is not None) else None
-
-        # Compute slots early for per-layer slot cross-attention
-        slot_emb = None
-        slot_masks = None
-        if self.use_per_layer_slot and self.slot_attention is not None:
-            # Compute slot embeddings and masks from IR features
-            if self.use_color_slots or self.use_affinity_slots:
-                slot_emb, slot_masks = self.slot_attention(ir_features, input_grid)
-            else:
-                slot_emb, slot_masks = self.slot_attention(ir_features)
-
         # U-Net forward - encoder
-        if use_per_layer:
-            x1 = self.inc(x, ir_feat, slot_emb, slot_masks)
-            if self.num_layers >= 1:
-                x2 = self.down1(x1, ir_feat, slot_emb, slot_masks)
-            if self.num_layers >= 2:
-                x3 = self.down2(x2, ir_feat, slot_emb, slot_masks)
-            if self.num_layers >= 3:
-                x4 = self.down3(x3, ir_feat, slot_emb, slot_masks)
-        else:
-            x1 = self.inc(x)
-            if self.num_layers >= 1:
-                x2 = self.down1(x1)
-            if self.num_layers >= 2:
-                x3 = self.down2(x2)
-            if self.num_layers >= 3:
-                x4 = self.down3(x3)
+        x1 = self.inc(x)
+        if self.num_layers >= 1:
+            x2 = self.down1(x1)
+        if self.num_layers >= 2:
+            x3 = self.down2(x2)
+        if self.num_layers >= 3:
+            x4 = self.down3(x3)
 
         # Determine bottleneck based on num_layers
         if self.num_layers == 0:
@@ -2062,28 +1765,6 @@ class DorsalCNN(nn.Module):
         if self.num_layers == 0:
             # No encoder/decoder layers - just use bottleneck (which is x1) directly
             x = bottleneck
-        elif use_per_layer and self.no_skip:
-            # Per-layer cross-attention with no skip connections
-            if self.num_layers == 3:
-                x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-                x = self.up2(x, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-            elif self.num_layers == 2:
-                x = self.up2(bottleneck, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-            else:  # num_layers == 1
-                x = self.up3(bottleneck, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat, slot_embeddings=slot_emb, slot_masks=slot_masks)
-        elif use_per_layer:
-            # Per-layer cross-attention with skip connections
-            if self.num_layers == 3:
-                x = self.up1(bottleneck, x3, ir_feat, slot_emb, slot_masks)
-                x = self.up2(x, x2, ir_feat, slot_emb, slot_masks)
-                x = self.up3(x, x1, ir_feat, slot_emb, slot_masks)
-            elif self.num_layers == 2:
-                x = self.up2(bottleneck, x2, ir_feat, slot_emb, slot_masks)
-                x = self.up3(x, x1, ir_feat, slot_emb, slot_masks)
-            else:  # num_layers == 1
-                x = self.up3(bottleneck, x1, ir_feat, slot_emb, slot_masks)
         elif self.no_skip:
             # No skip connections - pass target sizes for proper upsampling
             if self.num_layers == 3:
@@ -2117,7 +1798,10 @@ class DorsalCNN(nn.Module):
             # x is (B, C, H, W), need (B, H, W, C) for attention
             x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, hidden_dim)
             # ir_features is (B, H, W, ir_feature_dim) from earlier computation
-            x_perm = self.cross_attention(query=x_perm, key_value=ir_features)
+            x_perm = self.cross_attention(
+                query=x_perm, key_value=ir_features,
+                query_content_mask=output_content_mask, kv_content_mask=input_content_mask
+            )
             x = x_perm.permute(0, 3, 1, 2).contiguous()  # Back to (B, C, H, W)
 
         # Apply slot-routed cross-attention if enabled
@@ -2127,7 +1811,7 @@ class DorsalCNN(nn.Module):
             if self.use_color_slots or self.use_affinity_slots:
                 slot_embeddings, slot_masks = self.slot_attention(ir_features, input_grid)
             else:
-                slot_embeddings, slot_masks = self.slot_attention(ir_features)
+                slot_embeddings, slot_masks = self.slot_attention(ir_features, content_mask=input_content_mask)
 
             # Permute decoder features for attention: (B, C, H, W) -> (B, H, W, C)
             x_perm = x.permute(0, 2, 3, 1).contiguous()
@@ -2137,7 +1821,8 @@ class DorsalCNN(nn.Module):
                 decoder_features=x_perm,
                 slot_embeddings=slot_embeddings,
                 slot_masks=slot_masks,
-                ir_features=ir_features
+                ir_features=ir_features,
+                content_mask=input_content_mask
             )
 
             # Residual connection (or direct replacement if no_residual)
@@ -2191,8 +1876,6 @@ class DorsalCNN(nn.Module):
         cross_attention_heads = args.get('cross_attention_heads', 1)
         cross_attention_position = args.get('cross_attention_position', 'late')
         cross_attention_no_softmax = args.get('cross_attention_no_softmax', False)
-        cross_attention_per_layer = args.get('cross_attention_per_layer', False)
-        cross_attention_shared = args.get('cross_attention_shared', False)
         ir_checkpoint = args.get('ir_checkpoint', None)
         use_untrained_ir = args.get('use_untrained_ir', False)
         ir_hidden_dim = args.get('ir_hidden_dim', 128)
@@ -2227,8 +1910,6 @@ class DorsalCNN(nn.Module):
             cross_attention_heads=cross_attention_heads,
             cross_attention_position=cross_attention_position,
             cross_attention_no_softmax=cross_attention_no_softmax,
-            cross_attention_per_layer=cross_attention_per_layer,
-            cross_attention_shared=cross_attention_shared,
             ir_checkpoint=ir_checkpoint,
             use_untrained_ir=use_untrained_ir,
             ir_hidden_dim=ir_hidden_dim,
@@ -2254,102 +1935,6 @@ class DorsalCNN(nn.Module):
         if device:
             model = model.to(device)
         return model
-
-
-# =============================================================================
-# Critic CNN - Predicts which pixels are wrong from output only
-# =============================================================================
-
-class CriticCNN(nn.Module):
-    """
-    Critic network that predicts which pixels are wrong in a predicted output.
-
-    Only sees the predicted output grid - no input, no ground truth at inference.
-    Trained concurrently with DorsalCNN to learn error patterns.
-
-    Architecture: Simplified U-Net
-    - Input: predicted output grid (10 channels one-hot)
-    - Output: per-pixel error probability (1 channel, sigmoid)
-    """
-
-    def __init__(self, hidden_dim: int = 32, num_layers: int = 3,
-                 conv_depth: int = 2, kernel_size: int = 3):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.conv_depth = conv_depth
-        self.kernel_size = kernel_size
-
-        # Input: one-hot encoded grid (10 channels)
-        in_channels = NUM_COLORS  # 10
-        base_ch = hidden_dim
-
-        # Encoder
-        self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
-        if num_layers >= 1:
-            self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
-        if num_layers >= 2:
-            self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
-        if num_layers >= 3:
-            self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
-
-        # Decoder with skip connections
-        if num_layers >= 3:
-            self.up1 = Up(base_ch * 8, base_ch * 4, conv_depth, kernel_size)
-        if num_layers >= 2:
-            self.up2 = Up(base_ch * 4, base_ch * 2, conv_depth, kernel_size)
-        if num_layers >= 1:
-            self.up3 = Up(base_ch * 2, base_ch, conv_depth, kernel_size)
-
-        # Output: single channel (error probability)
-        self.outc = nn.Conv2d(base_ch, 1, kernel_size=1)
-
-    def forward(self, pred_grid: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pred_grid: (B, H, W) predicted output grid with values 0-9
-
-        Returns:
-            error_probs: (B, 1, H, W) probability each pixel is wrong
-        """
-        # One-hot encode the predicted grid
-        x = F.one_hot(pred_grid.long(), NUM_COLORS).float()  # (B, H, W, 10)
-        x = x.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
-
-        # Encoder path
-        x1 = self.inc(x)  # (B, base_ch, H, W)
-
-        if self.num_layers >= 1:
-            x2 = self.down1(x1)  # (B, base_ch*2, H/2, W/2)
-        if self.num_layers >= 2:
-            x3 = self.down2(x2)  # (B, base_ch*4, H/4, W/4)
-        if self.num_layers >= 3:
-            x4 = self.down3(x3)  # (B, base_ch*8, H/8, W/8)
-
-        # Decoder path with skip connections
-        if self.num_layers >= 3:
-            x = self.up1(x4, x3)
-        else:
-            x = x3 if self.num_layers >= 2 else (x2 if self.num_layers >= 1 else x1)
-        if self.num_layers >= 2:
-            x = self.up2(x, x2)
-        if self.num_layers >= 1:
-            x = self.up3(x, x1)
-
-        # Output layer (no sigmoid - use BCEWithLogitsLoss)
-        logits = self.outc(x)  # (B, 1, H, W)
-        return logits
-
-    def predict_errors(self, pred_grid: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-        """Return binary error prediction."""
-        logits = self.forward(pred_grid)
-        probs = torch.sigmoid(logits)
-        return (probs > threshold).float().squeeze(1)  # (B, H, W)
-
-    def predict_proba(self, pred_grid: torch.Tensor) -> torch.Tensor:
-        """Return error probabilities."""
-        logits = self.forward(pred_grid)
-        return torch.sigmoid(logits).squeeze(1)  # (B, H, W)
 
 
 # =============================================================================
@@ -2786,111 +2371,6 @@ def visualize_prediction(
     print()
 
 
-def visualize_critic_prediction(
-    pred_output: np.ndarray,
-    ground_truth: np.ndarray,
-    critic_pred_errors: np.ndarray,
-    out_h: int,
-    out_w: int,
-    puzzle_id: str = "",
-):
-    """
-    Visualize critic's error predictions vs actual errors.
-
-    Shows:
-    - Predicted output from main model
-    - Ground truth
-    - Actual errors (where prediction != truth)
-    - Critic's predicted errors
-    - Color coding: TP=green, FP=yellow, FN=red, TN=default
-
-    Args:
-        pred_output: (H, W) predicted output grid from main model
-        ground_truth: (H, W) ground truth grid
-        critic_pred_errors: (H, W) binary mask of critic's error predictions
-        out_h, out_w: actual output dimensions (to crop padding)
-        puzzle_id: optional puzzle identifier
-    """
-    # Color codes for terminal
-    COLORS = [
-        '\033[48;5;0m',    # 0: black
-        '\033[48;5;21m',   # 1: blue
-        '\033[48;5;196m',  # 2: red
-        '\033[48;5;46m',   # 3: green
-        '\033[48;5;226m',  # 4: yellow
-        '\033[48;5;250m',  # 5: gray
-        '\033[48;5;201m',  # 6: magenta
-        '\033[48;5;208m',  # 7: orange
-        '\033[48;5;51m',   # 8: cyan
-        '\033[48;5;88m',   # 9: maroon
-    ]
-    RESET = '\033[0m'
-    GREEN_BG = '\033[42m\033[30m'  # TP: correctly predicted error
-    YELLOW_BG = '\033[43m\033[30m'  # FP: predicted error but was correct
-    RED_BG = '\033[41m\033[97m'    # FN: missed error
-
-    # Crop to actual dimensions
-    pred = pred_output[:out_h, :out_w]
-    truth = ground_truth[:out_h, :out_w]
-    critic_pred = critic_pred_errors[:out_h, :out_w]
-
-    # Compute actual errors
-    actual_errors = (pred != truth)
-
-    # Compute confusion matrix elements
-    tp = (critic_pred & actual_errors).sum()
-    fp = (critic_pred & ~actual_errors).sum()
-    fn = (~critic_pred & actual_errors).sum()
-    tn = (~critic_pred & ~actual_errors).sum()
-
-    # Metrics
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-    print(f"\n{'='*60}")
-    print(f"CRITIC EVALUATION {puzzle_id}")
-    print(f"{'='*60}")
-    print(f"Precision: {precision:.3f}  Recall: {recall:.3f}  F1: {f1:.3f}")
-    print(f"TP: {tp}  FP: {fp}  FN: {fn}  TN: {tn}")
-    print(f"Total errors: {actual_errors.sum()}  Predicted errors: {critic_pred.sum()}")
-    print(f"{'='*60}")
-
-    def print_grid(grid, label, rows, cols):
-        print(f"\n{label}:")
-        for r in range(rows):
-            row_str = "  "
-            for c in range(cols):
-                val = grid[r, c]
-                row_str += f"{COLORS[val]}{val}{RESET} "
-            print(row_str)
-
-    def print_error_grid(actual, predicted, label, rows, cols):
-        """Print error grid with TP/FP/FN highlighting."""
-        print(f"\n{label}:")
-        print("  (green=TP, yellow=FP, red=FN)")
-        for r in range(rows):
-            row_str = "  "
-            for c in range(cols):
-                is_actual = actual[r, c]
-                is_pred = predicted[r, c]
-                if is_pred and is_actual:
-                    row_str += f"{GREEN_BG}X{RESET} "  # TP
-                elif is_pred and not is_actual:
-                    row_str += f"{YELLOW_BG}X{RESET} "  # FP
-                elif not is_pred and is_actual:
-                    row_str += f"{RED_BG}X{RESET} "  # FN
-                else:
-                    row_str += ". "  # TN
-            print(row_str)
-
-    # Print grids
-    print_grid(pred, "MAIN MODEL OUTPUT", out_h, out_w)
-    print_grid(truth, "GROUND TRUTH", out_h, out_w)
-    print_error_grid(actual_errors, critic_pred, "CRITIC ERROR PREDICTION", out_h, out_w)
-    print()
-
-
 def evaluate_test_examples(
     model: nn.Module,
     dataset: TestEvalDataset,
@@ -3286,13 +2766,9 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    critic: nn.Module = None,  # Optional critic CNN for error prediction
-    critic_optimizer: torch.optim.Optimizer = None,  # Critic optimizer
 ) -> Dict[str, float]:
-    """Training epoch for color prediction (and optionally critic)"""
+    """Training epoch for color prediction"""
     model.train()
-    if critic is not None:
-        critic.train()
 
     total_loss = 0.0
     total_pixel_loss = 0.0
@@ -3301,13 +2777,6 @@ def train_epoch(
     total_error_pixels = 0
     total_error_color_correct = 0
     num_batches = 0
-
-    # Critic metrics
-    total_critic_loss = 0.0
-    total_critic_tp = 0  # True positives (correctly predicted errors)
-    total_critic_fp = 0  # False positives (predicted error but was correct)
-    total_critic_fn = 0  # False negatives (missed errors)
-    total_critic_tn = 0  # True negatives (correctly predicted correct)
 
     pbar = tqdm(loader, desc="Training")
     for input_grid, output_grid, target_colors, pixel_mask, output_dims in pbar:
@@ -3331,56 +2800,8 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        # Get predicted colors for critic and metrics
         with torch.no_grad():
             pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
-
-        # Train critic if provided
-        if critic is not None and critic_optimizer is not None:
-            critic_optimizer.zero_grad()
-
-            # Critic sees only the predicted colors (detached from main model)
-            critic_input = pred_colors.detach()
-
-            # Critic predicts error logits
-            error_logits = critic(critic_input)  # (B, 1, H, W)
-            error_logits = error_logits.squeeze(1)  # (B, H, W)
-
-            # Actual errors: where prediction differs from target (only in content region)
-            actual_errors = (pred_colors != target_colors).float()  # (B, H, W)
-
-            # BCE loss with masking to content region
-            # pos_weight helps with class imbalance (errors are often rare later in training)
-            bce_loss = F.binary_cross_entropy_with_logits(
-                error_logits, actual_errors, reduction='none'
-            )
-            # Mask to content region
-            masked_bce = bce_loss * content_mask
-            critic_loss = masked_bce.sum() / content_mask.sum().clamp(min=1)
-
-            critic_loss.backward()
-            critic_optimizer.step()
-
-            # Track critic metrics
-            with torch.no_grad():
-                pred_errors = (torch.sigmoid(error_logits) > 0.5).float()
-                actual_bool = actual_errors.bool()
-                pred_bool = pred_errors.bool()
-                content_bool = content_mask.bool()
-
-                # Only count within content region
-                tp = ((pred_bool & actual_bool) & content_bool).sum().item()
-                fp = ((pred_bool & ~actual_bool) & content_bool).sum().item()
-                fn = ((~pred_bool & actual_bool) & content_bool).sum().item()
-                tn = ((~pred_bool & ~actual_bool) & content_bool).sum().item()
-
-                total_critic_tp += tp
-                total_critic_fp += fp
-                total_critic_fn += fn
-                total_critic_tn += tn
-                total_critic_loss += critic_loss.item()
-
-        with torch.no_grad():
 
             # Overall color accuracy - only on content pixels (not padding)
             content_mask_bool = content_mask.bool()
@@ -3413,23 +2834,6 @@ def train_epoch(
         "error_color_accuracy": error_color_accuracy,
     }
 
-    # Add critic metrics if applicable
-    if critic is not None:
-        metrics["critic_loss"] = total_critic_loss / max(num_batches, 1)
-        # Precision: of predicted errors, how many were actually errors
-        precision = total_critic_tp / max(total_critic_tp + total_critic_fp, 1)
-        # Recall: of actual errors, how many did we catch
-        recall = total_critic_tp / max(total_critic_tp + total_critic_fn, 1)
-        # F1 score
-        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-        metrics["critic_precision"] = precision
-        metrics["critic_recall"] = recall
-        metrics["critic_f1"] = f1
-        metrics["critic_tp"] = total_critic_tp
-        metrics["critic_fp"] = total_critic_fp
-        metrics["critic_fn"] = total_critic_fn
-        metrics["critic_tn"] = total_critic_tn
-
     return metrics
 
 
@@ -3437,12 +2841,9 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    critic: nn.Module = None,  # Optional critic CNN for error prediction
 ) -> Dict[str, float]:
-    """Evaluation for color prediction (and optionally critic)"""
+    """Evaluation for color prediction"""
     model.eval()
-    if critic is not None:
-        critic.eval()
 
     total_loss = 0.0
     total_pixel_loss = 0.0
@@ -3453,13 +2854,6 @@ def evaluate(
     total_perfect = 0
     total_samples = 0
     num_batches = 0
-
-    # Critic metrics
-    total_critic_loss = 0.0
-    total_critic_tp = 0
-    total_critic_fp = 0
-    total_critic_fn = 0
-    total_critic_tn = 0
 
     with torch.no_grad():
         for input_grid, output_grid, target_colors, pixel_mask, output_dims in loader:
@@ -3479,38 +2873,6 @@ def evaluate(
             loss = pixel_loss
 
             pred_colors = pixel_logits.argmax(dim=1)  # (B, H, W)
-
-            # Evaluate critic if provided
-            if critic is not None:
-                error_logits = critic(pred_colors)  # (B, 1, H, W)
-                error_logits = error_logits.squeeze(1)  # (B, H, W)
-
-                # Actual errors
-                actual_errors = (pred_colors != target_colors).float()
-
-                # BCE loss
-                bce_loss = F.binary_cross_entropy_with_logits(
-                    error_logits, actual_errors, reduction='none'
-                )
-                masked_bce = bce_loss * content_mask
-                critic_loss = masked_bce.sum() / content_mask.sum().clamp(min=1)
-                total_critic_loss += critic_loss.item()
-
-                # Critic metrics
-                pred_errors = (torch.sigmoid(error_logits) > 0.5).float()
-                actual_bool = actual_errors.bool()
-                pred_bool = pred_errors.bool()
-                content_bool = content_mask.bool()
-
-                tp = ((pred_bool & actual_bool) & content_bool).sum().item()
-                fp = ((pred_bool & ~actual_bool) & content_bool).sum().item()
-                fn = ((~pred_bool & actual_bool) & content_bool).sum().item()
-                tn = ((~pred_bool & ~actual_bool) & content_bool).sum().item()
-
-                total_critic_tp += tp
-                total_critic_fp += fp
-                total_critic_fn += fn
-                total_critic_tn += tn
 
             # Overall color accuracy - only on content pixels (not padding)
             content_mask_bool = content_mask.bool()
@@ -3550,32 +2912,18 @@ def evaluate(
         "perfect_rate": perfect_rate,
     }
 
-    # Add critic metrics if applicable
-    if critic is not None:
-        metrics["critic_loss"] = total_critic_loss / max(num_batches, 1)
-        precision = total_critic_tp / max(total_critic_tp + total_critic_fp, 1)
-        recall = total_critic_tp / max(total_critic_tp + total_critic_fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-        metrics["critic_precision"] = precision
-        metrics["critic_recall"] = recall
-        metrics["critic_f1"] = f1
-        metrics["critic_tp"] = total_critic_tp
-        metrics["critic_fp"] = total_critic_fp
-        metrics["critic_fn"] = total_critic_fn
-        metrics["critic_tn"] = total_critic_tn
-
     return metrics
 
 
 def _find_grid_bounds(grid: np.ndarray, max_size: int = 30) -> Tuple[int, int]:
-    """Find the bounds of non-zero content in a grid."""
-    nonzero = np.where(grid > 0)
-    if len(nonzero[0]) > 0:
-        r_max = min(nonzero[0].max() + 1, max_size)
-        c_max = min(nonzero[1].max() + 1, max_size)
+    """Find the bounds of actual content in a grid (excluding padding sentinel 10)."""
+    # Find positions with actual content (values 0-9, not the padding sentinel 10)
+    content = np.where(grid < 10)
+    if len(content[0]) > 0:
+        r_max = min(content[0].max() + 1, max_size)
+        c_max = min(content[1].max() + 1, max_size)
     else:
-        # If all zeros, check for any non-padding content by looking at the mask pattern
-        # Default to a small size
+        # If no content found, default to a small size
         r_max, c_max = 1, 1
     return r_max, c_max
 
@@ -4051,12 +3399,6 @@ def main():
                         help="Where to apply cross-attention: 'early' (on embeddings before CNN) or 'late' (on decoder features before outc, default)")
     parser.add_argument("--cross-attention-no-softmax", action="store_true",
                         help="Disable softmax in cross-attention (use raw attention scores)")
-    parser.add_argument("--cross-attention-per-layer", action="store_true",
-                        help="Apply cross-attention after each conv layer (default: once at end). "
-                             "With conv-depth=3, applies 3 times per block.")
-    parser.add_argument("--cross-attention-shared", action="store_true",
-                        help="Share cross-attention parameters across all layers (default: separate). "
-                             "Only relevant when --cross-attention-per-layer is enabled.")
     parser.add_argument("--ir-checkpoint", type=str, default=None,
                         help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
     parser.add_argument("--use-untrained-ir", action="store_true",
@@ -4099,7 +3441,7 @@ def main():
                              "Each merged group becomes a slot. Overrides --use-color-slots.")
     parser.add_argument("--affinity-max-slots", type=int, default=40,
                         help="Maximum number of slots for affinity-based slot attention (default: 40)")
-    parser.add_argument("--merge-threshold", type=float, default=2.5,
+    parser.add_argument("--merge-threshold", type=float, default=1.0,
                         help="Threshold for merging components in affinity slots (affinity > threshold)")
     parser.add_argument("--no-affinity-background-detection", action="store_true",
                         help="Disable automatic background detection in affinity slots. "
@@ -4114,19 +3456,6 @@ def main():
                         help="Run layer-wise ablation analysis after training. "
                              "Zeros each layer's output and measures accuracy drop. "
                              "Requires --eval-on-test to have test data to evaluate against.")
-
-    # Critic CNN - concurrent error prediction training
-    parser.add_argument("--use-critic", action="store_true",
-                        help="Train a critic CNN concurrently that predicts which pixels are wrong. "
-                             "The critic only sees the main model's predicted output (not input/ground truth).")
-    parser.add_argument("--critic-hidden-dim", type=int, default=8,
-                        help="Hidden dimension for critic CNN (default: 32)")
-    parser.add_argument("--critic-num-layers", type=int, default=1,
-                        help="Number of encoder/decoder layers in critic CNN (default: 3)")
-    parser.add_argument("--critic-lr", type=float, default=1e-3,
-                        help="Learning rate for critic optimizer (default: 1e-3)")
-    parser.add_argument("--visualize-critic", action="store_true",
-                        help="Visualize critic predictions during evaluation")
 
     args = parser.parse_args()
 
@@ -4326,8 +3655,6 @@ def main():
         cross_attention_heads=args.cross_attention_heads,
         cross_attention_position=args.cross_attention_position,
         cross_attention_no_softmax=args.cross_attention_no_softmax,
-        cross_attention_per_layer=args.cross_attention_per_layer,
-        cross_attention_shared=args.cross_attention_shared,
         ir_checkpoint=args.ir_checkpoint,
         use_untrained_ir=args.use_untrained_ir,
         ir_hidden_dim=args.ir_hidden_dim,
@@ -4361,16 +3688,12 @@ def main():
         heads_str = f", {args.cross_attention_heads} heads" if args.cross_attention_heads > 1 else ""
         pos = args.cross_attention_position
         pos_desc = "on embeddings before CNN" if pos == "early" else "on decoder features after CNN"
-        per_layer_str = ""
-        if args.cross_attention_per_layer:
-            shared_str = "shared" if args.cross_attention_shared else "separate"
-            per_layer_str = f", per-layer ({shared_str} params)"
         if args.ir_checkpoint:
             freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
-            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}{heads_str}{per_layer_str}) from {args.ir_checkpoint}")
+            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}{heads_str}) from {args.ir_checkpoint}")
             print(f"  Position: {pos} ({pos_desc})")
         elif args.use_untrained_ir:
-            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init{heads_str}{per_layer_str}, for ablation)")
+            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init{heads_str}, for ablation)")
             print(f"  IR encoder config: hidden={args.ir_hidden_dim}, out={args.ir_out_dim}, "
                   f"layers={args.ir_num_layers}, kernel={args.ir_kernel_size}x{args.ir_kernel_size}")
             print(f"  Position: {pos} ({pos_desc})")
@@ -4398,24 +3721,6 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
-    # Create critic CNN if requested
-    critic = None
-    critic_optimizer = None
-    if args.use_critic:
-        critic = CriticCNN(
-            hidden_dim=args.critic_hidden_dim,
-            num_layers=args.critic_num_layers,
-            conv_depth=args.conv_depth,
-            kernel_size=args.kernel_size,
-        ).to(DEVICE)
-        critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.critic_lr, weight_decay=0.01)
-        print(f"\nCritic CNN enabled:")
-        print(f"  Hidden dim: {args.critic_hidden_dim}")
-        print(f"  Num layers: {args.critic_num_layers}")
-        print(f"  Learning rate: {args.critic_lr}")
-        param_count = sum(p.numel() for p in critic.parameters())
-        print(f"  Parameters: {param_count:,}")
-
     # Create checkpoint directory
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
 
@@ -4429,9 +3734,8 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE,
-                                     critic=critic, critic_optimizer=critic_optimizer)
-        val_metrics = evaluate(model, val_loader, DEVICE, critic=critic)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
+        val_metrics = evaluate(model, val_loader, DEVICE)
 
         # Print pixel metrics
         print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
@@ -4439,15 +3743,6 @@ def main():
         print(f"  Val   Loss: {val_metrics['loss']:.4f}, Color Acc: {val_metrics['color_accuracy']:.2%}, "
               f"Error Color Acc: {val_metrics['error_color_accuracy']:.2%}, "
               f"Perfect: {val_metrics['perfect_rate']:.2%}")
-
-        # Print critic metrics if applicable
-        if critic is not None and 'critic_f1' in train_metrics:
-            print(f"  Train Critic - Loss: {train_metrics['critic_loss']:.4f}, "
-                  f"P: {train_metrics['critic_precision']:.2%}, R: {train_metrics['critic_recall']:.2%}, "
-                  f"F1: {train_metrics['critic_f1']:.2%}")
-            print(f"  Val   Critic - Loss: {val_metrics['critic_loss']:.4f}, "
-                  f"P: {val_metrics['critic_precision']:.2%}, R: {val_metrics['critic_recall']:.2%}, "
-                  f"F1: {val_metrics['critic_f1']:.2%}")
 
         current_metric = val_metrics['color_accuracy']
 
@@ -4463,8 +3758,6 @@ def main():
                 'best_val_metric': current_metric,
                 'is_last_epoch': True,
             }
-            if critic is not None:
-                checkpoint['critic_state_dict'] = critic.state_dict()
             torch.save(checkpoint, args.save_path)
             if current_metric > best_val_metric:
                 best_val_metric = current_metric
@@ -4479,8 +3772,6 @@ def main():
                 'best_val_metric': best_val_metric,
                 'is_last_epoch': False,
             }
-            if critic is not None:
-                checkpoint['critic_state_dict'] = critic.state_dict()
             torch.save(checkpoint, args.save_path)
 
         # Early stopping: if we hit 100% validation accuracy, no point continuing
@@ -4502,36 +3793,6 @@ def main():
 
     # Visualize on training data
     visualize_predictions(model, val_dataset, DEVICE)
-
-    # Visualize critic predictions if enabled
-    if critic is not None and args.visualize_critic:
-        print("\n" + "="*60)
-        print("CRITIC VISUALIZATION")
-        print("="*60)
-        model.eval()
-        critic.eval()
-        with torch.no_grad():
-            # Show a few examples from validation set
-            num_viz = min(5, len(val_dataset))
-            for i in range(num_viz):
-                sample = val_dataset[i]
-                input_grid = sample[0].unsqueeze(0).to(DEVICE)
-                output_grid = sample[1].unsqueeze(0).to(DEVICE)
-                target_colors = sample[2].numpy()
-                output_dims = sample[4]
-                out_h, out_w = output_dims[0].item(), output_dims[1].item()
-
-                # Get main model prediction
-                pixel_logits = model(input_grid, output_grid)
-                pred_colors = pixel_logits.argmax(dim=1)[0].cpu().numpy()
-
-                # Get critic prediction
-                critic_pred = critic.predict_errors(pixel_logits.argmax(dim=1))[0].cpu().numpy().astype(bool)
-
-                visualize_critic_prediction(
-                    pred_colors, target_colors, critic_pred,
-                    out_h, out_w, puzzle_id=f"Sample {i+1}"
-                )
 
     # =========================================================================
     # CRITICAL: Evaluate on held-out test examples
@@ -4619,109 +3880,6 @@ def main():
             ablation_results = run_layer_ablation(
                 model, test_eval_dataset, DEVICE
             )
-
-        # =========================================================================
-        # CRITIC CNN EVALUATION ON TEST PREDICTIONS
-        # =========================================================================
-        if 'critic_state_dict' in checkpoint:
-            print("\n" + "="*60)
-            print("CRITIC CNN EVALUATION ON TEST PREDICTIONS")
-            print("="*60)
-            print("The critic predicts which pixels in the output are wrong.")
-            print("(Only sees the predicted output - no input or ground truth)\n")
-
-            # Load critic from checkpoint
-            saved_args = checkpoint.get('args', {})
-            critic_eval = CriticCNN(
-                hidden_dim=saved_args.get('critic_hidden_dim', 8),
-                num_layers=saved_args.get('critic_num_layers', 1),
-                conv_depth=saved_args.get('conv_depth', 2),
-                kernel_size=saved_args.get('kernel_size', 3),
-            ).to(DEVICE)
-            critic_eval.load_state_dict(checkpoint['critic_state_dict'])
-            critic_eval.eval()
-
-            # Accumulate stats across all test examples
-            total_tp, total_fp, total_fn, total_tn = 0, 0, 0, 0
-            total_actual_errors, total_predicted_errors = 0, 0
-
-            with torch.no_grad():
-                for i in range(len(test_eval_dataset)):
-                    input_grid, output_grid, dims, puzzle_id = test_eval_dataset[i]
-                    _, _, true_out_h, true_out_w = dims[0].item(), dims[1].item(), dims[2].item(), dims[3].item()
-
-                    inp_t = input_grid.unsqueeze(0).to(DEVICE)
-                    target_colors = output_grid.numpy()
-
-                    # Get model prediction (use recursive if specified)
-                    candidate = torch.zeros_like(input_grid).unsqueeze(0).to(DEVICE)
-                    for _ in range(args.recursive_iters):
-                        output = model(inp_t, candidate)
-                        logits = output['pixel_logits'] if isinstance(output, dict) else output
-                        pred_colors = logits.argmax(dim=1)
-                        candidate = pred_colors.long()
-
-                    pred_np = pred_colors[0].cpu().numpy()
-
-                    # Get critic prediction on the model's output
-                    critic_pred = critic_eval.predict_errors(pred_colors)[0].cpu().numpy().astype(bool)
-
-                    # Crop to actual dimensions
-                    pred_region = pred_np[:true_out_h, :true_out_w]
-                    target_region = target_colors[:true_out_h, :true_out_w]
-                    critic_region = critic_pred[:true_out_h, :true_out_w]
-
-                    # Compute actual errors
-                    actual_errors = (pred_region != target_region)
-
-                    # Confusion matrix elements
-                    tp = (critic_region & actual_errors).sum()
-                    fp = (critic_region & ~actual_errors).sum()
-                    fn = (~critic_region & actual_errors).sum()
-                    tn = (~critic_region & ~actual_errors).sum()
-
-                    total_tp += tp
-                    total_fp += fp
-                    total_fn += fn
-                    total_tn += tn
-                    total_actual_errors += actual_errors.sum()
-                    total_predicted_errors += critic_region.sum()
-
-                    # Visualize if requested
-                    if args.visualize_critic:
-                        visualize_critic_prediction(
-                            pred_np, target_colors, critic_pred,
-                            true_out_h, true_out_w, puzzle_id=puzzle_id
-                        )
-
-            # Summary statistics
-            precision = total_tp / max(total_tp + total_fp, 1)
-            recall = total_tp / max(total_tp + total_fn, 1)
-            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-            print(f"\n{'-'*60}")
-            print("CRITIC SUMMARY (across all test examples):")
-            print(f"{'-'*60}")
-            print(f"  Precision: {precision:.3f} (of pixels critic flagged, how many were actually wrong)")
-            print(f"  Recall:    {recall:.3f} (of actual errors, how many did critic catch)")
-            print(f"  F1 Score:  {f1:.3f}")
-            print(f"\n  Confusion Matrix:")
-            print(f"    True Positives:  {total_tp:5d} (correctly identified errors)")
-            print(f"    False Positives: {total_fp:5d} (flagged correct pixels as errors)")
-            print(f"    False Negatives: {total_fn:5d} (missed actual errors)")
-            print(f"    True Negatives:  {total_tn:5d} (correctly identified good pixels)")
-            print(f"\n  Total actual errors:    {total_actual_errors}")
-            print(f"  Total predicted errors: {total_predicted_errors}")
-            print(f"{'-'*60}")
-
-            if f1 > 0.8:
-                print("\nExcellent critic! It can reliably identify errors in predictions.")
-            elif f1 > 0.5:
-                print("\nDecent critic - catches some errors but has room for improvement.")
-            elif total_actual_errors == 0:
-                print("\nNo errors to detect (perfect predictions)!")
-            else:
-                print("\nCritic struggles to identify errors reliably.")
 
     print("\nDone!")
     print(f"\nTo test generalization on a single puzzle:")

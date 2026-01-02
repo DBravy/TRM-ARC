@@ -300,15 +300,6 @@ async function loadModelInfo() {
             }
         }
 
-        // Build per-layer cross-attention info string
-        let perLayerInfo = 'No';
-        if (modelInfo.cross_attention_per_layer && modelInfo.per_layer_cross_attention_info) {
-            const plInfo = modelInfo.per_layer_cross_attention_info;
-            const typeLabel = plInfo.is_slot_attention ? 'slot' : 'cross';
-            const sharedLabel = plInfo.shared ? 'shared' : 'separate';
-            perLayerInfo = `${plInfo.total_applications}× ${typeLabel} (${sharedLabel})`;
-        }
-
         container.innerHTML = `
             <div class="info-item">
                 <div class="info-label">Layers</div>
@@ -329,10 +320,6 @@ async function loadModelInfo() {
             <div class="info-item">
                 <div class="info-label">Cross Attn</div>
                 <div class="info-value" style="color: ${modelInfo.use_cross_attention ? '#2ECC40' : '#888'};">${crossAttnInfo}</div>
-            </div>
-            <div class="info-item">
-                <div class="info-label">Per-Layer</div>
-                <div class="info-value" style="color: ${modelInfo.cross_attention_per_layer ? '#2ECC40' : '#888'};">${perLayerInfo}</div>
             </div>
             <div class="info-item">
                 <div class="info-label">Slot Attn</div>
@@ -989,11 +976,6 @@ function renderPixelTrace(trace) {
     // 5b. Slot Attention Section (if model has slot cross-attention)
     if (trace.slot_attention && trace.slot_attention.has_slot_attention) {
         grid.appendChild(createSlotAttentionSection(trace));
-    }
-
-    // 5c. Per-Layer Cross-Attention Section (if model has per-layer cross-attention)
-    if (trace.per_layer_attention && trace.per_layer_attention.has_per_layer_attention) {
-        grid.appendChild(createPerLayerAttentionSection(trace));
     }
 
     // 6. Final Calculation Section
@@ -1708,177 +1690,6 @@ function createSlotAttentionSection(trace) {
 
     section.innerHTML = html;
     return section;
-}
-
-function createPerLayerAttentionSection(trace) {
-    const section = document.createElement('div');
-    section.className = 'trace-section';
-
-    const perLayer = trace.per_layer_attention;
-    const pixel = trace.pixel;
-    const layers = perLayer.layers || [];
-    const numLayers = layers.length;
-    const isSlot = perLayer.is_slot_attention;
-    const shared = perLayer.shared;
-
-    const attnType = isSlot ? 'Slot Cross-Attention' : 'Cross-Attention';
-    const sharedLabel = shared ? ' (shared params)' : ' (separate params)';
-
-    let html = `
-        <h4>Per-Layer ${attnType}${sharedLabel}</h4>
-        <p style="font-size: 0.8em; color: #888; margin-bottom: 10px;">
-            Cross-attention applied after each conv layer (${numLayers} total applications across ${perLayer.num_blocks} blocks).
-        </p>
-    `;
-
-    if (numLayers === 0) {
-        html += `<p style="color: #666;">No per-layer attention captured for this pixel.</p>`;
-        section.innerHTML = html;
-        return section;
-    }
-
-    // Store data globally for tab selection
-    window.currentPerLayerAttentionData = { perLayer, pixel, layers };
-
-    // Layer selector tabs
-    const tabStyle = 'padding: 4px 8px; border: 1px solid #444; border-radius: 4px; background: #1a2a3a; color: #aaa; cursor: pointer; font-size: 0.75em;';
-    const activeTabStyle = 'padding: 4px 8px; border: 1px solid #00d4ff; border-radius: 4px; background: #0a3040; color: #00d4ff; cursor: pointer; font-size: 0.75em;';
-
-    html += `
-        <div style="margin-bottom: 15px;">
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Select layer:</div>
-            <div class="per-layer-tabs" style="display: flex; gap: 4px; flex-wrap: wrap;">
-    `;
-
-    for (let i = 0; i < numLayers; i++) {
-        const layer = layers[i];
-        const style = i === 0 ? activeTabStyle : tabStyle;
-        const sizeLabel = `${layer.spatial_size[0]}×${layer.spatial_size[1]}`;
-        html += `<button class="per-layer-tab ${i === 0 ? 'active' : ''}" data-layer="${i}" style="${style}"
-                         onclick="selectPerLayerAttention(this, ${i})">${layer.display_name} (${sizeLabel})</button>`;
-    }
-    html += `</div></div>`;
-
-    // Attention display container (will be updated by tab selection)
-    html += `<div id="per-layer-attention-container">`;
-    html += renderPerLayerAttentionContent(layers[0], pixel);
-    html += `</div>`;
-
-    // Legend
-    html += `
-        <div style="margin-top: 12px; font-size: 0.75em; color: #666; display: flex; gap: 15px;">
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(255, 128, 0); border-radius: 2px;"></span> High attention</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; background: rgb(0, 0, 0); border-radius: 2px; border: 1px solid #444;"></span> Low attention</span>
-            <span><span style="display: inline-block; width: 12px; height: 12px; border: 1px solid #ff0; border-radius: 2px;"></span> Selected pixel</span>
-        </div>
-    `;
-
-    section.innerHTML = html;
-    return section;
-}
-
-// Helper function to render per-layer attention content
-function renderPerLayerAttentionContent(layer, pixel) {
-    if (!layer) return '<p style="color: #666;">No attention data for this layer.</p>';
-
-    const attnGrid = layer.attention_from_pixel;
-    const topAttended = layer.top_attended;
-    const stats = layer.stats;
-    const kvSize = layer.kv_size;
-    const spatialSize = layer.spatial_size;
-    const numHeads = layer.num_heads;
-
-    // Calculate cell size based on grid dimensions
-    const maxDim = Math.max(kvSize[0], kvSize[1]);
-    const cellSize = maxDim <= 15 ? 10 : (maxDim <= 20 ? 8 : 6);
-
-    let html = `<div style="display: flex; gap: 20px; flex-wrap: wrap;">`;
-
-    // Attention heatmap
-    html += `
-        <div>
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">
-                Attention from (${pixel.row}, ${pixel.col}) to input (${kvSize[0]}×${kvSize[1]}):
-            </div>
-            <div style="display: grid; grid-template-columns: repeat(${kvSize[1]}, ${cellSize}px); gap: 1px;">
-    `;
-
-    const maxWeight = stats.max || 1;
-    for (let r = 0; r < kvSize[0]; r++) {
-        for (let c = 0; c < kvSize[1]; c++) {
-            const weight = attnGrid[r] ? (attnGrid[r][c] || 0) : 0;
-            const normalized = maxWeight > 0 ? weight / maxWeight : 0;
-            const intensity = Math.floor(normalized * 255);
-            const color = `rgb(${intensity}, ${Math.floor(intensity * 0.5)}, 0)`;
-
-            // Check if this is the corresponding position in the kv grid
-            // Map pixel position to kv grid position
-            const kvRow = Math.floor(pixel.row * kvSize[0] / spatialSize[0]);
-            const kvCol = Math.floor(pixel.col * kvSize[1] / spatialSize[1]);
-            const isSelectedPos = (r === kvRow && c === kvCol);
-            const border = isSelectedPos ? 'border: 1px solid #ff0;' : '';
-
-            html += `<div style="width: ${cellSize}px; height: ${cellSize}px; background: ${color}; ${border}"
-                         title="(${r},${c}): ${(weight * 100).toFixed(2)}%"></div>`;
-        }
-    }
-    html += `</div></div>`;
-
-    // Top attended positions
-    html += `
-        <div>
-            <div style="font-size: 0.85em; color: #aaa; margin-bottom: 8px;">Top attended positions:</div>
-            <div style="display: flex; flex-direction: column; gap: 4px;">
-    `;
-
-    for (let i = 0; i < Math.min(5, topAttended.length); i++) {
-        const p = topAttended[i];
-        html += `
-            <div style="padding: 4px 8px; background: #1a2a3a; border-radius: 4px; font-size: 0.8em;">
-                (${p.row}, ${p.col}): <span style="color: #f90;">${(p.weight * 100).toFixed(2)}%</span>
-            </div>
-        `;
-    }
-    html += `</div></div>`;
-    html += `</div>`;
-
-    // Stats
-    html += `
-        <div style="margin-top: 10px; font-size: 0.8em; color: #666;">
-            ${numHeads > 1 ? `${numHeads} heads (averaged) | ` : ''}
-            Max: ${(stats.max * 100).toFixed(2)}% | Mean: ${(stats.mean * 100).toFixed(2)}% |
-            Spatial: ${spatialSize[0]}×${spatialSize[1]} → KV: ${kvSize[0]}×${kvSize[1]}
-        </div>
-    `;
-
-    return html;
-}
-
-// Global function to handle per-layer tab selection
-function selectPerLayerAttention(button, layerIdx) {
-    const tabStyle = 'padding: 4px 8px; border: 1px solid #444; border-radius: 4px; background: #1a2a3a; color: #aaa; cursor: pointer; font-size: 0.75em;';
-    const activeTabStyle = 'padding: 4px 8px; border: 1px solid #00d4ff; border-radius: 4px; background: #0a3040; color: #00d4ff; cursor: pointer; font-size: 0.75em;';
-
-    // Update active tab styling
-    document.querySelectorAll('.per-layer-tab').forEach(tab => {
-        tab.classList.remove('active');
-        tab.style.cssText = tabStyle;
-    });
-    button.classList.add('active');
-    button.style.cssText = activeTabStyle;
-
-    // Get the container for attention content
-    const container = document.getElementById('per-layer-attention-container');
-    if (!container) return;
-
-    // Get the stored data and render
-    if (window.currentPerLayerAttentionData) {
-        const layers = window.currentPerLayerAttentionData.layers;
-        const pixel = window.currentPerLayerAttentionData.pixel;
-        if (layers[layerIdx]) {
-            container.innerHTML = renderPerLayerAttentionContent(layers[layerIdx], pixel);
-        }
-    }
 }
 
 function createFinalCalculationSection(trace) {

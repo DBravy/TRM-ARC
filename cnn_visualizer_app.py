@@ -382,28 +382,6 @@ def api_model_info():
             'no_softmax': getattr(model.cross_attention, 'no_softmax', False),
         }
 
-    # Per-layer cross-attention info
-    per_layer_cross_attention_info = {}
-    cross_attention_per_layer = getattr(model, 'cross_attention_per_layer', False)
-    use_per_layer_slot = getattr(model, 'use_per_layer_slot', False)
-    if cross_attention_per_layer or use_per_layer_slot:
-        per_layer_cross_attention_info = {
-            'enabled': True,
-            'is_slot_attention': use_per_layer_slot,
-            'shared': getattr(model, 'cross_attention_shared', False),
-            'conv_depth': model.conv_depth,
-            'num_layers': model.num_layers,
-        }
-        # Count total cross-attention applications
-        num_blocks = 1  # inc always exists
-        if model.num_layers >= 1:
-            num_blocks += 2  # down1 + up3
-        if model.num_layers >= 2:
-            num_blocks += 2  # down2 + up2
-        if model.num_layers >= 3:
-            num_blocks += 2  # down3 + up1
-        per_layer_cross_attention_info['total_applications'] = num_blocks * model.conv_depth
-
     return jsonify({
         'checkpoint': checkpoint_path,
         'num_layers': model.num_layers,
@@ -415,8 +393,6 @@ def api_model_info():
         'use_attention': getattr(model, 'use_attention', False),
         'use_cross_attention': getattr(model, 'use_cross_attention', False),
         'cross_attention_info': cross_attention_info,
-        'cross_attention_per_layer': cross_attention_per_layer or use_per_layer_slot,
-        'per_layer_cross_attention_info': per_layer_cross_attention_info,
         'use_slot_cross_attention': use_slot_cross_attention,
         'slot_info': slot_info,
         'predict_size': getattr(model, 'predict_size', False),
@@ -1005,133 +981,6 @@ def compute_pixel_trace(
             result['attention'] = {'has_attention': False}
     else:
         result['attention'] = {'has_attention': False}
-
-    # Per-layer cross-attention visualization (NConvWithCrossAttention blocks)
-    cross_attention_per_layer = getattr(model, 'cross_attention_per_layer', False)
-    use_per_layer_slot = getattr(model, 'use_per_layer_slot', False)
-    if cross_attention_per_layer or use_per_layer_slot:
-        # Collect all NConvWithCrossAttention blocks
-        per_layer_blocks = []
-        block_names = []
-
-        # Check inc block
-        if hasattr(model.inc, 'capture_attention'):
-            per_layer_blocks.append(model.inc)
-            block_names.append('inc')
-
-        # Check down blocks
-        for i in range(1, 4):
-            down_name = f'down{i}'
-            if hasattr(model, down_name):
-                down_block = getattr(model, down_name)
-                if hasattr(down_block, 'conv') and hasattr(down_block.conv, 'capture_attention'):
-                    per_layer_blocks.append(down_block.conv)
-                    block_names.append(down_name)
-
-        # Check up blocks
-        for i in range(1, 4):
-            up_name = f'up{i}'
-            if hasattr(model, up_name):
-                up_block = getattr(model, up_name)
-                if hasattr(up_block, 'conv') and hasattr(up_block.conv, 'capture_attention'):
-                    per_layer_blocks.append(up_block.conv)
-                    block_names.append(up_name)
-
-        if per_layer_blocks:
-            # Enable attention capture on all blocks
-            for block in per_layer_blocks:
-                block.capture_attention = True
-
-            # Run inference to capture attention
-            with torch.no_grad():
-                _ = model(inp_tensor, candidate_tensor)
-
-            # Collect attention weights from all blocks
-            per_layer_attention = []
-            for block, block_name in zip(per_layer_blocks, block_names):
-                if block.last_attention_weights is not None:
-                    for layer_attn in block.last_attention_weights:
-                        layer_idx = layer_attn['layer_idx']
-                        attn_weights = layer_attn['attention_weights']
-                        spatial_size = layer_attn['spatial_size']
-                        is_slot = layer_attn['is_slot_attention']
-
-                        # Process attention weights for visualization
-                        H, W = spatial_size
-                        pixel_idx = row * W + col if row < H and col < W else None
-
-                        if attn_weights is not None and pixel_idx is not None:
-                            # Handle different attention weight shapes
-                            if isinstance(attn_weights, torch.Tensor):
-                                attn_np = attn_weights.squeeze(0).cpu().numpy()
-                            else:
-                                attn_np = attn_weights
-
-                            # For cross-attention: (num_heads, N_q, N_kv) or (N_q, N_kv)
-                            if len(attn_np.shape) == 3:
-                                # Multi-head: average across heads for display
-                                attn_avg = attn_np.mean(axis=0)  # (N_q, N_kv)
-                                num_heads = attn_np.shape[0]
-                            elif len(attn_np.shape) == 2:
-                                attn_avg = attn_np
-                                num_heads = 1
-                            else:
-                                continue
-
-                            N_q = attn_avg.shape[0]
-                            N_kv = attn_avg.shape[1]
-
-                            # Get attention from this pixel to all key-value positions
-                            if pixel_idx < N_q:
-                                attn_from_pixel = attn_avg[pixel_idx, :]  # (N_kv,)
-
-                                # Reshape to grid (assuming square or use original IR size)
-                                H_kv = int(np.sqrt(N_kv))
-                                W_kv = N_kv // H_kv if H_kv > 0 else 1
-                                attn_from_grid = attn_from_pixel.reshape(H_kv, W_kv)
-
-                                # Top attended positions
-                                top_indices = np.argsort(attn_from_pixel)[-5:][::-1]
-                                top_attended = [
-                                    {
-                                        'row': int(idx // W_kv),
-                                        'col': int(idx % W_kv),
-                                        'weight': float(attn_from_pixel[idx])
-                                    }
-                                    for idx in top_indices
-                                ]
-
-                                per_layer_attention.append({
-                                    'block_name': block_name,
-                                    'layer_idx': layer_idx,
-                                    'display_name': f'{block_name}_conv{layer_idx}',
-                                    'is_slot_attention': is_slot,
-                                    'spatial_size': list(spatial_size),
-                                    'kv_size': [H_kv, W_kv],
-                                    'num_heads': num_heads,
-                                    'attention_from_pixel': attn_from_grid.tolist(),
-                                    'top_attended': top_attended,
-                                    'stats': {
-                                        'max': float(attn_from_pixel.max()),
-                                        'min': float(attn_from_pixel.min()),
-                                        'mean': float(attn_from_pixel.mean()),
-                                    }
-                                })
-
-                # Disable capture after grabbing weights
-                block.capture_attention = False
-
-            result['per_layer_attention'] = {
-                'has_per_layer_attention': True,
-                'is_slot_attention': use_per_layer_slot,
-                'shared': getattr(model, 'cross_attention_shared', False),
-                'num_blocks': len(per_layer_blocks),
-                'block_names': block_names,
-                'conv_depth': model.conv_depth,
-                'layers': per_layer_attention
-            }
-    else:
-        result['per_layer_attention'] = {'has_per_layer_attention': False}
 
     # Slot-routed cross-attention visualization
     if getattr(model, 'use_slot_cross_attention', False) and model.slot_attention is not None:
