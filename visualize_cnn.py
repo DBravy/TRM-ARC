@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CNN Kernel and Feature Map Visualization for PixelErrorCNN.
+CNN Kernel and Feature Map Visualization for DorsalCNN.
 
 Visualizes:
 1. Convolutional kernel weights as grids + histograms
@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 
 # Import model from training script
-from crm import PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS
+from crm import DorsalCNN, load_puzzles, GRID_SIZE, NUM_COLORS
 
 # ARC color palette (0-9)
 ARC_COLORS = [
@@ -452,7 +452,7 @@ def get_first_example(
     raise ValueError(f"No {split} examples found in puzzles")
 
 
-def get_layer_names_for_model(model: PixelErrorCNN) -> List[str]:
+def get_layer_names_for_model(model: DorsalCNN) -> List[str]:
     """Get appropriate layer names based on model configuration."""
     num_layers = model.num_layers
 
@@ -545,7 +545,7 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint}")
-    model = PixelErrorCNN.from_checkpoint(args.checkpoint, device=device)
+    model = DorsalCNN.from_checkpoint(args.checkpoint, device=device)
     model.eval()
 
     print(f"Model configuration:")

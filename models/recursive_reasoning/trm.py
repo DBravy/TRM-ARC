@@ -178,13 +178,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Load CNN for correctness detection (jointly trained)
         self.correctness_cnn = None
         if self.config.cnn_checkpoint_path:
-            from train_pixel_error_cnn import PixelErrorCNN
+            from train_pixel_error_cnn import DorsalCNN
             if self.config.cnn_checkpoint_path == "init":
                 # Initialize fresh CNN without loading weights
-                self.correctness_cnn = PixelErrorCNN(hidden_dim=64)
+                self.correctness_cnn = DorsalCNN(hidden_dim=64)
             else:
                 # Load from checkpoint as initialization
-                self.correctness_cnn = PixelErrorCNN.from_checkpoint(self.config.cnn_checkpoint_path)
+                self.correctness_cnn = DorsalCNN.from_checkpoint(self.config.cnn_checkpoint_path)
             # CNN is now trainable - no freezing
 
         # Step counter for CNN warmup

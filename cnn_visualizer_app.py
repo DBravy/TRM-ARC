@@ -2,7 +2,7 @@
 """
 CNN Learning Visualization Web App for ARC Patterns.
 
-Provides interactive visualization of how PixelErrorCNN learns ARC patterns:
+Provides interactive visualization of how DorsalCNN learns ARC patterns:
 1. Per-color kernel visualization - How each kernel responds to each color
 2. Layer flow animation - Step through layers to see transformations
 3. Puzzle browser - Select puzzles from the ARC dataset
@@ -26,7 +26,7 @@ from flask import Flask, render_template, jsonify, request
 
 # Import from existing modules
 from crm import (
-    PixelErrorCNN, load_puzzles, GRID_SIZE, NUM_COLORS,
+    DorsalCNN, load_puzzles, GRID_SIZE, NUM_COLORS,
     SpatialSelfAttention, CrossAttention, SlotAttention, SlotRoutedCrossAttention
 )
 from visualize_cnn import (
@@ -42,7 +42,7 @@ app = Flask(__name__,
             static_folder='static')
 
 # Global state
-model: Optional[PixelErrorCNN] = None
+model: Optional[DorsalCNN] = None
 puzzles: Optional[Dict] = None
 device: Optional[torch.device] = None
 checkpoint_path: str = ""
@@ -65,7 +65,7 @@ def init_app(ckpt_path: str, dataset: str = "arc-agi-1", data_root: str = "kaggl
     checkpoint_path = ckpt_path
 
     print(f"Loading model from {ckpt_path}")
-    model = PixelErrorCNN.from_checkpoint(ckpt_path, device=device)
+    model = DorsalCNN.from_checkpoint(ckpt_path, device=device)
     model.eval()
 
     print(f"Model loaded: {model.num_layers} layers, hidden_dim={model.inc.conv[0].out_channels if hasattr(model.inc, 'conv') else 'unknown'}")
@@ -79,7 +79,7 @@ def init_app(ckpt_path: str, dataset: str = "arc-agi-1", data_root: str = "kaggl
 # Per-Color Kernel Response Computation
 # =============================================================================
 
-def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
+def compute_per_color_kernel_response(model: DorsalCNN) -> Dict:
     """
     Compute effective kernel response for each of the 10 ARC colors.
 
@@ -139,7 +139,7 @@ def compute_per_color_kernel_response(model: PixelErrorCNN) -> Dict:
     }
 
 
-def compute_all_kernel_responses(model: PixelErrorCNN) -> Dict:
+def compute_all_kernel_responses(model: DorsalCNN) -> Dict:
     """
     Compute per-color responses for all conv layers.
 

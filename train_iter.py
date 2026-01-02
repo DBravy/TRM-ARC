@@ -88,7 +88,7 @@ class Up(nn.Module):
         return self.conv(x)
 
 
-class PixelErrorCNN(nn.Module):
+class DorsalCNN(nn.Module):
     def __init__(self, hidden_dim: int = 64, num_classes: int = 10):
         super().__init__()
         self.num_classes = num_classes
@@ -292,7 +292,7 @@ def train_iterative(
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
-    model = PixelErrorCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
+    model = DorsalCNN(hidden_dim=hidden_dim, num_classes=10).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
     

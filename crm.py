@@ -275,7 +275,130 @@ class UpNoSkip(nn.Module):
         return self.conv(x)
 
 
-class IREncoder(nn.Module):
+class NConvWithCrossAttention(nn.Module):
+    """N consecutive convolutions with cross-attention after each layer.
+
+    Unlike NConv which uses nn.Sequential, this class stores individual layers
+    and applies cross-attention between them.
+
+    Args:
+        in_ch: Input channels
+        out_ch: Output channels
+        depth: Number of conv layers
+        kernel_size: Kernel size for all convolutions
+        cross_attention_modules: Either a single CrossAttention module (shared)
+                                 or a ModuleList of modules (one per layer)
+    """
+    def __init__(self, in_ch: int, out_ch: int, depth: int = 2, kernel_size: int = 3,
+                 cross_attention_modules=None):
+        super().__init__()
+        self.depth = depth
+        self.out_ch = out_ch
+        padding = (kernel_size - 1) // 2
+
+        # Store individual layers instead of Sequential
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(depth):
+            self.convs.append(nn.Conv2d(in_ch if i == 0 else out_ch, out_ch, kernel_size, padding=padding))
+            self.bns.append(nn.BatchNorm2d(out_ch))
+
+        # Cross-attention modules (ModuleList for separate, single module for shared)
+        self.cross_attentions = cross_attention_modules
+        self.shared_attention = not isinstance(cross_attention_modules, nn.ModuleList)
+
+    def forward(self, x, ir_features=None):
+        """
+        Args:
+            x: Input tensor (B, C, H, W)
+            ir_features: IR encoder features (B, H_ir, W_ir, D) for cross-attention
+        """
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+            x = F.relu(bn(conv(x)), inplace=True)
+
+            # Apply cross-attention after each layer if available
+            if self.cross_attentions is not None and ir_features is not None:
+                x = self._apply_cross_attention(x, ir_features, i)
+        return x
+
+    def _apply_cross_attention(self, x, ir_features, layer_idx):
+        """Apply cross-attention with spatial interpolation if needed."""
+        _, _, H, W = x.shape
+        H_ir, W_ir = ir_features.shape[1], ir_features.shape[2]
+
+        # Interpolate IR features if spatial mismatch
+        if H != H_ir or W != W_ir:
+            # ir_features is (B, H_ir, W_ir, D), need to interpolate spatial dims
+            ir_interp = ir_features.permute(0, 3, 1, 2)  # (B, D, H_ir, W_ir)
+            ir_interp = F.interpolate(ir_interp, size=(H, W), mode='bilinear', align_corners=False)
+            ir_interp = ir_interp.permute(0, 2, 3, 1)  # (B, H, W, D)
+        else:
+            ir_interp = ir_features
+
+        # Get appropriate cross-attention module
+        if self.shared_attention:
+            ca = self.cross_attentions
+        else:
+            ca = self.cross_attentions[layer_idx]
+
+        # Apply cross-attention: x is (B, C, H, W), need (B, H, W, C)
+        x_perm = x.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+        x_perm = ca(query=x_perm, key_value=ir_interp)
+        return x_perm.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+
+
+class DownWithCrossAttention(nn.Module):
+    """Encoder block with per-layer cross-attention."""
+    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
+                 cross_attention_modules=None):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
+                                            cross_attention_modules)
+
+    def forward(self, x, ir_features=None):
+        return self.conv(self.pool(x), ir_features)
+
+
+class UpWithCrossAttention(nn.Module):
+    """Decoder block with skip connections and per-layer cross-attention."""
+    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
+                 cross_attention_modules=None):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
+        self.conv = NConvWithCrossAttention(in_ch, out_ch, conv_depth, kernel_size,
+                                            cross_attention_modules)
+
+    def forward(self, x1, x2, ir_features=None):
+        x1 = self.up(x1)
+        diff_h = x2.size(2) - x1.size(2)
+        diff_w = x2.size(3) - x1.size(3)
+        x1 = F.pad(x1, [diff_w // 2, diff_w - diff_w // 2,
+                       diff_h // 2, diff_h - diff_h // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x, ir_features)
+
+
+class UpNoSkipWithCrossAttention(nn.Module):
+    """Decoder block without skip connections but with per-layer cross-attention."""
+    def __init__(self, in_ch: int, out_ch: int, conv_depth: int = 2, kernel_size: int = 3,
+                 cross_attention_modules=None):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = NConvWithCrossAttention(out_ch, out_ch, conv_depth, kernel_size,
+                                            cross_attention_modules)
+
+    def forward(self, x, target_size=None, ir_features=None):
+        x = self.up(x)
+        if target_size is not None:
+            diff_h = target_size[0] - x.size(2)
+            diff_w = target_size[1] - x.size(3)
+            x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2,
+                         diff_h // 2, diff_h - diff_h // 2])
+        return self.conv(x, ir_features)
+
+
+class VentralCNN(nn.Module):
     """
     Instance Recognition encoder - produces features per pixel.
 
@@ -1225,7 +1348,7 @@ class SlotRoutedCrossAttention(nn.Module):
         return output.reshape(B, H_out, W_out, self.query_dim)
 
 
-class PixelErrorCNN(nn.Module):
+class DorsalCNN(nn.Module):
     """
     U-Net style CNN for comparing input and output grids.
 
@@ -1241,11 +1364,14 @@ class PixelErrorCNN(nn.Module):
                  use_attention: bool = False, use_cross_attention: bool = False,
                  cross_attention_heads: int = 1, cross_attention_position: str = "late",
                  cross_attention_no_softmax: bool = False,
+                 cross_attention_per_layer: bool = False,
+                 cross_attention_shared: bool = False,
                  ir_checkpoint: str = None, use_untrained_ir: bool = False,
                  ir_hidden_dim: int = 128, ir_out_dim: int = 64,
                  ir_num_layers: int = 3, ir_kernel_size: int = 3,
                  freeze_ir: bool = True,
                  use_slot_cross_attention: bool = False,
+                 slot_cross_attention_no_residual: bool = False,
                  use_color_slots: bool = False,
                  use_affinity_slots: bool = False,
                  num_slots: int = 8, slot_dim: int = 64,
@@ -1266,6 +1392,8 @@ class PixelErrorCNN(nn.Module):
         self.cross_attention_heads = cross_attention_heads
         self.cross_attention_position = cross_attention_position
         self.cross_attention_no_softmax = cross_attention_no_softmax
+        self.cross_attention_per_layer = cross_attention_per_layer
+        self.cross_attention_shared = cross_attention_shared
         self.ir_checkpoint = ir_checkpoint
         self.use_untrained_ir = use_untrained_ir
         self.ir_hidden_dim = ir_hidden_dim
@@ -1274,6 +1402,7 @@ class PixelErrorCNN(nn.Module):
         self.ir_kernel_size = ir_kernel_size
         self.freeze_ir = freeze_ir
         self.use_slot_cross_attention = use_slot_cross_attention
+        self.slot_cross_attention_no_residual = slot_cross_attention_no_residual
         self.use_color_slots = use_color_slots
         self.use_affinity_slots = use_affinity_slots
         self.affinity_max_slots = affinity_max_slots
@@ -1308,11 +1437,11 @@ class PixelErrorCNN(nn.Module):
 
         if ir_checkpoint or use_untrained_ir:
             if ir_checkpoint:
-                self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                self.ir_encoder = VentralCNN.from_checkpoint(ir_checkpoint, DEVICE)
                 self.ir_feature_dim = self.ir_encoder.out_dim  # Get from loaded checkpoint
             else:
                 # Use randomly initialized IR encoder (for ablation study)
-                self.ir_encoder = IREncoder(
+                self.ir_encoder = VentralCNN(
                     hidden_dim=ir_hidden_dim,
                     out_dim=ir_out_dim,
                     num_layers=ir_num_layers,
@@ -1347,18 +1476,109 @@ class PixelErrorCNN(nn.Module):
 
         base_ch = hidden_dim
 
+        # Per-layer cross-attention modules (created before blocks so blocks can reference them)
+        self.per_layer_cross_attentions = None
+        self.shared_cross_attention = None
+
+        if use_cross_attention and cross_attention_per_layer:
+            # Block configurations: (name, output_channels)
+            # inc always exists, down/up blocks depend on num_layers
+            block_configs = [('inc', base_ch)]
+            if num_layers >= 1:
+                block_configs.append(('down1', base_ch * 2))
+            if num_layers >= 2:
+                block_configs.append(('down2', base_ch * 4))
+            if num_layers >= 3:
+                block_configs.append(('down3', base_ch * 8))
+            if num_layers >= 3:
+                block_configs.append(('up1', base_ch * 4))
+            if num_layers >= 2:
+                block_configs.append(('up2', base_ch * 2))
+            if num_layers >= 1:
+                block_configs.append(('up3', base_ch))
+
+            if cross_attention_shared:
+                # Single shared cross-attention module
+                # Use base_ch as query_dim - will need channel projection for other sizes
+                self.shared_cross_attention = CrossAttention(
+                    query_dim=base_ch,
+                    kv_dim=self.ir_feature_dim,
+                    proj_dim=base_ch,
+                    num_heads=cross_attention_heads,
+                    no_softmax=cross_attention_no_softmax
+                )
+            else:
+                # Separate cross-attention modules per block per layer
+                self.per_layer_cross_attentions = nn.ModuleDict()
+                for block_name, out_ch in block_configs:
+                    for layer_idx in range(conv_depth):
+                        key = f"{block_name}_layer{layer_idx}"
+                        self.per_layer_cross_attentions[key] = CrossAttention(
+                            query_dim=out_ch,
+                            kv_dim=self.ir_feature_dim,
+                            proj_dim=out_ch,
+                            num_heads=cross_attention_heads,
+                            no_softmax=cross_attention_no_softmax
+                        )
+
+        def _get_cross_attention_modules(block_name):
+            """Helper to get cross-attention modules for a block."""
+            if not (use_cross_attention and cross_attention_per_layer):
+                return None
+            if cross_attention_shared:
+                return self.shared_cross_attention
+            else:
+                # Return ModuleList of this block's cross-attention modules
+                modules = nn.ModuleList([
+                    self.per_layer_cross_attentions[f"{block_name}_layer{i}"]
+                    for i in range(conv_depth)
+                ])
+                return modules
+
         # Encoder - create layers based on num_layers
-        self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
-        if num_layers >= 1:
-            self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
-        if num_layers >= 2:
-            self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
-        if num_layers >= 3:
-            self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
+        if use_cross_attention and cross_attention_per_layer:
+            self.inc = NConvWithCrossAttention(in_channels, base_ch, conv_depth, kernel_size,
+                                               _get_cross_attention_modules('inc'))
+            if num_layers >= 1:
+                self.down1 = DownWithCrossAttention(base_ch, base_ch * 2, conv_depth, kernel_size,
+                                                    _get_cross_attention_modules('down1'))
+            if num_layers >= 2:
+                self.down2 = DownWithCrossAttention(base_ch * 2, base_ch * 4, conv_depth, kernel_size,
+                                                    _get_cross_attention_modules('down2'))
+            if num_layers >= 3:
+                self.down3 = DownWithCrossAttention(base_ch * 4, base_ch * 8, conv_depth, kernel_size,
+                                                    _get_cross_attention_modules('down3'))
+        else:
+            self.inc = get_conv_block(in_channels, base_ch, conv_depth, kernel_size)
+            if num_layers >= 1:
+                self.down1 = Down(base_ch, base_ch * 2, conv_depth, kernel_size)
+            if num_layers >= 2:
+                self.down2 = Down(base_ch * 2, base_ch * 4, conv_depth, kernel_size)
+            if num_layers >= 3:
+                self.down3 = Down(base_ch * 4, base_ch * 8, conv_depth, kernel_size)
 
         # Decoder - create layers based on num_layers (no up layers needed for num_layers=0)
         if num_layers >= 1:
-            if no_skip:
+            if use_cross_attention and cross_attention_per_layer:
+                if no_skip:
+                    if num_layers >= 3:
+                        self.up1 = UpNoSkipWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
+                                                              _get_cross_attention_modules('up1'))
+                    if num_layers >= 2:
+                        self.up2 = UpNoSkipWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
+                                                              _get_cross_attention_modules('up2'))
+                    self.up3 = UpNoSkipWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
+                                                          _get_cross_attention_modules('up3'))
+                else:
+                    if num_layers >= 3:
+                        self.up1 = UpWithCrossAttention(base_ch * 8, base_ch * 4, conv_depth, kernel_size,
+                                                        _get_cross_attention_modules('up1'))
+                    if num_layers >= 2:
+                        self.up2 = UpWithCrossAttention(base_ch * 4, base_ch * 2, conv_depth, kernel_size,
+                                                        _get_cross_attention_modules('up2'))
+                    self.up3 = UpWithCrossAttention(base_ch * 2, base_ch, conv_depth, kernel_size,
+                                                    _get_cross_attention_modules('up3'))
+            elif no_skip:
                 # No skip connections - all info must flow through bottleneck
                 if num_layers >= 3:
                     self.up1 = UpNoSkip(base_ch * 8, base_ch * 4, conv_depth, kernel_size)
@@ -1398,11 +1618,11 @@ class PixelErrorCNN(nn.Module):
             # Ensure IR encoder exists for slot attention
             if self.ir_encoder is None:
                 if ir_checkpoint:
-                    self.ir_encoder = IREncoder.from_checkpoint(ir_checkpoint, DEVICE)
+                    self.ir_encoder = VentralCNN.from_checkpoint(ir_checkpoint, DEVICE)
                     ir_feature_dim = self.ir_encoder.out_dim
                 else:
                     # Create untrained IR encoder for slot attention
-                    self.ir_encoder = IREncoder(
+                    self.ir_encoder = VentralCNN(
                         hidden_dim=ir_hidden_dim,
                         out_dim=ir_out_dim,
                         num_layers=ir_num_layers,
@@ -1501,14 +1721,26 @@ class PixelErrorCNN(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous()
 
+        # Get ir_features for per-layer cross-attention (None if not using)
+        ir_feat = ir_features if (self.cross_attention_per_layer and self.ir_encoder is not None) else None
+
         # U-Net forward - encoder
-        x1 = self.inc(x)
-        if self.num_layers >= 1:
-            x2 = self.down1(x1)
-        if self.num_layers >= 2:
-            x3 = self.down2(x2)
-        if self.num_layers >= 3:
-            x4 = self.down3(x3)
+        if self.cross_attention_per_layer:
+            x1 = self.inc(x, ir_feat)
+            if self.num_layers >= 1:
+                x2 = self.down1(x1, ir_feat)
+            if self.num_layers >= 2:
+                x3 = self.down2(x2, ir_feat)
+            if self.num_layers >= 3:
+                x4 = self.down3(x3, ir_feat)
+        else:
+            x1 = self.inc(x)
+            if self.num_layers >= 1:
+                x2 = self.down1(x1)
+            if self.num_layers >= 2:
+                x3 = self.down2(x2)
+            if self.num_layers >= 3:
+                x4 = self.down3(x3)
 
         # Determine bottleneck based on num_layers
         if self.num_layers == 0:
@@ -1524,6 +1756,28 @@ class PixelErrorCNN(nn.Module):
         if self.num_layers == 0:
             # No encoder/decoder layers - just use bottleneck (which is x1) directly
             x = bottleneck
+        elif self.cross_attention_per_layer and self.no_skip:
+            # Per-layer cross-attention with no skip connections
+            if self.num_layers == 3:
+                x = self.up1(bottleneck, target_size=(x3.size(2), x3.size(3)), ir_features=ir_feat)
+                x = self.up2(x, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat)
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
+            elif self.num_layers == 2:
+                x = self.up2(bottleneck, target_size=(x2.size(2), x2.size(3)), ir_features=ir_feat)
+                x = self.up3(x, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
+            else:  # num_layers == 1
+                x = self.up3(bottleneck, target_size=(x1.size(2), x1.size(3)), ir_features=ir_feat)
+        elif self.cross_attention_per_layer:
+            # Per-layer cross-attention with skip connections
+            if self.num_layers == 3:
+                x = self.up1(bottleneck, x3, ir_feat)
+                x = self.up2(x, x2, ir_feat)
+                x = self.up3(x, x1, ir_feat)
+            elif self.num_layers == 2:
+                x = self.up2(bottleneck, x2, ir_feat)
+                x = self.up3(x, x1, ir_feat)
+            else:  # num_layers == 1
+                x = self.up3(bottleneck, x1, ir_feat)
         elif self.no_skip:
             # No skip connections - pass target sizes for proper upsampling
             if self.num_layers == 3:
@@ -1580,8 +1834,12 @@ class PixelErrorCNN(nn.Module):
                 ir_features=ir_features
             )
 
-            # Residual connection: permute back and add
-            x = x + attended.permute(0, 3, 1, 2).contiguous()
+            # Residual connection (or direct replacement if no_residual)
+            attended_perm = attended.permute(0, 3, 1, 2).contiguous()
+            if self.slot_cross_attention_no_residual:
+                x = attended_perm
+            else:
+                x = x + attended_perm
 
         pixel_logits = self.outc(x)  # (B, 10, H, W) for color prediction
 
@@ -1627,6 +1885,8 @@ class PixelErrorCNN(nn.Module):
         cross_attention_heads = args.get('cross_attention_heads', 1)
         cross_attention_position = args.get('cross_attention_position', 'late')
         cross_attention_no_softmax = args.get('cross_attention_no_softmax', False)
+        cross_attention_per_layer = args.get('cross_attention_per_layer', False)
+        cross_attention_shared = args.get('cross_attention_shared', False)
         ir_checkpoint = args.get('ir_checkpoint', None)
         use_untrained_ir = args.get('use_untrained_ir', False)
         ir_hidden_dim = args.get('ir_hidden_dim', 128)
@@ -1635,6 +1895,7 @@ class PixelErrorCNN(nn.Module):
         ir_kernel_size = args.get('ir_kernel_size', 3)
         freeze_ir = args.get('freeze_ir', True)
         use_slot_cross_attention = args.get('use_slot_cross_attention', False)
+        slot_cross_attention_no_residual = args.get('slot_cross_attention_no_residual', False)
         use_color_slots = args.get('use_color_slots', False)
         use_affinity_slots = args.get('use_affinity_slots', False)
         affinity_max_slots = args.get('affinity_max_slots', 40)
@@ -1657,6 +1918,8 @@ class PixelErrorCNN(nn.Module):
             cross_attention_heads=cross_attention_heads,
             cross_attention_position=cross_attention_position,
             cross_attention_no_softmax=cross_attention_no_softmax,
+            cross_attention_per_layer=cross_attention_per_layer,
+            cross_attention_shared=cross_attention_shared,
             ir_checkpoint=ir_checkpoint,
             use_untrained_ir=use_untrained_ir,
             ir_hidden_dim=ir_hidden_dim,
@@ -1665,6 +1928,7 @@ class PixelErrorCNN(nn.Module):
             ir_kernel_size=ir_kernel_size,
             freeze_ir=freeze_ir,
             use_slot_cross_attention=use_slot_cross_attention,
+            slot_cross_attention_no_residual=slot_cross_attention_no_residual,
             use_color_slots=use_color_slots,
             use_affinity_slots=use_affinity_slots,
             num_slots=num_slots,
@@ -1691,7 +1955,7 @@ class CriticCNN(nn.Module):
     Critic network that predicts which pixels are wrong in a predicted output.
 
     Only sees the predicted output grid - no input, no ground truth at inference.
-    Trained concurrently with PixelErrorCNN to learn error patterns.
+    Trained concurrently with DorsalCNN to learn error patterns.
 
     Architecture: Simplified U-Net
     - Input: predicted output grid (10 channels one-hot)
@@ -2481,7 +2745,7 @@ def run_layer_ablation(
     print(f"  Perfect Rate:   {baseline_perfect:.2%}")
     print(f"{'-'*70}\n")
 
-    # PixelErrorCNN (U-Net) layers - build based on num_layers
+    # DorsalCNN (U-Net) layers - build based on num_layers
     encoder_layers = [
         ("inc (initial conv)", model.inc),
     ]
@@ -3477,6 +3741,12 @@ def main():
                         help="Where to apply cross-attention: 'early' (on embeddings before CNN) or 'late' (on decoder features before outc, default)")
     parser.add_argument("--cross-attention-no-softmax", action="store_true",
                         help="Disable softmax in cross-attention (use raw attention scores)")
+    parser.add_argument("--cross-attention-per-layer", action="store_true",
+                        help="Apply cross-attention after each conv layer (default: once at end). "
+                             "With conv-depth=3, applies 3 times per block.")
+    parser.add_argument("--cross-attention-shared", action="store_true",
+                        help="Share cross-attention parameters across all layers (default: separate). "
+                             "Only relevant when --cross-attention-per-layer is enabled.")
     parser.add_argument("--ir-checkpoint", type=str, default=None,
                         help="Path to instance recognition CNN checkpoint for cross-attention keys/values (requires --use-cross-attention)")
     parser.add_argument("--use-untrained-ir", action="store_true",
@@ -3498,6 +3768,9 @@ def main():
     parser.add_argument("--use-slot-cross-attention", action="store_true",
                         help="Enable slot-routed cross-attention: output pixels attend to input "
                              "pixels via object-level slot routing. Requires IR encoder.")
+    parser.add_argument("--slot-cross-attention-no-residual", action="store_true",
+                        help="Disable residual connection for slot cross-attention. Instead of "
+                             "adding attended features to decoder features, replace them directly.")
     parser.add_argument("--num-slots", type=int, default=8,
                         help="Number of slots for slot attention (default: 8)")
     parser.add_argument("--slot-dim", type=int, default=8,
@@ -3724,7 +3997,7 @@ def main():
     encoding_str = "one-hot+nonzero (11 ch/grid)" if args.use_onehot else "learned embeddings (16 ch/grid)"
     print(f"Architecture: U-Net ({args.num_layers} encoder/decoder layers, conv_depth={args.conv_depth} ({rf_per_block}x{rf_per_block} RF), {args.kernel_size}x{args.kernel_size} kernels)")
     print(f"Encoding: {encoding_str}")
-    model = PixelErrorCNN(
+    model = DorsalCNN(
         hidden_dim=args.hidden_dim,
         no_skip=args.no_skip,
         num_layers=args.num_layers,
@@ -3737,6 +4010,8 @@ def main():
         cross_attention_heads=args.cross_attention_heads,
         cross_attention_position=args.cross_attention_position,
         cross_attention_no_softmax=args.cross_attention_no_softmax,
+        cross_attention_per_layer=args.cross_attention_per_layer,
+        cross_attention_shared=args.cross_attention_shared,
         ir_checkpoint=args.ir_checkpoint,
         use_untrained_ir=args.use_untrained_ir,
         ir_hidden_dim=args.ir_hidden_dim,
@@ -3745,6 +4020,7 @@ def main():
         ir_kernel_size=args.ir_kernel_size,
         freeze_ir=args.freeze_ir,
         use_slot_cross_attention=args.use_slot_cross_attention,
+        slot_cross_attention_no_residual=args.slot_cross_attention_no_residual,
         use_color_slots=args.use_color_slots,
         use_affinity_slots=args.use_affinity_slots,
         num_slots=args.num_slots,
@@ -3767,17 +4043,22 @@ def main():
         heads_str = f", {args.cross_attention_heads} heads" if args.cross_attention_heads > 1 else ""
         pos = args.cross_attention_position
         pos_desc = "on embeddings before CNN" if pos == "early" else "on decoder features after CNN"
+        per_layer_str = ""
+        if args.cross_attention_per_layer:
+            shared_str = "shared" if args.cross_attention_shared else "separate"
+            per_layer_str = f", per-layer ({shared_str} params)"
         if args.ir_checkpoint:
             freeze_str = "frozen" if args.freeze_ir else "fine-tuned"
-            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}{heads_str}) from {args.ir_checkpoint}")
+            print(f"Cross-attention: ENABLED with pretrained IR encoder ({freeze_str}{heads_str}{per_layer_str}) from {args.ir_checkpoint}")
             print(f"  Position: {pos} ({pos_desc})")
         elif args.use_untrained_ir:
-            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init{heads_str}, for ablation)")
+            print(f"Cross-attention: ENABLED with UNTRAINED IR encoder (random init{heads_str}{per_layer_str}, for ablation)")
             print(f"  IR encoder config: hidden={args.ir_hidden_dim}, out={args.ir_out_dim}, "
                   f"layers={args.ir_num_layers}, kernel={args.ir_kernel_size}x{args.ir_kernel_size}")
             print(f"  Position: {pos} ({pos_desc})")
     if args.use_slot_cross_attention:
-        print(f"Slot cross-attention: ENABLED")
+        residual_str = " (NO RESIDUAL - direct replacement)" if args.slot_cross_attention_no_residual else ""
+        print(f"Slot cross-attention: ENABLED{residual_str}")
         if args.use_affinity_slots:
             print(f"  Mode: AFFINITY-BASED slots (connected components merged by affinity)")
             print(f"  Max slots={args.affinity_max_slots}, dim={args.slot_dim}")

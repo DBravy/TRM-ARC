@@ -444,11 +444,11 @@ class TRMSparse_Inner(nn.Module):
         # CNN for error detection (guides attention)
         self.correctness_cnn = None
         if config.cnn_checkpoint_path:
-            from train_pixel_error_cnn import PixelErrorCNN
+            from train_pixel_error_cnn import DorsalCNN
             if config.cnn_checkpoint_path == "init":
-                self.correctness_cnn = PixelErrorCNN(hidden_dim=64)
+                self.correctness_cnn = DorsalCNN(hidden_dim=64)
             else:
-                self.correctness_cnn = PixelErrorCNN.from_checkpoint(config.cnn_checkpoint_path)
+                self.correctness_cnn = DorsalCNN.from_checkpoint(config.cnn_checkpoint_path)
 
         self.register_buffer('step_counter', torch.tensor(0, dtype=torch.long))
 

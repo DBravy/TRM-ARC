@@ -1029,8 +1029,8 @@ def train(args):
     if args.cnn_checkpoint and os.path.exists(args.cnn_checkpoint):
         print(f"\nLoading CNN error detector from {args.cnn_checkpoint}...")
         try:
-            from train_pixel_error_cnn import PixelErrorCNN
-            cnn_model = PixelErrorCNN.from_checkpoint(args.cnn_checkpoint, DEVICE)
+            from train_pixel_error_cnn import DorsalCNN
+            cnn_model = DorsalCNN.from_checkpoint(args.cnn_checkpoint, DEVICE)
             print("CNN error detector loaded successfully")
         except Exception as e:
             print(f"Warning: Could not load CNN model: {e}")

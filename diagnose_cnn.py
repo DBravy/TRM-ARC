@@ -35,8 +35,8 @@ GRID_SIZE = 30
 def load_cnn(checkpoint_path: str):
     """Load the CNN model"""
     # Import here to avoid dependency issues
-    from train_pixel_error_cnn import PixelErrorCNN
-    return PixelErrorCNN.from_checkpoint(checkpoint_path, device=DEVICE)
+    from train_pixel_error_cnn import DorsalCNN
+    return DorsalCNN.from_checkpoint(checkpoint_path, device=DEVICE)
 
 
 def load_puzzles(dataset_name: str, data_root: str = "kaggle/combined"):

@@ -363,11 +363,11 @@ def load_trm_model(checkpoint_path: str, device: torch.device):
 
 def load_cnn_model(checkpoint_path: str, device: torch.device):
     """Load trained CNN model from checkpoint."""
-    from train_pixel_error_cnn import PixelErrorCNN
+    from train_pixel_error_cnn import DorsalCNN
 
     print(f"\nLoading CNN from {checkpoint_path}...")
 
-    model = PixelErrorCNN.from_checkpoint(checkpoint_path, device)
+    model = DorsalCNN.from_checkpoint(checkpoint_path, device)
     model.eval()
 
     print(f"  Loaded CNN in color mode")

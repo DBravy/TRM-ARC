@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 # Import model and utilities from train_pixel_error_cnn.py
 from train_pixel_error_cnn import (
-    PixelErrorCNN,
+    DorsalCNN,
     dihedral_transform,
     random_color_permutation,
     apply_augmentation,
@@ -173,7 +173,7 @@ def analyze_puzzle_palettes(puzzle: Dict) -> Dict:
 # =============================================================================
 # Model imported from train_pixel_error_cnn.py
 # =============================================================================
-# PixelErrorCNN and related utilities are imported at top of file
+# DorsalCNN and related utilities are imported at top of file
 
 
 # =============================================================================
@@ -643,7 +643,7 @@ def train_on_puzzle(
     - Mismatched augmentation samples
     - Degenerate outputs (zeros, constant, noise, color_swap)
 
-    Architecture options are passed through to PixelErrorCNN.
+    Architecture options are passed through to DorsalCNN.
     """
 
     # Distribute negatives based on negative_type
@@ -700,7 +700,7 @@ def train_on_puzzle(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     # Create model with all architecture options
-    model = PixelErrorCNN(
+    model = DorsalCNN(
         hidden_dim=hidden_dim,
         no_skip=no_skip,
         num_layers=num_layers,
@@ -837,7 +837,7 @@ def train_on_all_puzzles(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     # Create model with all architecture options
-    model = PixelErrorCNN(
+    model = DorsalCNN(
         hidden_dim=hidden_dim,
         no_skip=no_skip,
         num_layers=num_layers,
