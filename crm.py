@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import random
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -193,6 +194,50 @@ def generate_color_swap(grid: np.ndarray) -> np.ndarray:
             result[r, c] = color_to
 
     return result
+
+
+# =============================================================================
+# Object Crop Extraction for Object-Level Training
+# =============================================================================
+
+def extract_shape_crop_30x30(grid: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """Extract bounding box crop of a shape, top-left aligned in 30x30 canvas.
+
+    Args:
+        grid: (H, W) integer array with color values 0-9
+        mask: (H, W) binary mask for the shape (1 = inside object, 0 = outside)
+
+    Returns:
+        padded_crop: (30, 30) array with shape top-left aligned, padding=10
+        bbox: (min_row, min_col, max_row, max_col) original bounding box
+    """
+    CANVAS_SIZE = 30
+    PADDING_VALUE = 10
+
+    rows, cols = np.where(mask > 0)
+    if len(rows) == 0:
+        # Empty mask - return all padding
+        return np.full((CANVAS_SIZE, CANVAS_SIZE), PADDING_VALUE, dtype=np.uint8), (0, 0, 0, 0)
+
+    min_r, max_r = rows.min(), rows.max()
+    min_c, max_c = cols.min(), cols.max()
+
+    # Extract crop from grid
+    crop = grid[min_r:max_r+1, min_c:max_c+1].copy()
+    crop_mask = mask[min_r:max_r+1, min_c:max_c+1]
+
+    # Zero out pixels outside the shape mask (use black as background within bbox)
+    crop = crop.astype(np.uint8)
+    crop[~crop_mask.astype(bool)] = 0
+
+    # Create padded canvas
+    h, w = crop.shape
+    padded = np.full((CANVAS_SIZE, CANVAS_SIZE), PADDING_VALUE, dtype=np.uint8)
+
+    # Top-left alignment (no resizing since max size is 30x30)
+    padded[:h, :w] = crop
+
+    return padded, (min_r, min_c, max_r, max_c)
 
 
 # =============================================================================
@@ -1696,24 +1741,37 @@ class DorsalCNN(nn.Module):
         onehot = onehot * content_mask
         return torch.cat([onehot, content_mask], dim=-1)
 
-    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor):
+    def forward(self, input_grid: torch.Tensor, output_grid: torch.Tensor,
+                full_input_grid: torch.Tensor = None):
         """
         Forward pass for pixel prediction.
+
+        Args:
+            input_grid: (B, 30, 30) - Input grid (or input object crop for object-level training)
+            output_grid: (B, 30, 30) - Output grid (or candidate output crop)
+            full_input_grid: (B, 30, 30) - Optional full input grid for VentralCNN context.
+                             If None, uses input_grid for VentralCNN. Used in object-level
+                             training where input_grid is an object crop but VentralCNN
+                             needs the full input grid for context.
 
         Returns:
             pixel_logits (B, 10, H, W)
         """
+        # Use full_input_grid for VentralCNN if provided, else input_grid
+        ir_input = full_input_grid if full_input_grid is not None else input_grid
+
         # Create content mask for attention efficiency (mask out padding pixels)
         # content_mask: (B, H, W) where 1 = valid content, 0 = padding
         input_content_mask = (input_grid < 10).float()  # (B, H, W)
         output_content_mask = (output_grid < 10).float()  # (B, H, W)
+        ir_content_mask = (ir_input < 10).float()  # (B, H, W) - for VentralCNN
 
         # Compute IR features for cross-attention
         if self.ir_encoder is not None:
             # Clamp padding sentinel (10) to 0 and zero out padding positions
-            inp_clamped = input_grid.clamp(max=9)
+            inp_clamped = ir_input.clamp(max=9)
             inp_onehot = F.one_hot(inp_clamped.long(), NUM_COLORS).float()
-            content_mask_expanded = input_content_mask.unsqueeze(-1)  # (B, H, W, 1)
+            content_mask_expanded = ir_content_mask.unsqueeze(-1)  # (B, H, W, 1)
             inp_onehot = inp_onehot * content_mask_expanded  # Zero out padding
             inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()  # (B, 10, H, W)
             ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, out_dim)
@@ -1728,7 +1786,7 @@ class DorsalCNN(nn.Module):
         if self.cross_attention is not None and self.cross_attention_position == "early":
             out_emb = self.cross_attention(
                 query=out_emb, key_value=ir_features,
-                query_content_mask=output_content_mask, kv_content_mask=input_content_mask
+                query_content_mask=output_content_mask, kv_content_mask=ir_content_mask
             )
 
         # Encode input grid for U-Net concatenation (always use original embeddings)
@@ -1800,7 +1858,7 @@ class DorsalCNN(nn.Module):
             # ir_features is (B, H, W, ir_feature_dim) from earlier computation
             x_perm = self.cross_attention(
                 query=x_perm, key_value=ir_features,
-                query_content_mask=output_content_mask, kv_content_mask=input_content_mask
+                query_content_mask=output_content_mask, kv_content_mask=ir_content_mask
             )
             x = x_perm.permute(0, 3, 1, 2).contiguous()  # Back to (B, C, H, W)
 
@@ -1808,10 +1866,11 @@ class DorsalCNN(nn.Module):
         if self.slot_cross_attention is not None:
             # Compute slot embeddings and masks from IR features
             # ColorSlotAttention and AffinitySlotAttention need the color grid
+            # Use ir_input (full input grid) for slot attention in object-level training
             if self.use_color_slots or self.use_affinity_slots:
-                slot_embeddings, slot_masks = self.slot_attention(ir_features, input_grid)
+                slot_embeddings, slot_masks = self.slot_attention(ir_features, ir_input)
             else:
-                slot_embeddings, slot_masks = self.slot_attention(ir_features, content_mask=input_content_mask)
+                slot_embeddings, slot_masks = self.slot_attention(ir_features, content_mask=ir_content_mask)
 
             # Permute decoder features for attention: (B, C, H, W) -> (B, H, W, C)
             x_perm = x.permute(0, 2, 3, 1).contiguous()
@@ -1822,7 +1881,7 @@ class DorsalCNN(nn.Module):
                 slot_embeddings=slot_embeddings,
                 slot_masks=slot_masks,
                 ir_features=ir_features,
-                content_mask=input_content_mask
+                content_mask=ir_content_mask
             )
 
             # Residual connection (or direct replacement if no_residual)
@@ -2252,6 +2311,433 @@ class CorrespondenceDataset(Dataset):
 
 
 # =============================================================================
+# Object-Level Correspondence Dataset
+# =============================================================================
+
+@dataclass
+class ObjectCorrespondence:
+    """A single object correspondence from one example pair."""
+    puzzle_id: str
+    example_idx: int
+    input_grid: np.ndarray      # Full input grid (H, W)
+    output_grid: np.ndarray     # Full output grid (H, W)
+    input_mask: np.ndarray      # Mask for input object (H, W)
+    output_mask: np.ndarray     # Mask for output object (H, W)
+    input_slot_idx: int
+    output_slot_idx: int
+    similarity_score: float
+
+
+class ObjectCorrespondenceDataset(Dataset):
+    """
+    Dataset that trains on individual OBJECT correspondences.
+
+    For each grid pair (input, output):
+    1. Extract slots/objects from both grids using AffinitySlotAttention
+    2. Find correspondences between input and output objects
+    3. For each correspondence, generate training pairs with various sample types
+
+    Key difference from CorrespondenceDataset:
+    - One grid pair -> MULTIPLE training pairs (one per object correspondence)
+    - DorsalCNN receives object crops (30x30, top-left aligned)
+    - VentralCNN still receives full input grid for context
+    """
+
+    def __init__(
+        self,
+        puzzles: Dict,
+        slot_attention: 'AffinitySlotAttention',
+        device: torch.device,
+        # Correspondence settings
+        similarity_threshold: float = 0.3,
+        margin: float = 0.1,
+        # Sample type counts
+        num_positives: int = 2,
+        num_corrupted: int = 2,
+        num_wrong_input: int = 2,
+        num_mismatched_aug: int = 2,
+        num_all_zeros: int = 1,
+        num_constant_fill: int = 1,
+        num_random_noise: int = 1,
+        num_color_swap: int = 1,
+        # Augmentation settings
+        augment: bool = True,
+        dihedral_only: bool = False,
+        color_only: bool = False,
+        include_test: bool = False,
+    ):
+        self.puzzles = puzzles
+        self.slot_attention = slot_attention
+        self.device = device
+        self.similarity_threshold = similarity_threshold
+        self.margin = margin
+
+        # Sample type configuration
+        self.num_positives = num_positives
+        self.num_corrupted = num_corrupted
+        self.num_wrong_input = num_wrong_input
+        self.num_mismatched_aug = num_mismatched_aug
+        self.num_all_zeros = num_all_zeros
+        self.num_constant_fill = num_constant_fill
+        self.num_random_noise = num_random_noise
+        self.num_color_swap = num_color_swap
+
+        self.samples_per_correspondence = (
+            num_positives + num_corrupted + num_wrong_input + num_mismatched_aug +
+            num_all_zeros + num_constant_fill + num_random_noise + num_color_swap
+        )
+
+        # Augmentation settings
+        self.augment = augment
+        self.dihedral_only = dihedral_only
+        self.color_only = color_only
+
+        # Extract all correspondences
+        self.correspondences: List[ObjectCorrespondence] = []
+        self._extract_all_correspondences(include_test)
+
+        print(f"ObjectCorrespondenceDataset: {len(self.correspondences)} object correspondences "
+              f"from {len(puzzles)} puzzles, {self.samples_per_correspondence} samples each = "
+              f"{len(self)} total samples")
+
+    def _extract_slots(self, grid: np.ndarray) -> Tuple[torch.Tensor, int, int]:
+        """Extract slot masks from a grid using AffinitySlotAttention.
+
+        IMPORTANT: We run AffinitySlotAttention on the ORIGINAL grid size, not padded.
+        This is critical because padding with value 10 would cause incorrect background
+        detection (value 10 would be detected as background, breaking the merge logic).
+
+        Returns:
+            masks: (max_slots, H, W) slot masks at original grid size
+            h: original grid height
+            w: original grid width
+        """
+        h, w = grid.shape
+
+        # Convert to tensor at ORIGINAL size (no padding!)
+        grid_tensor = torch.from_numpy(grid.astype(np.int64)).unsqueeze(0).to(self.device)  # (1, h, w)
+
+        with torch.no_grad():
+            # AffinitySlotAttention needs features from IR encoder, but we only need masks
+            # which are computed from the color grid. Create dummy features of right shape.
+            dummy_features = torch.zeros(1, h, w, self.slot_attention.input_dim,
+                                        device=self.device, dtype=torch.float32)
+            _, masks = self.slot_attention(dummy_features, grid_tensor)  # masks: (1, max_slots, h, w)
+
+        return masks.squeeze(0), h, w  # (max_slots, h, w), h, w
+
+    def _extract_all_correspondences(self, include_test: bool):
+        """Extract and store all object correspondences from puzzles."""
+        # Import here to avoid circular dependency
+        from slot_viz import compute_slot_similarity, find_correspondences
+
+        for puzzle_id, puzzle in tqdm(self.puzzles.items(), desc="Extracting correspondences"):
+            examples = puzzle.get('train', [])
+            if include_test:
+                examples = examples + puzzle.get('test', [])
+
+            for ex_idx, example in enumerate(examples):
+                if 'output' not in example:
+                    continue
+
+                input_grid = np.array(example['input'], dtype=np.int64)
+                output_grid = np.array(example['output'], dtype=np.int64)
+
+                # Extract slots from both grids (masks are at original grid size)
+                input_masks, in_h, in_w = self._extract_slots(input_grid)   # (max_slots, h, w)
+                output_masks, out_h, out_w = self._extract_slots(output_grid)  # (max_slots, h, w)
+
+                # Compute similarity matrix using shape features
+                similarity, valid_in_idx, valid_out_idx = compute_slot_similarity(
+                    input_masks, output_masks, input_grid, output_grid
+                )
+
+                # Find correspondences
+                matches = find_correspondences(
+                    similarity, valid_in_idx, valid_out_idx,
+                    threshold=self.similarity_threshold, margin=self.margin
+                )
+
+                # Store each correspondence
+                for in_idx, out_idx, score in matches:
+                    # Get masks for storage
+                    input_mask = input_masks[in_idx].cpu().numpy()
+                    output_mask = output_masks[out_idx].cpu().numpy()
+
+                    corr = ObjectCorrespondence(
+                        puzzle_id=puzzle_id,
+                        example_idx=ex_idx,
+                        input_grid=input_grid,
+                        output_grid=output_grid,
+                        input_mask=input_mask,
+                        output_mask=output_mask,
+                        input_slot_idx=in_idx,
+                        output_slot_idx=out_idx,
+                        similarity_score=score,
+                    )
+                    self.correspondences.append(corr)
+
+    def __len__(self) -> int:
+        return len(self.correspondences) * self.samples_per_correspondence
+
+    def _get_augmentation(self) -> Tuple[int, np.ndarray]:
+        """Get augmentation parameters based on settings."""
+        if not self.augment:
+            return 0, np.arange(10, dtype=np.uint8)
+
+        if self.dihedral_only:
+            return random.randint(0, 7), np.arange(10, dtype=np.uint8)
+        elif self.color_only:
+            return 0, random_color_permutation()
+        else:
+            return get_random_augmentation()
+
+    def _get_sample_type(self, sample_type_idx: int) -> str:
+        """Determine sample type from index."""
+        pos_end = self.num_positives
+        corrupt_end = pos_end + self.num_corrupted
+        wrong_end = corrupt_end + self.num_wrong_input
+        mismatch_end = wrong_end + self.num_mismatched_aug
+        zeros_end = mismatch_end + self.num_all_zeros
+        const_end = zeros_end + self.num_constant_fill
+        noise_end = const_end + self.num_random_noise
+
+        if sample_type_idx < pos_end:
+            return "positive"
+        elif sample_type_idx < corrupt_end:
+            return "corrupted"
+        elif sample_type_idx < wrong_end:
+            return "wrong_input"
+        elif sample_type_idx < mismatch_end:
+            return "mismatched_aug"
+        elif sample_type_idx < zeros_end:
+            return "all_zeros"
+        elif sample_type_idx < const_end:
+            return "constant_fill"
+        elif sample_type_idx < noise_end:
+            return "random_noise"
+        else:
+            return "color_swap"
+
+    def _get_different_correspondence(self, current_idx: int) -> ObjectCorrespondence:
+        """Get a different correspondence for wrong_input samples."""
+        while True:
+            other_idx = random.randint(0, len(self.correspondences) - 1)
+            if other_idx != current_idx:
+                return self.correspondences[other_idx]
+
+    def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
+        """Pad grid to GRID_SIZE x GRID_SIZE with padding value 10."""
+        h, w = grid.shape
+        padded = np.full((GRID_SIZE, GRID_SIZE), 10, dtype=np.uint8)
+        padded[:h, :w] = grid
+        return padded
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+        corr_idx = idx // self.samples_per_correspondence
+        sample_type_idx = idx % self.samples_per_correspondence
+
+        corr = self.correspondences[corr_idx]
+        sample_type = self._get_sample_type(sample_type_idx)
+
+        # Get the input/output grids and masks
+        input_grid = corr.input_grid
+        output_grid = corr.output_grid
+        input_mask = corr.input_mask
+        output_mask = corr.output_mask
+
+        if sample_type == "positive":
+            # Same augmentation on input and output
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            # Transform masks with dihedral (masks don't use color)
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            # Extract object crops (30x30, top-left aligned)
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            # Full input grid for VentralCNN context
+            full_input = self._pad_grid(aug_input_grid)
+
+            target_correct = output_crop.copy()
+            is_positive = 1.0
+
+        elif sample_type == "corrupted":
+            # Same augmentation, but corrupt the output
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            correct_output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            # Corrupt the output crop
+            output_crop = corrupt_output(correct_output_crop)
+
+            full_input = self._pad_grid(aug_input_grid)
+            target_correct = correct_output_crop.copy()
+            is_positive = 0.0
+
+        elif sample_type == "wrong_input":
+            # Use a different correspondence's input object
+            wrong_corr = self._get_different_correspondence(corr_idx)
+
+            trans_id, color_map = self._get_augmentation()
+
+            # Use wrong correspondence's input
+            aug_wrong_input_grid = apply_augmentation(wrong_corr.input_grid, trans_id, color_map)
+            aug_wrong_input_mask = dihedral_transform(wrong_corr.input_mask, trans_id)
+
+            # Use correct correspondence's output
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_wrong_input_grid, aug_wrong_input_mask)
+            output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            # Full input is the WRONG input grid
+            full_input = self._pad_grid(aug_wrong_input_grid)
+
+            target_correct = output_crop.copy()
+            is_positive = 0.0
+
+        elif sample_type == "mismatched_aug":
+            # Different augmentations on input vs output
+            trans_id_1, color_map_1 = self._get_augmentation()
+            trans_id_2, color_map_2 = self._get_augmentation()
+
+            # Ensure they're actually different
+            while trans_id_1 == trans_id_2 and np.array_equal(color_map_1, color_map_2):
+                trans_id_2, color_map_2 = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id_1, color_map_1)
+            aug_output_grid = apply_augmentation(output_grid, trans_id_2, color_map_2)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id_1)
+            aug_output_mask = dihedral_transform(output_mask, trans_id_2)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            full_input = self._pad_grid(aug_input_grid)
+
+            # Target is what output SHOULD be with input's augmentation
+            correct_aug_output = apply_augmentation(output_grid, trans_id_1, color_map_1)
+            correct_aug_output_mask = dihedral_transform(output_mask, trans_id_1)
+            target_correct, _ = extract_shape_crop_30x30(correct_aug_output, correct_aug_output_mask)
+            is_positive = 0.0
+
+        elif sample_type == "all_zeros":
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            correct_output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            # Output is all zeros (within the object's bbox extent)
+            output_crop = generate_all_zeros(correct_output_crop)
+
+            full_input = self._pad_grid(aug_input_grid)
+            target_correct = correct_output_crop.copy()
+            is_positive = 0.0
+
+        elif sample_type == "constant_fill":
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            correct_output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            output_crop = generate_constant_fill(correct_output_crop)
+
+            full_input = self._pad_grid(aug_input_grid)
+            target_correct = correct_output_crop.copy()
+            is_positive = 0.0
+
+        elif sample_type == "random_noise":
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            correct_output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            output_crop = generate_random_noise(correct_output_crop)
+
+            full_input = self._pad_grid(aug_input_grid)
+            target_correct = correct_output_crop.copy()
+            is_positive = 0.0
+
+        else:  # color_swap
+            trans_id, color_map = self._get_augmentation()
+
+            aug_input_grid = apply_augmentation(input_grid, trans_id, color_map)
+            aug_output_grid = apply_augmentation(output_grid, trans_id, color_map)
+
+            aug_input_mask = dihedral_transform(input_mask, trans_id)
+            aug_output_mask = dihedral_transform(output_mask, trans_id)
+
+            input_crop, _ = extract_shape_crop_30x30(aug_input_grid, aug_input_mask)
+            correct_output_crop, _ = extract_shape_crop_30x30(aug_output_grid, aug_output_mask)
+
+            output_crop = generate_color_swap(correct_output_crop)
+
+            full_input = self._pad_grid(aug_input_grid)
+            target_correct = correct_output_crop.copy()
+            is_positive = 0.0
+
+        # Create pixel mask: 1 within object boundary (non-padding), 0 outside
+        pixel_mask = (output_crop < 10).astype(np.float32)
+
+        # Get output dimensions for the target
+        rows, cols = np.where(target_correct < 10)
+        if len(rows) > 0:
+            target_out_h = rows.max() + 1
+            target_out_w = cols.max() + 1
+        else:
+            target_out_h, target_out_w = 1, 1
+
+        # Ensure contiguous arrays
+        input_crop = np.ascontiguousarray(input_crop)
+        output_crop = np.ascontiguousarray(output_crop)
+        target_correct = np.ascontiguousarray(target_correct)
+        pixel_mask = np.ascontiguousarray(pixel_mask)
+        full_input = np.ascontiguousarray(full_input)
+
+        return (
+            torch.from_numpy(input_crop.copy()).long(),       # Input object crop
+            torch.from_numpy(output_crop.copy()).long(),      # Candidate output crop
+            torch.from_numpy(target_correct.copy()).long(),   # Target colors
+            torch.from_numpy(pixel_mask.copy()).float(),      # Pixel mask (1 within object)
+            torch.from_numpy(full_input.copy()).long(),       # Full input grid for VentralCNN
+            torch.tensor([target_out_h, target_out_w], dtype=torch.long),  # Target dims
+        )
+
+
+# =============================================================================
 # Training
 # =============================================================================
 
@@ -2492,6 +2978,183 @@ def evaluate_test_examples(
         'results': results,
         'iter_stats': iter_stats if recursive_iters > 1 else None,
     }
+
+    return result
+
+
+def evaluate_test_examples_object_level(
+    model: nn.Module,
+    test_dataset: TestEvalDataset,
+    slot_attention: 'AffinitySlotAttention',
+    device: torch.device,
+    verbose: bool = True,
+    visualize: bool = True,
+    similarity_threshold: float = 0.3,
+    margin: float = 0.1,
+) -> Dict[str, float]:
+    """
+    Evaluate model on held-out test examples in object-level mode.
+
+    For each test example:
+    1. Extract objects from both input and output using AffinitySlotAttention
+    2. Find correspondences between input and output objects
+    3. For each correspondence, predict output and compare against ground truth
+    """
+    from slot_viz import compute_slot_similarity, find_correspondences
+
+    model.eval()
+
+    total_objects = 0
+    total_pixels = 0
+    total_correct = 0
+    perfect_objects = 0
+
+    with torch.no_grad():
+        for i in range(len(test_dataset)):
+            input_grid, output_grid, dims, puzzle_id = test_dataset[i]
+            inp_h, inp_w = dims[0].item(), dims[1].item()
+            out_h, out_w = dims[2].item(), dims[3].item()
+
+            input_np = input_grid.numpy()[:inp_h, :inp_w]
+            output_np = output_grid.numpy()[:out_h, :out_w]
+
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Test Example {i+1}: {puzzle_id}")
+                print(f"Input: {inp_h}x{inp_w}, Output: {out_h}x{out_w}")
+                print(f"{'='*60}")
+
+            # Extract objects from input (use ORIGINAL size, not padded!)
+            input_tensor = torch.from_numpy(input_np.astype(np.int64)).unsqueeze(0).to(device)
+            dummy_features_in = torch.zeros(1, inp_h, inp_w, slot_attention.input_dim,
+                                           device=device, dtype=torch.float32)
+            _, input_masks = slot_attention(dummy_features_in, input_tensor)
+            input_masks = input_masks.squeeze(0)  # (max_slots, inp_h, inp_w)
+
+            # Extract objects from output
+            output_tensor = torch.from_numpy(output_np.astype(np.int64)).unsqueeze(0).to(device)
+            dummy_features_out = torch.zeros(1, out_h, out_w, slot_attention.input_dim,
+                                            device=device, dtype=torch.float32)
+            _, output_masks = slot_attention(dummy_features_out, output_tensor)
+            output_masks = output_masks.squeeze(0)  # (max_slots, out_h, out_w)
+
+            # Find correspondences between input and output objects
+            similarity, valid_in_idx, valid_out_idx = compute_slot_similarity(
+                input_masks, output_masks, input_np, output_np
+            )
+            matches = find_correspondences(
+                similarity, valid_in_idx, valid_out_idx,
+                threshold=similarity_threshold, margin=margin
+            )
+
+            if verbose:
+                print(f"Found {len(valid_in_idx)} input objects, {len(valid_out_idx)} output objects")
+                print(f"Found {len(matches)} correspondences")
+
+            # Create padded input for VentralCNN context
+            padded_input = np.full((GRID_SIZE, GRID_SIZE), 10, dtype=np.int64)
+            padded_input[:inp_h, :inp_w] = input_np
+
+            # For each correspondence, predict and compare
+            for match_idx, (in_slot_idx, out_slot_idx, score) in enumerate(matches):
+                input_mask_np = input_masks[in_slot_idx].cpu().numpy()
+                output_mask_np = output_masks[out_slot_idx].cpu().numpy()
+
+                # Extract input and ground truth output object crops
+                input_crop, input_bbox = extract_shape_crop_30x30(input_np, input_mask_np)
+                target_crop, output_bbox = extract_shape_crop_30x30(output_np, output_mask_np)
+
+                # Get true output object dimensions
+                target_rows, target_cols = np.where(target_crop < 10)
+                if len(target_rows) > 0:
+                    true_out_h = target_rows.max() + 1
+                    true_out_w = target_cols.max() + 1
+                else:
+                    true_out_h, true_out_w = 1, 1
+
+                # Create all-zeros candidate (model predicts from scratch)
+                candidate_crop = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+
+                # Prepare tensors
+                input_crop_t = torch.from_numpy(input_crop).unsqueeze(0).long().to(device)
+                candidate_t = torch.from_numpy(candidate_crop).unsqueeze(0).long().to(device)
+                full_input_t = torch.from_numpy(padded_input).unsqueeze(0).long().to(device)
+
+                # Predict
+                logits = model(input_crop_t, candidate_t, full_input_grid=full_input_t)
+                pred_colors = logits.argmax(dim=1)[0].cpu().numpy()  # (30, 30)
+
+                # Compare prediction against ground truth using TRUE output dimensions
+                pred_region = pred_colors[:true_out_h, :true_out_w]
+                target_region = target_crop[:true_out_h, :true_out_w]
+
+                correct = (pred_region == target_region).sum()
+                total = true_out_h * true_out_w
+                is_perfect = (correct == total)
+
+                total_objects += 1
+                total_pixels += total
+                total_correct += correct
+                if is_perfect:
+                    perfect_objects += 1
+
+                if visualize:
+                    # Get input object dimensions
+                    input_rows, input_cols = np.where(input_crop < 10)
+                    if len(input_rows) > 0:
+                        input_crop_h = input_rows.max() + 1
+                        input_crop_w = input_cols.max() + 1
+                    else:
+                        input_crop_h, input_crop_w = 1, 1
+
+                    status = "PERFECT" if is_perfect else f"ERRORS: {total - correct}/{total}"
+                    print(f"\n  Object {match_idx + 1} (in:{in_slot_idx}->out:{out_slot_idx}, sim={score:.2f}) [{status}]")
+                    print(f"    Input bbox: rows {input_bbox[0]}-{input_bbox[2]}, cols {input_bbox[1]}-{input_bbox[3]}")
+                    print(f"    Output bbox: rows {output_bbox[0]}-{output_bbox[2]}, cols {output_bbox[1]}-{output_bbox[3]}")
+
+                    print(f"    Input object ({input_crop_h}x{input_crop_w}):")
+                    for r in range(input_crop_h):
+                        row_str = "      "
+                        for c in range(input_crop_w):
+                            val = input_crop[r, c]
+                            row_str += f"{val} " if val < 10 else ". "
+                        print(row_str)
+
+                    print(f"    Target output ({true_out_h}x{true_out_w}):")
+                    for r in range(true_out_h):
+                        row_str = "      "
+                        for c in range(true_out_w):
+                            val = target_crop[r, c]
+                            row_str += f"{val} " if val < 10 else ". "
+                        print(row_str)
+
+                    print(f"    Predicted output ({true_out_h}x{true_out_w}):")
+                    for r in range(true_out_h):
+                        row_str = "      "
+                        for c in range(true_out_w):
+                            val = pred_colors[r, c]
+                            row_str += f"{val} " if val < 10 else ". "
+                        print(row_str)
+
+    pixel_accuracy = total_correct / max(total_pixels, 1)
+    perfect_rate = perfect_objects / max(total_objects, 1)
+
+    result = {
+        'total_objects': total_objects,
+        'total_pixels': total_pixels,
+        'total_correct': total_correct,
+        'perfect_objects': perfect_objects,
+        'pixel_accuracy': pixel_accuracy,
+        'perfect_rate': perfect_rate,
+    }
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Object-Level Evaluation Summary")
+        print(f"{'='*60}")
+        print(f"Total objects evaluated: {total_objects}")
+        print(f"Perfect objects: {perfect_objects}/{total_objects} ({100*perfect_rate:.1f}%)")
+        print(f"Pixel accuracy: {total_correct}/{total_pixels} ({100*pixel_accuracy:.1f}%)")
 
     return result
 
@@ -2766,6 +3429,7 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    object_level: bool = False,
 ) -> Dict[str, float]:
     """Training epoch for color prediction"""
     model.train()
@@ -2779,7 +3443,15 @@ def train_epoch(
     num_batches = 0
 
     pbar = tqdm(loader, desc="Training")
-    for input_grid, output_grid, target_colors, pixel_mask, output_dims in pbar:
+    for batch in pbar:
+        # Handle both standard (5-tuple) and object-level (6-tuple) datasets
+        if object_level:
+            input_grid, output_grid, target_colors, pixel_mask, full_input_grid, output_dims = batch
+            full_input_grid = full_input_grid.to(device)
+        else:
+            input_grid, output_grid, target_colors, pixel_mask, output_dims = batch
+            full_input_grid = None
+
         input_grid = input_grid.to(device)
         output_grid = output_grid.to(device)
         target_colors = target_colors.to(device)
@@ -2788,7 +3460,7 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        pixel_logits = model(input_grid, output_grid)
+        pixel_logits = model(input_grid, output_grid, full_input_grid=full_input_grid)
 
         # Create mask for actual output region (excludes padding)
         content_mask = create_output_region_mask(output_dims)
@@ -2841,6 +3513,7 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    object_level: bool = False,
 ) -> Dict[str, float]:
     """Evaluation for color prediction"""
     model.eval()
@@ -2856,14 +3529,22 @@ def evaluate(
     num_batches = 0
 
     with torch.no_grad():
-        for input_grid, output_grid, target_colors, pixel_mask, output_dims in loader:
+        for batch in loader:
+            # Handle both standard (5-tuple) and object-level (6-tuple) datasets
+            if object_level:
+                input_grid, output_grid, target_colors, pixel_mask, full_input_grid, output_dims = batch
+                full_input_grid = full_input_grid.to(device)
+            else:
+                input_grid, output_grid, target_colors, pixel_mask, output_dims = batch
+                full_input_grid = None
+
             input_grid = input_grid.to(device)
             output_grid = output_grid.to(device)
             target_colors = target_colors.to(device)
             pixel_mask = pixel_mask.to(device)
             output_dims = output_dims.to(device)
 
-            pixel_logits = model(input_grid, output_grid)
+            pixel_logits = model(input_grid, output_grid, full_input_grid=full_input_grid)
 
             # Create mask for actual output region (excludes padding)
             content_mask = create_output_region_mask(output_dims)
@@ -3457,6 +4138,12 @@ def main():
                              "Zeros each layer's output and measures accuracy drop. "
                              "Requires --eval-on-test to have test data to evaluate against.")
 
+    # Object-level training mode
+    parser.add_argument("--object-level", action="store_true",
+                        help="Train on individual object correspondences rather than full grids. "
+                             "Uses correspondence system to break puzzles into object-level pairs. "
+                             "Requires --use-affinity-slots for object extraction.")
+
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -3510,6 +4197,12 @@ def main():
         print("Warning: --ablation requires --eval-on-test to have test data to evaluate against.")
         print("         Ablation analysis will be skipped. Add --eval-on-test to enable it.")
         args.ablation = False
+
+    # Check object-level requirements
+    if args.object_level:
+        print("\n*** OBJECT-LEVEL TRAINING MODE ***")
+        print("Training on individual object correspondences rather than full grids.")
+        print("Each grid pair will be decomposed into multiple object-level training pairs.\n")
     
     # For --eval-on-test mode, explain what we're doing
     if args.eval_on_test:
@@ -3595,38 +4288,110 @@ def main():
     # Determine whether to include test examples in training
     # For --eval-on-test mode, we train ONLY on train examples
     include_test_in_train = not args.eval_on_test
-    
+
     # Create datasets
-    train_dataset = CorrespondenceDataset(
-        train_puzzles,
-        num_positives=num_positives,
-        num_corrupted=num_corrupted,
-        num_wrong_input=num_wrong_input,
-        num_mismatched_aug=num_mismatched_aug,
-        num_all_zeros=num_all_zeros,
-        num_constant_fill=num_constant_fill,
-        num_random_noise=num_random_noise,
-        num_color_swap=num_color_swap,
-        augment=use_augment,
-        dihedral_only=args.dihedral_only,
-        color_only=args.color_only,
-        include_test=include_test_in_train,
-    )
-    val_dataset = CorrespondenceDataset(
-        val_puzzles,
-        num_positives=num_positives,
-        num_corrupted=num_corrupted,
-        num_wrong_input=num_wrong_input,
-        num_mismatched_aug=num_mismatched_aug,
-        num_all_zeros=num_all_zeros,
-        num_constant_fill=num_constant_fill,
-        num_random_noise=num_random_noise,
-        num_color_swap=num_color_swap,
-        augment=use_augment,
-        dihedral_only=args.dihedral_only,
-        color_only=args.color_only,
-        include_test=include_test_in_train,
-    )
+    correspondence_slot_attention = None  # Will be set if object-level mode
+    if args.object_level:
+        # Create AffinitySlotAttention for object extraction (used during dataset creation)
+        # We use dummy input_dim since we only need masks, not slot embeddings
+        print("Creating AffinitySlotAttention for object extraction...")
+        correspondence_slot_attention = AffinitySlotAttention(
+            input_dim=16,  # Dummy value - we only use masks, not slot embeddings
+            slot_dim=16,   # Dummy value - we only use masks, not slot embeddings
+            max_slots=args.affinity_max_slots,
+            merge_threshold=args.merge_threshold,
+            use_background_detection=not args.no_affinity_background_detection,
+        ).to(DEVICE)
+        correspondence_slot_attention.eval()  # Use in eval mode for consistent results
+
+        train_dataset = ObjectCorrespondenceDataset(
+            train_puzzles,
+            slot_attention=correspondence_slot_attention,
+            device=DEVICE,
+            similarity_threshold=0.3,
+            margin=0.1,
+            num_positives=num_positives,
+            num_corrupted=num_corrupted,
+            num_wrong_input=num_wrong_input,
+            num_mismatched_aug=num_mismatched_aug,
+            num_all_zeros=num_all_zeros,
+            num_constant_fill=num_constant_fill,
+            num_random_noise=num_random_noise,
+            num_color_swap=num_color_swap,
+            augment=use_augment,
+            dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+            include_test=include_test_in_train,
+        )
+        val_dataset = ObjectCorrespondenceDataset(
+            val_puzzles,
+            slot_attention=correspondence_slot_attention,
+            device=DEVICE,
+            similarity_threshold=0.3,
+            margin=0.1,
+            num_positives=num_positives,
+            num_corrupted=num_corrupted,
+            num_wrong_input=num_wrong_input,
+            num_mismatched_aug=num_mismatched_aug,
+            num_all_zeros=num_all_zeros,
+            num_constant_fill=num_constant_fill,
+            num_random_noise=num_random_noise,
+            num_color_swap=num_color_swap,
+            augment=use_augment,
+            dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+            include_test=include_test_in_train,
+        )
+    else:
+        train_dataset = CorrespondenceDataset(
+            train_puzzles,
+            num_positives=num_positives,
+            num_corrupted=num_corrupted,
+            num_wrong_input=num_wrong_input,
+            num_mismatched_aug=num_mismatched_aug,
+            num_all_zeros=num_all_zeros,
+            num_constant_fill=num_constant_fill,
+            num_random_noise=num_random_noise,
+            num_color_swap=num_color_swap,
+            augment=use_augment,
+            dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+            include_test=include_test_in_train,
+        )
+        val_dataset = CorrespondenceDataset(
+            val_puzzles,
+            num_positives=num_positives,
+            num_corrupted=num_corrupted,
+            num_wrong_input=num_wrong_input,
+            num_mismatched_aug=num_mismatched_aug,
+            num_all_zeros=num_all_zeros,
+            num_constant_fill=num_constant_fill,
+            num_random_noise=num_random_noise,
+            num_color_swap=num_color_swap,
+            augment=use_augment,
+            dihedral_only=args.dihedral_only,
+            color_only=args.color_only,
+            include_test=include_test_in_train,
+        )
+
+    # Print correspondence info for object-level mode
+    if args.object_level:
+        print(f"\n{'='*60}")
+        print("OBJECT-LEVEL TRAINING SUMMARY")
+        print(f"{'='*60}")
+        print(f"Train correspondences: {len(train_dataset.correspondences)}")
+        print(f"Val correspondences: {len(val_dataset.correspondences)}")
+        print(f"Samples per correspondence: {train_dataset.samples_per_correspondence}")
+        print(f"Total train samples: {len(train_dataset)}")
+        print(f"Total val samples: {len(val_dataset)}")
+
+        # Show breakdown by puzzle
+        puzzle_counts = {}
+        for corr in train_dataset.correspondences:
+            puzzle_counts[corr.puzzle_id] = puzzle_counts.get(corr.puzzle_id, 0) + 1
+        for pid, count in puzzle_counts.items():
+            print(f"  Puzzle {pid}: {count} object correspondences")
+        print(f"{'='*60}\n")
 
     # For --eval-on-test, create separate test evaluation dataset
     test_eval_dataset = None
@@ -3734,8 +4499,8 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE)
-        val_metrics = evaluate(model, val_loader, DEVICE)
+        train_metrics = train_epoch(model, train_loader, optimizer, DEVICE, object_level=args.object_level)
+        val_metrics = evaluate(model, val_loader, DEVICE, object_level=args.object_level)
 
         # Print pixel metrics
         print(f"  Train Loss: {train_metrics['loss']:.4f}, Color Acc: {train_metrics['color_accuracy']:.2%}, "
@@ -3791,8 +4556,9 @@ def main():
         print(f"Using BEST checkpoint model")
     print(f"Checkpoint saved to: {args.save_path}")
 
-    # Visualize on training data
-    visualize_predictions(model, val_dataset, DEVICE)
+    # Visualize on training data (skip for object-level mode - different dataset structure)
+    if not args.object_level:
+        visualize_predictions(model, val_dataset, DEVICE)
 
     # =========================================================================
     # CRITICAL: Evaluate on held-out test examples
@@ -3819,59 +4585,72 @@ def main():
         else:
             print(f"Loaded BEST checkpoint from epoch {epoch_str}/{args.epochs} (val accuracy: {metric_str})")
 
-        test_results = evaluate_test_examples(
-            model, test_eval_dataset, DEVICE,
-            verbose=True, visualize=args.visualize,
-            recursive_iters=args.recursive_iters,
-        )
-
-        print(f"\n{'-'*60}")
-        print(f"TEST SET RESULTS:")
-        print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
-        print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
-        print(f"{'-'*60}")
-
-        if test_results['perfect_rate'] == 1.0:
-            print("\nPERFECT GENERALIZATION! The CNN learned the transformation rule!")
-            print("   This suggests the CNN can solve this puzzle from training examples alone.")
-        elif test_results['pixel_accuracy'] > 0.95:
-            print("\nStrong generalization - CNN learned most of the rule.")
-            print("  Minor errors may be edge cases or noise.")
-        elif test_results['pixel_accuracy'] > 0.8:
-            print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
+        if args.object_level:
+            # Object-level evaluation: extract objects from test input and predict their outputs
+            test_results = evaluate_test_examples_object_level(
+                model, test_eval_dataset, correspondence_slot_attention, DEVICE,
+                verbose=True, visualize=args.visualize,
+            )
+            print(f"\n{'-'*60}")
+            print(f"OBJECT-LEVEL TEST RESULTS:")
+            print(f"  Total objects evaluated: {test_results['total_objects']}")
+            print(f"{'-'*60}")
         else:
-            print("\nPoor generalization - CNN may have memorized training examples.")
-            print("  The transformation rule was not learned.")
+            test_results = evaluate_test_examples(
+                model, test_eval_dataset, DEVICE,
+                verbose=True, visualize=args.visualize,
+                recursive_iters=args.recursive_iters,
+            )
 
-        # Also show comparison with training examples
-        print("\n" + "-"*60)
-        print("Comparison - Evaluating on TRAINING examples (sanity check):")
-        train_eval_dataset = TestEvalDataset(train_puzzles, test_only=False)
-        train_results = evaluate_test_examples(
-            model, train_eval_dataset, DEVICE,
-            verbose=True, visualize=False,  # Don't visualize training examples
-            recursive_iters=args.recursive_iters,
-        )
-        # Summary comparison
-        print("\n" + "="*60)
-        print("GENERALIZATION SUMMARY")
-        print("="*60)
+            print(f"\n{'-'*60}")
+            print(f"TEST SET RESULTS:")
+            print(f"  Pixel Accuracy: {test_results['pixel_accuracy']:.2%}")
+            print(f"  Perfect Examples: {test_results['perfect_examples']}/{test_results['total_examples']} ({test_results['perfect_rate']:.2%})")
+            print(f"{'-'*60}")
 
-        print(f"\nTRAINING SET RESULTS:")
-        print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
-        print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
+        # Skip generalization summary for object-level mode (different metrics)
+        if not args.object_level:
+            if test_results['perfect_rate'] == 1.0:
+                print("\nPERFECT GENERALIZATION! The CNN learned the transformation rule!")
+                print("   This suggests the CNN can solve this puzzle from training examples alone.")
+            elif test_results['pixel_accuracy'] > 0.95:
+                print("\nStrong generalization - CNN learned most of the rule.")
+                print("  Minor errors may be edge cases or noise.")
+            elif test_results['pixel_accuracy'] > 0.8:
+                print("\n~ Partial generalization - CNN learned some patterns but not the full rule.")
+            else:
+                print("\nPoor generalization - CNN may have memorized training examples.")
+                print("  The transformation rule was not learned.")
 
-        print(f"\nComparison:")
-        print(f"  Training examples: {train_results['pixel_accuracy']:.2%} accuracy, {train_results['perfect_rate']:.2%} perfect")
-        print(f"  Test examples:     {test_results['pixel_accuracy']:.2%} accuracy, {test_results['perfect_rate']:.2%} perfect")
-        gap = train_results['pixel_accuracy'] - test_results['pixel_accuracy']
+            # Also show comparison with training examples
+            print("\n" + "-"*60)
+            print("Comparison - Evaluating on TRAINING examples (sanity check):")
+            train_eval_dataset = TestEvalDataset(train_puzzles, test_only=False)
+            train_results = evaluate_test_examples(
+                model, train_eval_dataset, DEVICE,
+                verbose=True, visualize=False,  # Don't visualize training examples
+                recursive_iters=args.recursive_iters,
+            )
+            # Summary comparison
+            print("\n" + "="*60)
+            print("GENERALIZATION SUMMARY")
+            print("="*60)
 
-        if gap > 0.1:
-            print(f"  Gap: {gap:.2%} - significant overfitting to training examples")
-        elif gap > 0.02:
-            print(f"  Gap: {gap:.2%} - mild overfitting")
-        else:
-            print(f"  Gap: {gap:.2%} - good generalization!")
+            print(f"\nTRAINING SET RESULTS:")
+            print(f"  Pixel Accuracy: {train_results['pixel_accuracy']:.2%}")
+            print(f"  Perfect Examples: {train_results['perfect_examples']}/{train_results['total_examples']} ({train_results['perfect_rate']:.2%})")
+
+            print(f"\nComparison:")
+            print(f"  Training examples: {train_results['pixel_accuracy']:.2%} accuracy, {train_results['perfect_rate']:.2%} perfect")
+            print(f"  Test examples:     {test_results['pixel_accuracy']:.2%} accuracy, {test_results['perfect_rate']:.2%} perfect")
+            gap = train_results['pixel_accuracy'] - test_results['pixel_accuracy']
+
+            if gap > 0.1:
+                print(f"  Gap: {gap:.2%} - significant overfitting to training examples")
+            elif gap > 0.02:
+                print(f"  Gap: {gap:.2%} - mild overfitting")
+            else:
+                print(f"  Gap: {gap:.2%} - good generalization!")
 
         # =========================================================================
         # LAYER-WISE ABLATION ANALYSIS

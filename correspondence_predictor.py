@@ -49,14 +49,14 @@ PADDING_VALUE = 10  # Sentinel value for padding (color 10 = invalid)
 # =============================================================================
 
 def extract_shape_crop(grid: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
-    """Extract bounding box crop of a shape, centered in SHAPE_SIZE canvas.
+    """Extract bounding box crop of a shape, top-left aligned in SHAPE_SIZE canvas.
 
     Args:
         grid: (H, W) integer array with color values 0-9
         mask: (H, W) binary mask for the shape
 
     Returns:
-        padded_crop: (SHAPE_SIZE, SHAPE_SIZE) array with shape centered, padding=10
+        padded_crop: (SHAPE_SIZE, SHAPE_SIZE) array with shape top-left aligned, padding=10
         bbox: (min_row, min_col, max_row, max_col) original bounding box
     """
     # Find bounding box
@@ -76,7 +76,7 @@ def extract_shape_crop(grid: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, 
     crop = crop.astype(np.uint8)
     crop[~crop_mask.astype(bool)] = 0
 
-    # Create padded canvas and center the crop
+    # Create padded canvas with top-left alignment
     h, w = crop.shape
 
     # Handle shapes larger than SHAPE_SIZE by resizing
@@ -91,9 +91,8 @@ def extract_shape_crop(grid: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, 
 
     padded = np.full((SHAPE_SIZE, SHAPE_SIZE), PADDING_VALUE, dtype=np.uint8)
 
-    start_r = (SHAPE_SIZE - h) // 2
-    start_c = (SHAPE_SIZE - w) // 2
-    padded[start_r:start_r+h, start_c:start_c+w] = crop
+    # Top-left alignment
+    padded[:h, :w] = crop
 
     return padded, (min_r, min_c, max_r, max_c)
 
@@ -465,13 +464,30 @@ class PixelTransformerPredictor(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
         nn.init.normal_(self.output_proj.weight, std=0.01)
 
-        # Bounding box prediction head (predicts RESIDUAL: output = input + delta)
-        # Zero residual = identity (output bbox = input bbox)
+        # Bounding box prediction head with dedicated cross-attention
+        # Uses a learnable bbox query that attends to VentralCNN context features
+        # Predicts RESIDUAL: output = input + delta (zero residual = identity)
         if use_bbox_prediction:
-            # Input: pooled pixel features + input bbox (2 values: h, w normalized)
-            bbox_input_dim = pixel_dim + 2
+            # Learnable bbox query token - will attend to context features
+            self.bbox_query = nn.Parameter(torch.zeros(1, 1, pixel_dim))
+            nn.init.trunc_normal_(self.bbox_query, std=0.02)
+
+            # Positional encoding for input bbox (h, w) -> pixel_dim
+            self.bbox_pos_enc = nn.Linear(2, pixel_dim)
+
+            # Dedicated cross-attention for bbox prediction
+            # bbox_query attends to VentralCNN features to gather spatial context
+            self.bbox_cross_attn = nn.MultiheadAttention(
+                embed_dim=pixel_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.bbox_norm = nn.LayerNorm(pixel_dim)
+
+            # Bbox prediction MLP: cross-attn output -> residual delta
             self.bbox_head = nn.Sequential(
-                nn.Linear(bbox_input_dim, pixel_dim),
+                nn.Linear(pixel_dim, pixel_dim),
                 nn.GELU(),
                 nn.Linear(pixel_dim, pixel_dim // 2),
                 nn.GELU(),
@@ -482,7 +498,7 @@ class PixelTransformerPredictor(nn.Module):
             nn.init.zeros_(self.bbox_head[-1].bias)
 
     def _create_bbox_mask(self, pred_bbox_hw: torch.Tensor, hard: bool = False) -> torch.Tensor:
-        """Create a centered bounding box mask from predicted height/width.
+        """Create a top-left aligned bounding box mask from predicted height/width.
 
         Args:
             pred_bbox_hw: (B, 2) predicted height and width (normalized 0-1)
@@ -504,14 +520,11 @@ class PixelTransformerPredictor(nn.Module):
         cols = torch.arange(SHAPE_SIZE, device=device).float()
         row_grid, col_grid = torch.meshgrid(rows, cols, indexing='ij')  # (H, W)
 
-        # Center of the canvas
-        center = SHAPE_SIZE / 2.0
-
-        # Compute start/end positions for each sample (centered bbox)
-        start_r = (center - pred_h / 2).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        end_r = (center + pred_h / 2).unsqueeze(-1).unsqueeze(-1)
-        start_c = (center - pred_w / 2).unsqueeze(-1).unsqueeze(-1)
-        end_c = (center + pred_w / 2).unsqueeze(-1).unsqueeze(-1)
+        # Top-left aligned: start at (0, 0)
+        start_r = torch.zeros(B, 1, 1, device=device)
+        end_r = pred_h.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        start_c = torch.zeros(B, 1, 1, device=device)
+        end_c = pred_w.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
 
         # Expand grids for batch
         row_grid = row_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
@@ -586,17 +599,26 @@ class PixelTransformerPredictor(nn.Module):
         # MLP + residual
         pixel_features = pixel_features + self.norm2(self.mlp(pixel_features))
 
-        # Bounding box prediction (residual: output = input + delta)
+        # Bounding box prediction with dedicated cross-attention
+        # bbox query attends to VentralCNN context to learn what spatial info matters for size
         pred_bbox_hw = None
         if self.use_bbox_prediction and input_bbox_hw is not None:
-            # Global average pool the pixel features
-            pooled_features = pixel_features.mean(dim=1)  # (B, pixel_dim)
+            # Create bbox query: learnable token + positional encoding of input bbox
+            # This conditions the query on the current input bbox (identity prior)
+            bbox_pos = self.bbox_pos_enc(input_bbox_hw)  # (B, pixel_dim)
+            bbox_query = self.bbox_query.expand(B, -1, -1) + bbox_pos.unsqueeze(1)  # (B, 1, pixel_dim)
 
-            # Concatenate with input bbox info
-            bbox_input = torch.cat([pooled_features, input_bbox_hw], dim=1)  # (B, pixel_dim+2)
+            # Cross-attention: bbox query attends to VentralCNN context features
+            # This allows bbox prediction to gather relevant spatial context from the input grid
+            bbox_attn_out, _ = self.bbox_cross_attn(
+                query=bbox_query,
+                key=context_features,
+                value=context_features
+            )  # (B, 1, pixel_dim)
+            bbox_features = self.bbox_norm(bbox_attn_out).squeeze(1)  # (B, pixel_dim)
 
             # Predict residual delta and add to input (identity when delta=0)
-            bbox_delta = self.bbox_head(bbox_input)  # (B, 2) residual
+            bbox_delta = self.bbox_head(bbox_features)  # (B, 2) residual
             pred_bbox_hw = (input_bbox_hw + bbox_delta).clamp(min=0.0, max=1.0)  # (B, 2)
 
         # Project to color logits: (B, 256, D) -> (B, 256, 10)
@@ -657,9 +679,10 @@ class ShapeDorsalCNN(nn.Module):
                  kernel_size: int = 3, use_onehot: bool = False,
                  use_cross_attention: bool = False,
                  ir_encoder: VentralCNN = None,
-                 ir_out_dim: int = 64,
+                 ir_out_dim: int = 16,
                  slot_top_k: int = 2,
-                 use_bbox_prediction: bool = False):
+                 use_bbox_prediction: bool = False,
+                 identity_scale_init: float = 1.0):
         super().__init__()
 
         self.num_classes = NUM_COLORS
@@ -667,6 +690,9 @@ class ShapeDorsalCNN(nn.Module):
         self.use_onehot = use_onehot
         self.use_cross_attention = use_cross_attention
         self.use_bbox_prediction = use_bbox_prediction
+
+        # Learnable identity skip scale - initialized to bias toward identity
+        self.identity_scale = nn.Parameter(torch.tensor(identity_scale_init))
 
         if use_onehot:
             # One-hot (10) + content mask (1) = 11 channels
@@ -722,21 +748,33 @@ class ShapeDorsalCNN(nn.Module):
                 top_k=slot_top_k
             )
 
-        # Bounding box prediction head (predicts RESIDUAL, not absolute value)
-        # Zero residual = identity (output bbox = input bbox)
+        # Bounding box prediction head with dedicated cross-attention
+        # Uses a learnable bbox query that attends to IR features from the input grid
+        # Predicts RESIDUAL: output = input + delta (zero residual = identity)
         if use_bbox_prediction:
-            # Compute bottleneck channel size based on num_layers
-            if num_layers == 0:
-                bottleneck_ch = base_ch
-            elif num_layers == 1:
-                bottleneck_ch = base_ch * 2
-            else:
-                bottleneck_ch = base_ch * 4
+            # Projection dimension for bbox cross-attention
+            bbox_proj_dim = ir_out_dim
 
-            # Input: bottleneck features (global pooled) + input bbox (2 values: h, w normalized)
-            bbox_input_dim = bottleneck_ch + 2
+            # Learnable bbox query token - will attend to IR features
+            self.bbox_query = nn.Parameter(torch.zeros(1, 1, bbox_proj_dim))
+            nn.init.trunc_normal_(self.bbox_query, std=0.02)
+
+            # Positional encoding for input bbox (h, w) -> proj_dim
+            self.bbox_pos_enc = nn.Linear(2, bbox_proj_dim)
+
+            # Dedicated cross-attention for bbox prediction
+            # bbox_query attends to VentralCNN IR features to gather spatial context
+            self.bbox_cross_attn = nn.MultiheadAttention(
+                embed_dim=bbox_proj_dim,
+                num_heads=4,
+                dropout=0.0,
+                batch_first=True
+            )
+            self.bbox_norm = nn.LayerNorm(bbox_proj_dim)
+
+            # Bbox prediction MLP: cross-attn output -> residual delta
             self.bbox_head = nn.Sequential(
-                nn.Linear(bbox_input_dim, hidden_dim * 2),
+                nn.Linear(bbox_proj_dim, hidden_dim * 2),
                 nn.ReLU(),
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.ReLU(),
@@ -765,7 +803,7 @@ class ShapeDorsalCNN(nn.Module):
         return torch.cat([onehot, content_mask], dim=-1)  # (B, H, W, 11)
 
     def _create_bbox_mask(self, pred_bbox_hw: torch.Tensor, hard: bool = False) -> torch.Tensor:
-        """Create a centered bounding box mask from predicted height/width.
+        """Create a top-left aligned bounding box mask from predicted height/width.
 
         Args:
             pred_bbox_hw: (B, 2) predicted height and width (normalized 0-1)
@@ -787,14 +825,11 @@ class ShapeDorsalCNN(nn.Module):
         cols = torch.arange(SHAPE_SIZE, device=device).float()
         row_grid, col_grid = torch.meshgrid(rows, cols, indexing='ij')  # (H, W)
 
-        # Center of the canvas
-        center = SHAPE_SIZE / 2.0
-
-        # Compute start/end positions for each sample (centered bbox)
-        start_r = (center - pred_h / 2).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        end_r = (center + pred_h / 2).unsqueeze(-1).unsqueeze(-1)
-        start_c = (center - pred_w / 2).unsqueeze(-1).unsqueeze(-1)
-        end_c = (center + pred_w / 2).unsqueeze(-1).unsqueeze(-1)
+        # Top-left aligned: start at (0, 0)
+        start_r = torch.zeros(B, 1, 1, device=device)
+        end_r = pred_h.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        start_c = torch.zeros(B, 1, 1, device=device)
+        end_c = pred_w.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
 
         # Expand grids for batch
         row_grid = row_grid.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
@@ -867,21 +902,24 @@ class ShapeDorsalCNN(nn.Module):
         else:
             x = bottleneck
 
-        # Optional cross-attention to full input grid
-        if (self.slot_cross_attention is not None and
-            full_input_grid is not None and
-            input_slot_mask is not None):
-
+        # Compute IR features if we have an ir_encoder and full grid
+        # These are shared between slot cross-attention and bbox prediction
+        ir_features = None
+        if self.ir_encoder is not None and full_input_grid is not None:
             B = input_shape.size(0)
-
-            # Compute IR features for the full input grid
             input_content_mask = (full_input_grid < PADDING_VALUE).float()
             inp_clamped = full_input_grid.clamp(max=9)
             inp_onehot = F.one_hot(inp_clamped.long(), NUM_COLORS).float()
             inp_onehot = inp_onehot * input_content_mask.unsqueeze(-1)
             inp_onehot = inp_onehot.permute(0, 3, 1, 2).contiguous()
-
             ir_features = self.ir_encoder(inp_onehot)  # (B, H, W, ir_out_dim)
+
+        # Optional cross-attention to full input grid
+        if (self.slot_cross_attention is not None and
+            ir_features is not None and
+            input_slot_mask is not None):
+
+            B = input_shape.size(0)
 
             # Get slot masks from the provided input_slot_mask
             # We use the single slot mask provided (the correspondence's input slot)
@@ -902,21 +940,49 @@ class ShapeDorsalCNN(nn.Module):
             x_perm = x_perm + attended
             x = x_perm.permute(0, 3, 1, 2).contiguous()
 
-        # Bounding box prediction (residual: output = input + delta)
+        # Bounding box prediction with dedicated cross-attention to IR features
+        # bbox query attends to VentralCNN features to learn what spatial info matters for size
         pred_bbox_hw = None
         if self.use_bbox_prediction and input_bbox_hw is not None:
-            # Global average pool the bottleneck features
-            bottleneck_pooled = bottleneck.mean(dim=(2, 3))  # (B, C)
+            B = input_shape.size(0)
 
-            # Concatenate with input bbox info
-            bbox_input = torch.cat([bottleneck_pooled, input_bbox_hw], dim=1)  # (B, C+2)
+            if ir_features is not None:
+                # Flatten IR features for cross-attention: (B, H*W, D)
+                H_ir, W_ir = ir_features.shape[1], ir_features.shape[2]
+                ir_features_flat = ir_features.view(B, H_ir * W_ir, -1)
 
-            # Predict residual delta and add to input (identity when delta=0)
-            bbox_delta = self.bbox_head(bbox_input)  # (B, 2) residual
-            pred_bbox_hw = (input_bbox_hw + bbox_delta).clamp(min=0.0, max=1.0)  # (B, 2)
+                # Create bbox query: learnable token + positional encoding of input bbox
+                bbox_pos = self.bbox_pos_enc(input_bbox_hw)  # (B, proj_dim)
+                bbox_query = self.bbox_query.expand(B, -1, -1) + bbox_pos.unsqueeze(1)  # (B, 1, proj_dim)
+
+                # Cross-attention: bbox query attends to IR features
+                bbox_attn_out, _ = self.bbox_cross_attn(
+                    query=bbox_query,
+                    key=ir_features_flat,
+                    value=ir_features_flat
+                )  # (B, 1, proj_dim)
+                bbox_features = self.bbox_norm(bbox_attn_out).squeeze(1)  # (B, proj_dim)
+
+                # Predict residual delta and add to input (identity when delta=0)
+                bbox_delta = self.bbox_head(bbox_features)  # (B, 2) residual
+                pred_bbox_hw = (input_bbox_hw + bbox_delta).clamp(min=0.0, max=1.0)  # (B, 2)
+            else:
+                # Fallback: no IR features available, just use identity
+                pred_bbox_hw = input_bbox_hw
 
         # Output head
         pixel_logits = self.outc(x)  # (B, 10, 16, 16)
+
+        # Identity skip connection: bias toward predicting input color
+        input_clamped = input_shape.clamp(max=NUM_COLORS - 1)
+        input_onehot = F.one_hot(input_clamped.long(), NUM_COLORS).float()  # (B, H, W, 10)
+        input_onehot = input_onehot.permute(0, 3, 1, 2)  # (B, 10, H, W)
+
+        # Zero out the identity skip for padding pixels (color 10)
+        padding_mask = (input_shape >= PADDING_VALUE).unsqueeze(1).float()  # (B, 1, H, W)
+        input_onehot = input_onehot * (1.0 - padding_mask)
+
+        pixel_logits = pixel_logits + self.identity_scale * input_onehot
 
         # Apply bbox mask if prediction is enabled
         if self.use_bbox_prediction and pred_bbox_hw is not None:
@@ -1482,8 +1548,8 @@ def visualize_test_predictions_console(model, ir_encoder: VentralCNN,
                 'in_w': in_w,
             }
             if pred_bbox_hw is not None:
-                pred_h = int(pred_bbox_hw[0, 0].item() * SHAPE_SIZE)
-                pred_w = int(pred_bbox_hw[0, 1].item() * SHAPE_SIZE)
+                pred_h = max(1, int(pred_bbox_hw[0, 0].item() * SHAPE_SIZE))
+                pred_w = max(1, int(pred_bbox_hw[0, 1].item() * SHAPE_SIZE))
                 pred_info['predicted_bbox_hw'] = (pred_h, pred_w)
 
             predictions.append(pred_info)
@@ -1494,25 +1560,21 @@ def visualize_test_predictions_console(model, ir_encoder: VentralCNN,
         print(f"SLOT {pred['slot_idx']} (bbox: row {pred['bbox'][0]}-{pred['bbox'][2]}, col {pred['bbox'][1]}-{pred['bbox'][3]})")
         print('─' * 40)
 
-        # Crop to actual bbox region for display
+        # Crop to actual bbox region for display (top-left aligned)
         in_h, in_w = pred['in_h'], pred['in_w']
-        in_start_r = int((SHAPE_SIZE - in_h) / 2)
-        in_start_c = int((SHAPE_SIZE - in_w) / 2)
-        in_cropped = pred['input_crop'][in_start_r:in_start_r+in_h, in_start_c:in_start_c+in_w]
+        in_cropped = pred['input_crop'][:in_h, :in_w]
 
         print(f"\nInput Shape ({in_h}x{in_w}):")
         print(grid_to_console(in_cropped, use_color, use_unicode))
 
-        # Crop predicted output
+        # Crop predicted output (top-left aligned)
         if 'predicted_bbox_hw' in pred:
             pred_h, pred_w = pred['predicted_bbox_hw']
-            pred_start_r = int((SHAPE_SIZE - pred_h) / 2)
-            pred_start_c = int((SHAPE_SIZE - pred_w) / 2)
-            pred_cropped = pred['predicted_crop'][pred_start_r:pred_start_r+pred_h, pred_start_c:pred_start_c+pred_w]
+            pred_cropped = pred['predicted_crop'][:pred_h, :pred_w]
             size_str = f"({pred_h}x{pred_w})"
         else:
             # No bbox prediction - use same size as input
-            pred_cropped = pred['predicted_crop'][in_start_r:in_start_r+in_h, in_start_c:in_start_c+in_w]
+            pred_cropped = pred['predicted_crop'][:in_h, :in_w]
             size_str = f"({in_h}x{in_w})"
 
         print(f"\nPredicted Output {size_str}:")
@@ -1616,8 +1678,8 @@ def visualize_test_predictions(model: ShapeDorsalCNN, ir_encoder: VentralCNN,
                 'bbox': in_bbox,
             }
             if pred_bbox_hw is not None:
-                pred_h = int(pred_bbox_hw[0, 0].item() * SHAPE_SIZE)
-                pred_w = int(pred_bbox_hw[0, 1].item() * SHAPE_SIZE)
+                pred_h = max(1, int(pred_bbox_hw[0, 0].item() * SHAPE_SIZE))
+                pred_w = max(1, int(pred_bbox_hw[0, 1].item() * SHAPE_SIZE))
                 pred_info['predicted_bbox_hw'] = (pred_h, pred_w)
 
             predictions.append(pred_info)
@@ -1669,29 +1731,23 @@ def visualize_test_predictions(model: ShapeDorsalCNN, ir_encoder: VentralCNN,
         row = i // n_pred_cols
         col = i % n_pred_cols
 
-        # Input crop - crop to the actual bbox region
+        # Input crop - crop to the actual bbox region (top-left aligned)
         in_bbox = pred['bbox']
         in_h = in_bbox[2] - in_bbox[0] + 1
         in_w = in_bbox[3] - in_bbox[1] + 1
-        # Compute crop region (centered in SHAPE_SIZE canvas)
-        in_start_r = int((SHAPE_SIZE - in_h) / 2)
-        in_start_c = int((SHAPE_SIZE - in_w) / 2)
-        in_cropped = pred['input_crop'][in_start_r:in_start_r+in_h, in_start_c:in_start_c+in_w]
+        in_cropped = pred['input_crop'][:in_h, :in_w]
 
         ax_in = fig.add_subplot(gs[row, 2 + col * 2])
         ax_in.imshow(grid_to_rgb(in_cropped), interpolation='nearest')
         ax_in.set_title(f'S{pred["slot_idx"]} In\n({in_h}x{in_w})', fontsize=8)
         ax_in.axis('off')
 
-        # Predicted output - crop to the predicted bbox region
+        # Predicted output - crop to the predicted bbox region (top-left aligned)
         ax_pred = fig.add_subplot(gs[row, 2 + col * 2 + 1])
 
         if 'predicted_bbox_hw' in pred:
             pred_h, pred_w = pred['predicted_bbox_hw']
-            # Compute crop region (centered in SHAPE_SIZE canvas)
-            pred_start_r = int((SHAPE_SIZE - pred_h) / 2)
-            pred_start_c = int((SHAPE_SIZE - pred_w) / 2)
-            pred_cropped = pred['predicted_crop'][pred_start_r:pred_start_r+pred_h, pred_start_c:pred_start_c+pred_w]
+            pred_cropped = pred['predicted_crop'][:pred_h, :pred_w]
             pred_title = f'S{pred["slot_idx"]} Pred\n({pred_h}x{pred_w})'
         else:
             # No bbox prediction - show full crop
@@ -1892,7 +1948,7 @@ def main():
     print(f"Train puzzles: {len(train_puzzles)}, Val puzzles: {len(val_puzzles)}")
 
     # Create IR encoder and slot attention for correspondence extraction
-    ir_encoder = VentralCNN(out_dim=args.ir_out_dim).to(device)
+    ir_encoder = VentralCNN(hidden_dim=8, out_dim=args.ir_out_dim).to(device)
     ir_encoder.eval()
 
     slot_attention = AffinitySlotAttention(
@@ -1952,8 +2008,9 @@ def main():
             ir_encoder=ir_encoder if args.use_cross_attention else None,
             ir_out_dim=args.ir_out_dim,
             use_bbox_prediction=args.use_bbox_prediction,
+            identity_scale_init=args.identity_scale,
         ).to(device)
-        print(f"Using ShapeDorsalCNN (hidden_dim={args.hidden_dim}, layers={args.num_layers})")
+        print(f"Using ShapeDorsalCNN (hidden_dim={args.hidden_dim}, layers={args.num_layers}, identity_scale={args.identity_scale})")
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
