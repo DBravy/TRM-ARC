@@ -1269,7 +1269,7 @@ def evaluate_test_pair(model: ShapeDorsalCNN, ir_encoder: VentralCNN,
 # Visualization
 # =============================================================================
 
-# ARC color palette
+# ARC color palette (hex for matplotlib)
 ARC_COLORS = [
     '#000000',  # 0: black
     '#0074D9',  # 1: blue
@@ -1282,6 +1282,251 @@ ARC_COLORS = [
     '#7FDBFF',  # 8: cyan
     '#870C25',  # 9: brown/maroon
 ]
+
+# ANSI color codes for console output (256-color mode)
+# Maps ARC color index to ANSI 256-color code
+ANSI_COLORS = [
+    16,   # 0: black
+    27,   # 1: blue
+    196,  # 2: red
+    46,   # 3: green
+    226,  # 4: yellow
+    248,  # 5: grey
+    201,  # 6: magenta
+    208,  # 7: orange
+    51,   # 8: cyan
+    88,   # 9: brown/maroon
+]
+
+# Color names for simple text output
+COLOR_NAMES = ['blk', 'blu', 'red', 'grn', 'yel', 'gry', 'mag', 'org', 'cyn', 'brn']
+
+
+def grid_to_console(grid: np.ndarray, use_color: bool = True, use_unicode: bool = True) -> str:
+    """Convert a color grid to console-printable string.
+
+    Args:
+        grid: (H, W) integer array with values 0-9 (10 = padding)
+        use_color: Use ANSI color codes for colored output
+        use_unicode: Use Unicode block characters (█) instead of digits
+
+    Returns:
+        Multi-line string representation of the grid
+    """
+    H, W = grid.shape
+    lines = []
+
+    for row in range(H):
+        line_parts = []
+        for col in range(W):
+            val = grid[row, col]
+
+            if val >= 10:  # Padding
+                if use_unicode:
+                    char = '·'  # Middle dot for padding
+                else:
+                    char = '.'
+                if use_color:
+                    line_parts.append(f'\033[38;5;240m{char}\033[0m')
+                else:
+                    line_parts.append(char)
+            else:
+                if use_unicode:
+                    char = '██'  # Full block (doubled for aspect ratio)
+                else:
+                    char = str(val)
+
+                if use_color:
+                    ansi_code = ANSI_COLORS[val]
+                    line_parts.append(f'\033[38;5;{ansi_code}m{char}\033[0m')
+                else:
+                    line_parts.append(char)
+
+        lines.append(''.join(line_parts))
+
+    return '\n'.join(lines)
+
+
+def print_grid_simple(grid: np.ndarray, title: str = "") -> None:
+    """Print a grid using simple digit representation with legend.
+
+    Args:
+        grid: (H, W) integer array with values 0-9
+        title: Optional title to print above the grid
+    """
+    H, W = grid.shape
+
+    if title:
+        print(f"\n{title} ({H}x{W}):")
+        print("-" * (W + 2))
+
+    for row in range(H):
+        line = ""
+        for col in range(W):
+            val = grid[row, col]
+            if val >= 10:
+                line += "."
+            else:
+                line += str(val)
+        print(f"|{line}|")
+
+    print("-" * (W + 2))
+
+
+def visualize_test_predictions_console(model, ir_encoder: VentralCNN,
+                                        slot_attention: AffinitySlotAttention,
+                                        puzzle: Dict, puzzle_id: str,
+                                        device: torch.device,
+                                        use_color: bool = True,
+                                        use_unicode: bool = True):
+    """
+    Console-based visualization of predictions on the test input of a puzzle.
+
+    Works on console-only devices without matplotlib/GUI dependencies.
+
+    Args:
+        model: Trained model (ShapeDorsalCNN or PixelTransformerPredictor)
+        ir_encoder: VentralCNN for feature extraction
+        slot_attention: AffinitySlotAttention for slot discovery
+        puzzle: Puzzle data dict
+        puzzle_id: Puzzle identifier
+        device: torch device
+        use_color: Use ANSI colors for output
+        use_unicode: Use Unicode block characters
+    """
+    model.eval()
+
+    # Get test example
+    test_example = puzzle.get('test', [{}])[0]
+    test_input = np.array(test_example.get('input', []), dtype=np.int64)
+    test_output = np.array(test_example.get('output', [])) if 'output' in test_example else None
+
+    if test_input.size == 0:
+        print("No test input found")
+        return
+
+    H_in, W_in = test_input.shape
+
+    print("\n" + "=" * 60)
+    print(f"PUZZLE: {puzzle_id} - Console Visualization")
+    print("=" * 60)
+
+    # Print color legend
+    print("\nColor Legend:")
+    legend_parts = []
+    for i, name in enumerate(COLOR_NAMES):
+        if use_color:
+            ansi_code = ANSI_COLORS[i]
+            legend_parts.append(f'\033[38;5;{ansi_code}m{i}={name}\033[0m')
+        else:
+            legend_parts.append(f'{i}={name}')
+    print("  " + "  ".join(legend_parts))
+
+    # Print test input
+    print(f"\n{'─' * 40}")
+    print(f"TEST INPUT ({H_in}x{W_in}):")
+    print('─' * 40)
+    print(grid_to_console(test_input, use_color, use_unicode))
+
+    # Extract slots from test input
+    with torch.no_grad():
+        onehot_in = grid_to_onehot(test_input).to(device)
+        features_in = ir_encoder(onehot_in)
+        color_grid_in = torch.from_numpy(test_input).unsqueeze(0).to(device)
+        _, input_masks = slot_attention(features_in, color_grid_in)
+        input_masks = input_masks.squeeze(0)
+
+    # Get valid input slots
+    input_counts = input_masks.sum(dim=(1, 2))
+    valid_input_idx = (input_counts > 0).nonzero(as_tuple=True)[0].tolist()
+
+    print(f"\nFound {len(valid_input_idx)} slot(s) in input")
+
+    # Prepare predictions for each slot
+    padded_input = np.full((GRID_SIZE, GRID_SIZE), PADDING_VALUE, dtype=np.int64)
+    padded_input[:H_in, :W_in] = test_input
+    full_input_tensor = torch.from_numpy(padded_input).unsqueeze(0).to(device)
+
+    predictions = []
+
+    with torch.no_grad():
+        for in_idx in valid_input_idx:
+            in_mask = input_masks[in_idx].cpu().numpy()
+            in_crop, in_bbox = extract_shape_crop(test_input, in_mask)
+
+            # Prepare slot mask
+            padded_mask = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+            padded_mask[:H_in, :W_in] = in_mask
+            mask_tensor = torch.from_numpy(padded_mask).unsqueeze(0).to(device)
+
+            # Compute input bbox for model
+            in_h = in_bbox[2] - in_bbox[0] + 1
+            in_w = in_bbox[3] - in_bbox[1] + 1
+            input_bbox_hw = torch.tensor(
+                [[in_h / SHAPE_SIZE, in_w / SHAPE_SIZE]], dtype=torch.float32, device=device
+            )
+
+            # Predict
+            in_tensor = torch.from_numpy(in_crop.astype(np.int64)).unsqueeze(0).to(device)
+            pred_colors, pred_bbox_hw = model.predict_colors(
+                in_tensor, full_input_tensor, mask_tensor, input_bbox_hw
+            )
+            pred_crop = pred_colors[0].cpu().numpy()
+
+            pred_info = {
+                'slot_idx': in_idx,
+                'input_crop': in_crop,
+                'predicted_crop': pred_crop,
+                'bbox': in_bbox,
+                'in_h': in_h,
+                'in_w': in_w,
+            }
+            if pred_bbox_hw is not None:
+                pred_h = int(pred_bbox_hw[0, 0].item() * SHAPE_SIZE)
+                pred_w = int(pred_bbox_hw[0, 1].item() * SHAPE_SIZE)
+                pred_info['predicted_bbox_hw'] = (pred_h, pred_w)
+
+            predictions.append(pred_info)
+
+    # Print each slot prediction
+    for pred in predictions:
+        print(f"\n{'─' * 40}")
+        print(f"SLOT {pred['slot_idx']} (bbox: row {pred['bbox'][0]}-{pred['bbox'][2]}, col {pred['bbox'][1]}-{pred['bbox'][3]})")
+        print('─' * 40)
+
+        # Crop to actual bbox region for display
+        in_h, in_w = pred['in_h'], pred['in_w']
+        in_start_r = int((SHAPE_SIZE - in_h) / 2)
+        in_start_c = int((SHAPE_SIZE - in_w) / 2)
+        in_cropped = pred['input_crop'][in_start_r:in_start_r+in_h, in_start_c:in_start_c+in_w]
+
+        print(f"\nInput Shape ({in_h}x{in_w}):")
+        print(grid_to_console(in_cropped, use_color, use_unicode))
+
+        # Crop predicted output
+        if 'predicted_bbox_hw' in pred:
+            pred_h, pred_w = pred['predicted_bbox_hw']
+            pred_start_r = int((SHAPE_SIZE - pred_h) / 2)
+            pred_start_c = int((SHAPE_SIZE - pred_w) / 2)
+            pred_cropped = pred['predicted_crop'][pred_start_r:pred_start_r+pred_h, pred_start_c:pred_start_c+pred_w]
+            size_str = f"({pred_h}x{pred_w})"
+        else:
+            # No bbox prediction - use same size as input
+            pred_cropped = pred['predicted_crop'][in_start_r:in_start_r+in_h, in_start_c:in_start_c+in_w]
+            size_str = f"({in_h}x{in_w})"
+
+        print(f"\nPredicted Output {size_str}:")
+        print(grid_to_console(pred_cropped, use_color, use_unicode))
+
+    # Print test output if available
+    if test_output is not None and test_output.size > 0:
+        H_out, W_out = test_output.shape
+        print(f"\n{'─' * 40}")
+        print(f"EXPECTED OUTPUT ({H_out}x{W_out}):")
+        print('─' * 40)
+        print(grid_to_console(test_output, use_color, use_unicode))
+
+    print("\n" + "=" * 60)
 
 
 def grid_to_rgb(grid: np.ndarray) -> np.ndarray:
@@ -1545,7 +1790,7 @@ def parse_args():
                         help="MLP expansion ratio for transformer model")
     parser.add_argument("--dropout", type=float, default=0.0,
                         help="Dropout rate for transformer model")
-    parser.add_argument("--identity-scale", type=float, default=500.0,
+    parser.add_argument("--identity-scale", type=float, default=5.0,
                         help="Initial scale for identity skip connection (higher = stronger identity prior)")
 
     # CNN model args (legacy)
@@ -1593,6 +1838,14 @@ def parse_args():
     # Output
     parser.add_argument("--save-dir", type=str, default="checkpoints/correspondence",
                         help="Directory for saving visualizations")
+
+    # Console visualization options
+    parser.add_argument("--console", action="store_true",
+                        help="Use console-based visualization (no GUI required)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable ANSI colors in console output")
+    parser.add_argument("--no-unicode", action="store_true",
+                        help="Use digits instead of Unicode blocks in console output")
 
     return parser.parse_args()
 
@@ -1754,12 +2007,23 @@ def main():
     if args.puzzle_id:
         print(f"\nGenerating test predictions visualization...")
         puzzle = puzzles[args.puzzle_id]
-        save_path = os.path.join(args.save_dir, f"{args.puzzle_id}_test_predictions.png")
-        visualize_test_predictions(
-            model, ir_encoder, slot_attention,
-            puzzle, args.puzzle_id, device,
-            save_path=save_path
-        )
+
+        if args.console:
+            # Console-based visualization (no GUI required)
+            visualize_test_predictions_console(
+                model, ir_encoder, slot_attention,
+                puzzle, args.puzzle_id, device,
+                use_color=not args.no_color,
+                use_unicode=not args.no_unicode
+            )
+        else:
+            # Matplotlib-based visualization (requires display)
+            save_path = os.path.join(args.save_dir, f"{args.puzzle_id}_test_predictions.png")
+            visualize_test_predictions(
+                model, ir_encoder, slot_attention,
+                puzzle, args.puzzle_id, device,
+                save_path=save_path
+            )
 
 
 if __name__ == "__main__":
