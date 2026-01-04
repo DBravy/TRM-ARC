@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-TRM-style Correspondence Predictor
+TRM-style Correspondence Predictor with Grid Cross-Attention
 
 Instead of predicting each object's transformation independently,
 this processes ALL objects together with iterative self-attention,
-allowing objects to condition on each other's predicted positions.
+allowing objects to condition on each other's predicted positions
+AND query the input grid at every thought step.
 
-Key difference from PixelTransformerPredictor:
-- All objects in a puzzle are processed as a sequence
-- Multiple iterations of self-attention let position estimates refine
-- Object N can "see" where objects 1..N-1 are predicted to go
+Key features:
+- Three state variables following TRM design:
+  - x_obj:  per-object input features (fixed)
+  - x_grid: input grid encoding (fixed, queryable)
+  - y:      current predicted positions (updated)
+  - z:      per-object thought vectors (updated)
+- Objects can cross-attend to input grid cells
+- Multiple iterations of thought refinement before each output update
+- Gradient truncation for memory efficiency
 
 Usage:
     python trm_correspondence.py --data-root kaggle/combined --puzzle-id <id>
@@ -20,8 +26,8 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-from tqdm import tqdm
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,6 +40,7 @@ from torch.utils.data import Dataset, DataLoader
 # =============================================================================
 
 MAX_OBJECTS = 16  # Maximum objects per puzzle
+MAX_GRID_SIZE = 30  # Maximum grid dimension
 POSITION_DIM = 4  # (center_y, center_x, height, width) normalized
 FEATURE_DIM = 32  # Object feature dimension
 
@@ -130,7 +137,7 @@ def get_random_augmentation() -> Tuple[int, np.ndarray]:
 
 
 # =============================================================================
-# Object Feature Extraction (simplified from your slot_viz.py)
+# Object Feature Extraction
 # =============================================================================
 
 def extract_object_features(mask: np.ndarray, color_grid: np.ndarray, 
@@ -209,12 +216,14 @@ class PuzzleLevelDataset(Dataset):
                  augment: bool = True,
                  num_augments: int = 8,
                  dihedral_only: bool = False,
-                 color_only: bool = False):
+                 color_only: bool = False,
+                 max_grid_size: int = MAX_GRID_SIZE):
         self.device = device
         self.augment = augment
         self.num_augments = num_augments if augment else 1
         self.dihedral_only = dihedral_only
         self.color_only = color_only
+        self.max_grid_size = max_grid_size
         self.examples: List[PuzzleObjectData] = []
 
         print("Extracting puzzle-level object data...")
@@ -242,12 +251,10 @@ class PuzzleLevelDataset(Dataset):
         if not self.augment:
             return 0, np.arange(10, dtype=np.int64)
         elif self.dihedral_only:
-            # Random dihedral transform, identity color mapping
             trans_id = np.random.randint(0, 8)
             color_map = np.arange(10, dtype=np.int64)
             return trans_id, color_map
         elif self.color_only:
-            # Identity dihedral transform, random color mapping
             trans_id = 0
             color_map = random_color_permutation()
             return trans_id, color_map
@@ -259,10 +266,8 @@ class PuzzleLevelDataset(Dataset):
         input_grid = np.array(example['input'], dtype=np.int64)
         output_grid = np.array(example['output'], dtype=np.int64)
 
-        # Get random augmentation (same for both input and output)
         trans_id, color_map = self._get_augmentation()
 
-        # Apply augmentation to both grids
         aug_input = apply_augmentation(input_grid, trans_id, color_map)
         aug_output = apply_augmentation(output_grid, trans_id, color_map)
 
@@ -270,6 +275,13 @@ class PuzzleLevelDataset(Dataset):
             'input': aug_input.tolist(),
             'output': aug_output.tolist(),
         }
+    
+    def _pad_grid(self, grid: np.ndarray) -> np.ndarray:
+        """Pad grid to max_grid_size x max_grid_size with value 10 (padding token)."""
+        H, W = grid.shape
+        padded = np.full((self.max_grid_size, self.max_grid_size), 10, dtype=np.int64)
+        padded[:H, :W] = grid
+        return padded
     
     def _extract_example(self, example: Dict, puzzle_id: str, 
                          ex_idx: int) -> Optional[PuzzleObjectData]:
@@ -279,6 +291,12 @@ class PuzzleLevelDataset(Dataset):
         
         in_h, in_w = input_grid.shape
         out_h, out_w = output_grid.shape
+        
+        # Skip grids that exceed max size
+        if in_h > self.max_grid_size or in_w > self.max_grid_size:
+            return None
+        if out_h > self.max_grid_size or out_w > self.max_grid_size:
+            return None
         
         # Simple object extraction: connected components of non-black pixels
         input_objects = self._extract_objects(input_grid)
@@ -382,128 +400,269 @@ class PuzzleLevelDataset(Dataset):
     
     def __getitem__(self, idx):
         ex = self.examples[idx]
+        
+        # Pad input grid to fixed size
+        padded_grid = self._pad_grid(ex.input_grid)
+        
         return {
             'input_features': torch.from_numpy(ex.input_features),
+            'input_grid': torch.from_numpy(padded_grid),
             'output_positions': torch.from_numpy(ex.output_positions),
             'object_mask': torch.from_numpy(ex.object_mask),
             'num_objects': ex.num_objects,
             'puzzle_id': ex.puzzle_id,
+            'grid_h': ex.input_grid.shape[0],
+            'grid_w': ex.input_grid.shape[1],
         }
 
 
 # =============================================================================
-# TRM-style Model: Iterative Self-Attention
+# TRM-style Model: Iterative Self-Attention with Grid Cross-Attention
 # =============================================================================
 
 class ObjectTRM(nn.Module):
     """
-    TRM-style model for object position prediction.
+    TRM-style model for object position prediction with grid cross-attention.
+    
+    Three state variables:
+        x_obj:  per-object input features (fixed)
+        x_grid: input grid encoding (fixed, queryable)
+        y:      current predicted positions (updated)
+        z:      per-object thought vectors (updated)
     
     Key features:
-    - All objects processed together as a sequence
-    - Multiple iterations of self-attention
-    - Position estimates refined each iteration
-    - Objects can condition on each other's evolving predictions
+        - Objects can cross-attend to input grid cells
+        - Multiple iterations of thought refinement before each output update
+        - Gradient truncation for memory efficiency
     """
     
-    def __init__(self, 
+    def __init__(self,
                  feature_dim: int = FEATURE_DIM,
-                 hidden_dim: int = 32,
+                 hidden_dim: int = 64,
                  num_heads: int = 4,
-                 num_iterations: int = 4,
-                 num_layers: int = 2,
+                 n_inner: int = 6,    # thought iterations per output update
+                 T_outer: int = 3,    # output update iterations
+                 max_grid_size: int = MAX_GRID_SIZE,
                  dropout: float = 0.1):
         super().__init__()
         
         self.hidden_dim = hidden_dim
-        self.num_iterations = num_iterations
+        self.n_inner = n_inner
+        self.T_outer = T_outer
+        self.max_grid_size = max_grid_size
         
-        # Input projection
-        self.input_proj = nn.Linear(feature_dim, hidden_dim)
+        # === Input encodings (x) ===
         
-        # Learnable initial hidden state
-        self.h_init = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        # Object features -> hidden
+        self.obj_proj = nn.Linear(feature_dim, hidden_dim)
         
-        # Position embedding (inject current position estimate back in)
+        # Grid cell encoding: color + position
+        self.color_embed = nn.Embedding(11, hidden_dim)  # 0-9 colors + padding (10)
+        self.cell_pos_proj = nn.Linear(2, hidden_dim)
+        
+        # === Output encoding (y) ===
         self.pos_proj = nn.Linear(4, hidden_dim)
         
-        # Transformer layers (shared across iterations)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # === Thought initialization (z) ===
+        self.z_init = nn.Parameter(torch.randn(hidden_dim) * 0.02)
         
-        # Output head: predict position delta (residual prediction)
+        # === Thought update network: z' = f(x, y, z) ===
+        
+        # Cross-attention: objects query grid
+        self.grid_cross_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.grid_attn_norm = nn.LayerNorm(hidden_dim)
+        
+        # Self-attention: objects attend to each other
+        self.obj_self_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.obj_attn_norm = nn.LayerNorm(hidden_dim)
+        
+        # FFN for thought update
+        self.thought_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        
+        # === Output update network: y' = g(y, z) ===
         self.output_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 4),  # (dy, dx, dh, dw)
+            nn.Linear(hidden_dim, 4),
         )
         
-        # Initialize output to small values (start near identity)
+        # Initialize output head to near-zero (start near identity)
         nn.init.zeros_(self.output_head[-1].bias)
         nn.init.normal_(self.output_head[-1].weight, std=0.01)
     
-    def forward(self, input_features: torch.Tensor, 
-                object_mask: torch.Tensor,
-                return_all_iterations: bool = False) -> torch.Tensor:
+    def encode_grid(self, grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Encode input grid as sequence of cell embeddings.
+        
         Args:
-            input_features: (B, MAX_OBJECTS, FEATURE_DIM)
-            object_mask: (B, MAX_OBJECTS) - 1 for valid objects, 0 for padding
+            grid: (B, H, W) integer grid with values 0-9, padded with 10
             
         Returns:
-            positions: (B, MAX_OBJECTS, 4) predicted output positions
+            grid_encoding: (B, H*W, hidden_dim)
+            grid_mask: (B, H*W) - True for padding cells
+        """
+        B, H, W = grid.shape
+        device = grid.device
+        
+        # Color embeddings
+        cell_colors = self.color_embed(grid)  # (B, H, W, hidden_dim)
+        
+        # Position embeddings (normalized 0-1)
+        ys = torch.linspace(0, 1, H, device=device)
+        xs = torch.linspace(0, 1, W, device=device)
+        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+        positions = torch.stack([yy, xx], dim=-1)  # (H, W, 2)
+        pos_embed = self.cell_pos_proj(positions)  # (H, W, hidden_dim)
+        
+        # Combine
+        grid_encoding = cell_colors + pos_embed.unsqueeze(0)  # (B, H, W, hidden_dim)
+        grid_encoding = grid_encoding.view(B, H * W, -1)  # (B, H*W, hidden_dim)
+        
+        # Mask for padded cells (color == 10)
+        grid_mask = (grid == 10).view(B, H * W)  # (B, H*W)
+        
+        return grid_encoding, grid_mask
+    
+    def update_thought(self, 
+                       x_obj: torch.Tensor,
+                       x_grid: torch.Tensor,
+                       grid_mask: torch.Tensor,
+                       y: torch.Tensor,
+                       z: torch.Tensor,
+                       obj_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Single thought update: z' = f(x_obj, x_grid, y, z)
+        
+        Args:
+            x_obj: (B, N, hidden_dim) - encoded object features
+            x_grid: (B, H*W, hidden_dim) - encoded grid cells
+            grid_mask: (B, H*W) - True for padding cells
+            y: (B, N, 4) - current position estimates
+            z: (B, N, hidden_dim) - current thought state
+            obj_mask: (B, N) - True for padding objects
+        """
+        # Build query from current state
+        y_embed = self.pos_proj(y)
+        query = z + x_obj + y_embed  # (B, N, hidden_dim)
+        
+        # 1. Cross-attend to grid: "what's in the input at/near my position?"
+        grid_context, _ = self.grid_cross_attn(
+            query=self.grid_attn_norm(query),
+            key=x_grid,
+            value=x_grid,
+            key_padding_mask=grid_mask,
+        )
+        z = z + grid_context
+        
+        # 2. Self-attend among objects: "where are other objects going?"
+        obj_context, _ = self.obj_self_attn(
+            query=self.obj_attn_norm(z),
+            key=self.obj_attn_norm(z),
+            value=z,
+            key_padding_mask=obj_mask,
+        )
+        z = z + obj_context
+        
+        # 3. FFN
+        z = z + self.thought_ffn(self.ffn_norm(z))
+        
+        return z
+    
+    def latent_recursion(self,
+                         x_obj: torch.Tensor,
+                         x_grid: torch.Tensor,
+                         grid_mask: torch.Tensor,
+                         y: torch.Tensor,
+                         z: torch.Tensor,
+                         obj_mask: torch.Tensor,
+                         n: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Inner loop: refine thought n times, then update output once.
+        """
+        n = n or self.n_inner
+        
+        # Refine thought n times (consulting x_grid each time!)
+        for i in range(n):
+            z = self.update_thought(x_obj, x_grid, grid_mask, y, z, obj_mask)
+        
+        # Update output based on refined thought
+        delta = self.output_head(z)
+        y = y + delta
+        
+        return y, z
+    
+    def deep_recursion(self,
+                       x_obj: torch.Tensor,
+                       x_grid: torch.Tensor,
+                       grid_mask: torch.Tensor,
+                       y: torch.Tensor,
+                       z: torch.Tensor,
+                       obj_mask: torch.Tensor,
+                       n: int = None,
+                       T: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Outer loop with gradient truncation for memory efficiency.
+        """
+        n = n or self.n_inner
+        T = T or self.T_outer
+        
+        # T-1 iterations without gradients
+        with torch.no_grad():
+            for j in range(T - 1):
+                y, z = self.latent_recursion(x_obj, x_grid, grid_mask, y, z, obj_mask, n)
+        
+        # Detach to truncate gradient flow
+        y = y.detach()
+        z = z.detach()
+        
+        # Final iteration with gradients
+        y, z = self.latent_recursion(x_obj, x_grid, grid_mask, y, z, obj_mask, n)
+        
+        return y, z
+    
+    def forward(self,
+                input_features: torch.Tensor,
+                input_grid: torch.Tensor,
+                object_mask: torch.Tensor,
+                return_intermediates: bool = False) -> torch.Tensor:
+        """
+        Args:
+            input_features: (B, N, FEATURE_DIM) - per-object features
+            input_grid: (B, H, W) - raw input grid (padded with 10)
+            object_mask: (B, N) - 1 for valid objects, 0 for padding
+            
+        Returns:
+            y: (B, N, 4) - predicted output positions
         """
         B, N, _ = input_features.shape
         
-        # Create attention mask (True = ignore)
-        attn_mask = (object_mask == 0)  # (B, N)
+        # === Encode inputs (fixed throughout) ===
+        x_obj = self.obj_proj(input_features)             # (B, N, hidden_dim)
+        x_grid, grid_mask = self.encode_grid(input_grid)  # (B, H*W, hidden_dim)
         
-        # Initial hidden state
-        h = self.input_proj(input_features)  # (B, N, hidden_dim)
-        h = h + self.h_init.view(1, 1, -1)
+        # === Initialize outputs ===
+        y = input_features[:, :, 0:4].clone()  # start with input positions
+        z = self.z_init.expand(B, N, -1).clone()  # (B, N, hidden_dim)
         
-        # Current position estimate (start with input positions)
-        # Input features[0:4] contains (center_y, center_x, h, w)
-        current_pos = input_features[:, :, 0:4].clone()  # (B, N, 4)
+        # Object padding mask (True = ignore)
+        obj_pad_mask = (object_mask == 0)
         
-        all_positions = [current_pos]
+        # === Run deep recursion ===
+        y, z = self.deep_recursion(x_obj, x_grid, grid_mask, y, z, obj_pad_mask)
         
-        # Iterative refinement
-        for iteration in range(self.num_iterations):
-            # Inject current position estimate
-            pos_embed = self.pos_proj(current_pos)
-            h_with_pos = h + pos_embed
-            
-            # Self-attention across all objects
-            # Key: objects can see each other's current state
-            h_out = self.transformer(
-                h_with_pos,
-                src_key_padding_mask=attn_mask
-            )
-            
-            # Residual connection on hidden state
-            h = h + h_out
-            
-            # Predict position delta
-            delta = self.output_head(h)  # (B, N, 4)
-            
-            # Update position estimate (residual)
-            current_pos = current_pos + delta
-            
-            all_positions.append(current_pos)
-        
-        if return_all_iterations:
-            return torch.stack(all_positions, dim=1)  # (B, num_iter+1, N, 4)
-        
-        return current_pos
+        return y
 
 
 # =============================================================================
@@ -518,13 +677,14 @@ def train_epoch(model: ObjectTRM, dataloader: DataLoader,
     
     for batch in dataloader:
         input_features = batch['input_features'].to(device)
+        input_grid = batch['input_grid'].to(device)
         output_positions = batch['output_positions'].to(device)
         object_mask = batch['object_mask'].to(device)
         
         optimizer.zero_grad()
         
         # Forward
-        pred_positions = model(input_features, object_mask)
+        pred_positions = model(input_features, input_grid, object_mask)
         
         # Loss: MSE on valid objects only
         mask = object_mask.unsqueeze(-1)  # (B, N, 1)
@@ -549,10 +709,11 @@ def evaluate(model: ObjectTRM, dataloader: DataLoader, device: torch.device) -> 
     with torch.no_grad():
         for batch in dataloader:
             input_features = batch['input_features'].to(device)
+            input_grid = batch['input_grid'].to(device)
             output_positions = batch['output_positions'].to(device)
             object_mask = batch['object_mask'].to(device)
             
-            pred_positions = model(input_features, object_mask)
+            pred_positions = model(input_features, input_grid, object_mask)
             
             mask = object_mask.unsqueeze(-1)
             loss = F.mse_loss(pred_positions * mask, output_positions * mask, reduction='sum')
@@ -585,153 +746,126 @@ def visualize_predictions(model: ObjectTRM, dataset: PuzzleLevelDataset,
     for idx in indices:
         item = dataset[idx]
         input_features = item['input_features'].unsqueeze(0).to(device)
+        input_grid = item['input_grid'].unsqueeze(0).to(device)
         object_mask = item['object_mask'].unsqueeze(0).to(device)
         target_positions = item['output_positions'].numpy()
         num_objects = item['num_objects']
         puzzle_id = item['puzzle_id']
         
         with torch.no_grad():
-            # Get all iterations
-            all_pos = model(input_features, object_mask, return_all_iterations=True)
-            all_pos = all_pos.squeeze(0).cpu().numpy()  # (num_iter+1, N, 4)
+            pred_positions = model(input_features, input_grid, object_mask)
+            pred_positions = pred_positions.squeeze(0).cpu().numpy()
         
         print(f"\n{'='*60}")
         print(f"Puzzle: {puzzle_id} | Objects: {num_objects}")
         print(f"{'='*60}")
         
-        input_pos = item['input_features'][:, 0:4].numpy()
+        # Get original grids from dataset
+        ex = dataset.examples[idx]
+        print(f"\nINPUT ({ex.input_grid.shape[0]}x{ex.input_grid.shape[1]}):")
+        print(grid_to_console(ex.input_grid))
         
-        for obj_idx in range(num_objects):
-            in_y, in_x = input_pos[obj_idx, 0:2]
-            tgt_y, tgt_x = target_positions[obj_idx, 0:2]
+        print(f"\nOUTPUT ({ex.output_grid.shape[0]}x{ex.output_grid.shape[1]}):")
+        print(grid_to_console(ex.output_grid))
+        
+        print(f"\n{'─'*40}")
+        print("Object Positions (normalized):")
+        print(f"{'─'*40}")
+        
+        for i in range(num_objects):
+            inp = item['input_features'][i, 0:4].numpy()
+            tgt = target_positions[i, 0:4]
+            pred = pred_positions[i, 0:4]
             
-            print(f"\nObject {obj_idx}:")
-            print(f"  Input:  ({in_y:.3f}, {in_x:.3f})")
-            print(f"  Target: ({tgt_y:.3f}, {tgt_x:.3f})")
-            print(f"  Iterations:")
+            print(f"\nObject {i}:")
+            print(f"  Input:  y={inp[0]:.3f}, x={inp[1]:.3f}, h={inp[2]:.3f}, w={inp[3]:.3f}")
+            print(f"  Target: y={tgt[0]:.3f}, x={tgt[1]:.3f}, h={tgt[2]:.3f}, w={tgt[3]:.3f}")
+            print(f"  Pred:   y={pred[0]:.3f}, x={pred[1]:.3f}, h={pred[2]:.3f}, w={pred[3]:.3f}")
             
-            for it in range(all_pos.shape[0]):
-                pred_y, pred_x = all_pos[it, obj_idx, 0:2]
-                err = np.sqrt((pred_y - tgt_y)**2 + (pred_x - tgt_x)**2)
-                marker = "  " if it == 0 else "->"
-                print(f"    {marker} iter {it}: ({pred_y:.3f}, {pred_x:.3f})  err={err:.4f}")
+            # Error
+            err = np.sqrt((pred[0] - tgt[0])**2 + (pred[1] - tgt[1])**2)
+            print(f"  Center error: {err:.4f}")
 
 
-def visualize_test_prediction(model: ObjectTRM, puzzle: Dict, puzzle_id: str,
-                               device: torch.device):
-    """
-    Visualize model predictions on the test input.
-
-    Trains on training pairs, then predicts where objects in test input should go.
-    """
-    from scipy.ndimage import label
-
+def visualize_test_prediction(model: ObjectTRM, puzzle: Dict, puzzle_id: str, 
+                              device: torch.device, max_grid_size: int = MAX_GRID_SIZE):
+    """Visualize prediction on test input."""
     model.eval()
-
-    # Get test example
-    test_examples = puzzle.get('test', [])
-    if not test_examples:
-        print("No test examples found")
+    
+    if 'test' not in puzzle or len(puzzle['test']) == 0:
         return
-
-    test_example = test_examples[0]
-    test_input = np.array(test_example.get('input', []), dtype=np.int64)
-    test_output = np.array(test_example.get('output', [])) if 'output' in test_example else None
-
-    if test_input.size == 0:
-        print("No test input found")
-        return
-
+    
+    test_example = puzzle['test'][0]
+    test_input = np.array(test_example['input'], dtype=np.int64)
+    test_output = np.array(test_example.get('output', []), dtype=np.int64) if test_example.get('output') else None
+    
     H_in, W_in = test_input.shape
-
-    print("\n" + "=" * 60)
+    
+    # Skip if too large
+    if H_in > max_grid_size or W_in > max_grid_size:
+        print(f"Test input too large: {H_in}x{W_in}")
+        return
+    
+    print(f"\n{'='*60}")
     print(f"TEST PREDICTION: {puzzle_id}")
-    print("=" * 60)
-
-    # Print color legend
-    print("\nColor Legend:")
-    legend_parts = []
-    for i, name in enumerate(COLOR_NAMES):
-        ansi_code = ANSI_COLORS[i]
-        legend_parts.append(f'\033[38;5;{ansi_code}m{i}={name}\033[0m')
-    print("  " + "  ".join(legend_parts))
-
-    # Print test input
-    print(f"\n{'─' * 40}")
-    print(f"TEST INPUT ({H_in}x{W_in}):")
-    print('─' * 40)
+    print(f"{'='*60}")
+    
+    print(f"\nTEST INPUT ({H_in}x{W_in}):")
     print(grid_to_console(test_input))
-
+    
     # Extract objects from test input
+    from scipy.ndimage import label
     non_black = test_input != 0
     labeled, num_features = label(non_black)
-
-    input_objects = []
-    for i in range(1, num_features + 1):
-        mask = labeled == i
-        if mask.sum() > 0:
-            input_objects.append(mask)
-
-    if len(input_objects) == 0:
-        print("\nNo objects found in test input")
+    
+    if num_features == 0:
+        print("\nNo objects found in test input.")
         return
-
-    print(f"\nFound {len(input_objects)} object(s) in test input")
-
-    # Sort by x-position (left to right) - same as training
-    def get_x(mask):
-        rows, cols = np.where(mask)
-        return cols.min() if len(cols) > 0 else 0
-    input_objects.sort(key=get_x)
-
-    # Build feature array for test input
-    num_objects = min(len(input_objects), MAX_OBJECTS)
+    
+    # Extract features and info for each object
+    object_info = []
     input_features = np.zeros((MAX_OBJECTS, FEATURE_DIM), dtype=np.float32)
     object_mask = np.zeros(MAX_OBJECTS, dtype=np.float32)
-
-    # Store original object info for rendering
-    object_info = []
-
-    for i, mask in enumerate(input_objects[:MAX_OBJECTS]):
+    
+    num_objects = min(num_features, MAX_OBJECTS)
+    
+    for i in range(num_objects):
+        mask = labeled == (i + 1)
         input_features[i] = extract_object_features(mask, test_input, H_in, W_in)
         object_mask[i] = 1.0
-
-        # Store object pixels and colors for rendering
+        
         rows, cols = np.where(mask)
-        colors = test_input[mask]
         min_r, max_r = rows.min(), rows.max()
         min_c, max_c = cols.min(), cols.max()
-
-        # Relative positions within object's bounding box
-        rel_rows = rows - min_r
-        rel_cols = cols - min_c
-        obj_h = max_r - min_r + 1
-        obj_w = max_c - min_c + 1
-
+        
         object_info.append({
-            'rel_rows': rel_rows,
-            'rel_cols': rel_cols,
-            'colors': colors,
-            'height': obj_h,
-            'width': obj_w,
+            'mask': mask,
+            'height': max_r - min_r + 1,
+            'width': max_c - min_c + 1,
             'input_center_y': (min_r + max_r) / 2,
             'input_center_x': (min_c + max_c) / 2,
+            'rel_rows': rows - min_r,
+            'rel_cols': cols - min_c,
+            'colors': test_input[rows, cols],
         })
-
-    # Run model prediction
+    
+    # Pad input grid
+    padded_grid = np.full((max_grid_size, max_grid_size), 10, dtype=np.int64)
+    padded_grid[:H_in, :W_in] = test_input
+    
+    # Run model
     with torch.no_grad():
         input_tensor = torch.from_numpy(input_features).unsqueeze(0).to(device)
+        grid_tensor = torch.from_numpy(padded_grid).unsqueeze(0).to(device)
         mask_tensor = torch.from_numpy(object_mask).unsqueeze(0).to(device)
 
-        pred_positions = model(input_tensor, mask_tensor)
+        pred_positions = model(input_tensor, grid_tensor, mask_tensor)
         pred_positions = pred_positions.squeeze(0).cpu().numpy()
 
     # Determine output grid size
-    # Use test output size if available, otherwise estimate from predictions
-    if test_output is not None:
+    if test_output is not None and test_output.size > 0:
         H_out, W_out = test_output.shape
     else:
-        # Estimate from predictions - use same as input for now
         H_out, W_out = H_in, W_in
 
     # Render predicted output
@@ -772,7 +906,7 @@ def visualize_test_prediction(model: ObjectTRM, puzzle: Dict, puzzle_id: str,
     print(grid_to_console(predicted_grid))
 
     # Display expected output if available
-    if test_output is not None:
+    if test_output is not None and test_output.size > 0:
         print(f"\n{'─' * 40}")
         print(f"EXPECTED OUTPUT ({test_output.shape[0]}x{test_output.shape[1]}):")
         print('─' * 40)
@@ -839,9 +973,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden-dim", type=int, default=32)
-    parser.add_argument("--num-iterations", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--n-inner", type=int, default=6,
+                        help="Thought iterations per output update")
+    parser.add_argument("--T-outer", type=int, default=3,
+                        help="Output update iterations (gradient truncated)")
     parser.add_argument("--num-heads", type=int, default=4)
 
     # Augmentation args
@@ -904,8 +1040,8 @@ def main():
     # Create model
     model = ObjectTRM(
         hidden_dim=args.hidden_dim,
-        num_iterations=args.num_iterations,
-        num_layers=args.num_layers,
+        n_inner=args.n_inner,
+        T_outer=args.T_outer,
         num_heads=args.num_heads,
     ).to(device)
     
