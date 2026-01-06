@@ -701,6 +701,12 @@ def segment_by_dividers(
             if row_start >= row_end or col_start >= col_end:
                 continue
 
+            # Check if this region is a divider (skip divider cells entirely)
+            is_h_divider = (row_start, row_end) in h_divider_rows
+            is_v_divider = (col_start, col_end) in v_divider_cols
+            if is_h_divider or is_v_divider:
+                continue
+
             component_id += 1
 
             # Label this region
@@ -711,15 +717,10 @@ def segment_by_dividers(
             unique, counts = np.unique(region, return_counts=True)
             dominant_color = int(unique[np.argmax(counts)])
 
-            # Check if this region is a divider
-            is_h_divider = (row_start, row_end) in h_divider_rows
-            is_v_divider = (col_start, col_end) in v_divider_cols
-            region_is_divider = is_h_divider or is_v_divider
-
             colors.append(dominant_color)
             bboxes.append((row_start, col_start, row_end - 1, col_end - 1))
             is_background.append(False)
-            is_divider.append(region_is_divider)
+            is_divider.append(False)
 
     return labels, colors, bboxes, is_background, is_divider
 

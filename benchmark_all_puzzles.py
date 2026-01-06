@@ -261,7 +261,7 @@ def main():
     parser.add_argument("--dataset", type=str, default="arc-agi-1",
                         choices=["arc-agi-1", "arc-agi-2"])
     parser.add_argument("--data-root", type=str, default="kaggle/combined")
-    parser.add_argument("--max-epochs", type=int, default=100,
+    parser.add_argument("--max-epochs", type=int, default=1,
                         help="Max training epochs per puzzle")
     parser.add_argument("--screening-epochs", type=int, default=100,
                         help="Epochs for screening phase")
