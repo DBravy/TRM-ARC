@@ -394,108 +394,111 @@ def plot_grid(ax, grid, title, cmap=None, show_grid_lines=True):
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
 
 
-def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: list, 
-                                 output_path: str = None, use_background_detection: bool = True):
-    """
-    Visualize component grouping at different merge thresholds for a puzzle.
-    """
-    examples = puzzle_data.get("test", [])
-    if not examples:
-        print(f"No test examples found for puzzle {puzzle_id}")
-        return
+class PuzzleViewer:
+    """Interactive viewer for scrolling through puzzle examples."""
 
-    # Use first test example
-    example = examples[0]
-    input_grid = np.array(example["input"], dtype=np.int32)
-    output_grid = np.array(example["output"], dtype=np.int32) if "output" in example else None
+    def __init__(self, puzzle_id: str, puzzle_data: dict, thresholds: list,
+                 use_background_detection: bool = True):
+        self.puzzle_id = puzzle_id
+        self.thresholds = thresholds
+        self.use_background_detection = use_background_detection
 
-    # Detect background color
-    background_color = None
-    if use_background_detection:
-        background_color = detect_background_color(input_grid)
-        if background_color is not None:
-            print(f"Detected background color: {background_color}")
-        else:
-            print("No clear background detected")
+        # Collect all examples: training pairs + test pairs
+        self.examples = []
 
-    # Compute components and affinity for input grid
-    component_labels, component_colors, component_bboxes, component_is_background = \
-        compute_connected_components(input_grid, background_color)
-    affinity = compute_pairwise_affinity(component_labels, component_colors, component_bboxes, 
-                                          component_is_background)
-    num_components = len(component_colors)
-    num_background_components = sum(component_is_background)
+        # Add training examples
+        for i, train_ex in enumerate(puzzle_data.get("train", [])):
+            self.examples.append({
+                "type": "train",
+                "index": i + 1,
+                "input": np.array(train_ex["input"], dtype=np.int32),
+                "output": np.array(train_ex["output"], dtype=np.int32) if "output" in train_ex else None
+            })
 
-    # Create figure
-    n_thresholds = len(thresholds)
-    n_cols = n_thresholds + 2  # Original + Components + thresholds
-    n_rows = 2 if output_grid is not None else 1
+        # Add test examples
+        for i, test_ex in enumerate(puzzle_data.get("test", [])):
+            self.examples.append({
+                "type": "test",
+                "index": i + 1,
+                "input": np.array(test_ex["input"], dtype=np.int32),
+                "output": np.array(test_ex["output"], dtype=np.int32) if "output" in test_ex else None
+            })
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
+        self.current_idx = 0
+        self.fig = None
+        self.axes = None
 
-    bg_str = f" | bg={background_color}" if background_color is not None else ""
-    fig.suptitle(f"Puzzle: {puzzle_id} (test input) | {num_components} components ({num_background_components} bg){bg_str}", 
-                 fontsize=14)
+        # Create colormap for groups
+        self.group_cmap = plt.cm.get_cmap('tab20', 20)
 
-    # Create a colormap for groups (distinct colors)
-    group_cmap = plt.cm.get_cmap('tab20', 20)
+    def _render_example(self):
+        """Render the current example."""
+        if not self.examples:
+            print("No examples to display!")
+            return
 
-    # Row 0: Test input grid analysis
-    plot_grid(axes[0, 0], input_grid, "Test Input (colors)")
+        example = self.examples[self.current_idx]
+        input_grid = example["input"]
+        output_grid = example["output"]
+        example_type = example["type"]
+        example_num = example["index"]
 
-    # Connected components
-    comp_display = component_labels.copy()
-    plot_grid(axes[0, 1], comp_display, f"Components ({num_components})",
-              cmap=group_cmap, show_grid_lines=True)
+        # Detect background color
+        background_color = None
+        if self.use_background_detection:
+            background_color = detect_background_color(input_grid)
 
-    # Different thresholds
-    for i, threshold in enumerate(thresholds):
-        group_ids = merge_components(affinity, num_components, threshold)
-        group_grid = create_group_visualization(component_labels, group_ids)
-        num_groups = len(np.unique(group_ids)) if len(group_ids) > 0 else 0
+        # Compute components and affinity for input grid
+        component_labels, component_colors, component_bboxes, component_is_background = \
+            compute_connected_components(input_grid, background_color)
+        affinity = compute_pairwise_affinity(component_labels, component_colors, component_bboxes,
+                                              component_is_background)
+        num_components = len(component_colors)
+        num_background_components = sum(component_is_background)
 
-        # Create masked array for visualization (background = -1)
-        masked_grid = np.ma.masked_where(group_grid < 0, group_grid)
+        # Create figure
+        n_thresholds = len(self.thresholds)
+        n_cols = n_thresholds + 2  # Original + Components + thresholds
+        n_rows = 2 if output_grid is not None else 1
 
-        ax = axes[0, i + 2]
-        ax.imshow(masked_grid, cmap=group_cmap, vmin=0, vmax=19, interpolation='nearest')
-        ax.set_title(f"Threshold {threshold}\n({num_groups} groups)", fontsize=10)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        # Clear existing figure
+        if self.fig is not None:
+            plt.close(self.fig)
 
-        H, W = group_grid.shape
-        ax.set_xticks(np.arange(-0.5, W, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, H, 1), minor=True)
-        ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
+        self.fig, self.axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
+        if n_rows == 1:
+            self.axes = self.axes.reshape(1, -1)
 
-    # Row 1: Test output grid analysis (if available)
-    if output_grid is not None:
-        # Detect background for output grid separately
-        out_background_color = None
-        if use_background_detection:
-            out_background_color = detect_background_color(output_grid)
-            
-        out_component_labels, out_component_colors, out_component_bboxes, out_component_is_background = \
-            compute_connected_components(output_grid, out_background_color)
-        out_affinity = compute_pairwise_affinity(out_component_labels, out_component_colors, 
-                                                  out_component_bboxes, out_component_is_background)
-        out_num_components = len(out_component_colors)
+        # Title with navigation info
+        total_train = sum(1 for e in self.examples if e["type"] == "train")
+        total_test = sum(1 for e in self.examples if e["type"] == "test")
+        bg_str = f" | bg={background_color}" if background_color is not None else ""
 
-        plot_grid(axes[1, 0], output_grid, "Test Output (colors)")
-        plot_grid(axes[1, 1], out_component_labels, f"Components ({out_num_components})",
-                  cmap=group_cmap, show_grid_lines=True)
+        self.fig.suptitle(
+            f"Puzzle: {self.puzzle_id} | {example_type.upper()} {example_num} "
+            f"[{self.current_idx + 1}/{len(self.examples)}] | "
+            f"{num_components} components ({num_background_components} bg){bg_str}\n"
+            f"(Left/Right arrows to navigate | {total_train} train, {total_test} test examples)",
+            fontsize=12
+        )
 
-        for i, threshold in enumerate(thresholds):
-            group_ids = merge_components(out_affinity, out_num_components, threshold)
-            group_grid = create_group_visualization(out_component_labels, group_ids)
+        # Row 0: Input grid analysis
+        plot_grid(self.axes[0, 0], input_grid, f"{example_type.capitalize()} Input (colors)")
+
+        # Connected components
+        plot_grid(self.axes[0, 1], component_labels, f"Components ({num_components})",
+                  cmap=self.group_cmap, show_grid_lines=True)
+
+        # Different thresholds
+        for i, threshold in enumerate(self.thresholds):
+            group_ids = merge_components(affinity, num_components, threshold)
+            group_grid = create_group_visualization(component_labels, group_ids)
             num_groups = len(np.unique(group_ids)) if len(group_ids) > 0 else 0
 
             masked_grid = np.ma.masked_where(group_grid < 0, group_grid)
 
-            ax = axes[1, i + 2]
-            ax.imshow(masked_grid, cmap=group_cmap, vmin=0, vmax=19, interpolation='nearest')
+            ax = self.axes[0, i + 2]
+            ax.imshow(masked_grid, cmap=self.group_cmap, vmin=0, vmax=19, interpolation='nearest')
             ax.set_title(f"Threshold {threshold}\n({num_groups} groups)", fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
@@ -505,36 +508,139 @@ def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: l
             ax.set_yticks(np.arange(-0.5, H, 1), minor=True)
             ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
 
-    plt.tight_layout()
+        # Row 1: Output grid analysis (if available)
+        if output_grid is not None:
+            out_background_color = None
+            if self.use_background_detection:
+                out_background_color = detect_background_color(output_grid)
+
+            out_component_labels, out_component_colors, out_component_bboxes, out_component_is_background = \
+                compute_connected_components(output_grid, out_background_color)
+            out_affinity = compute_pairwise_affinity(out_component_labels, out_component_colors,
+                                                      out_component_bboxes, out_component_is_background)
+            out_num_components = len(out_component_colors)
+
+            plot_grid(self.axes[1, 0], output_grid, f"{example_type.capitalize()} Output (colors)")
+            plot_grid(self.axes[1, 1], out_component_labels, f"Components ({out_num_components})",
+                      cmap=self.group_cmap, show_grid_lines=True)
+
+            for i, threshold in enumerate(self.thresholds):
+                group_ids = merge_components(out_affinity, out_num_components, threshold)
+                group_grid = create_group_visualization(out_component_labels, group_ids)
+                num_groups = len(np.unique(group_ids)) if len(group_ids) > 0 else 0
+
+                masked_grid = np.ma.masked_where(group_grid < 0, group_grid)
+
+                ax = self.axes[1, i + 2]
+                ax.imshow(masked_grid, cmap=self.group_cmap, vmin=0, vmax=19, interpolation='nearest')
+                ax.set_title(f"Threshold {threshold}\n({num_groups} groups)", fontsize=10)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+                H, W = group_grid.shape
+                ax.set_xticks(np.arange(-0.5, W, 1), minor=True)
+                ax.set_yticks(np.arange(-0.5, H, 1), minor=True)
+                ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
+
+        plt.tight_layout()
+        self.fig.canvas.mpl_connect('key_press_event', self._on_key)
+        self.fig.canvas.draw()
+
+    def _on_key(self, event):
+        """Handle keyboard navigation."""
+        if event.key == 'right' or event.key == 'n':
+            self.current_idx = (self.current_idx + 1) % len(self.examples)
+            self._render_example()
+            plt.show()
+        elif event.key == 'left' or event.key == 'p':
+            self.current_idx = (self.current_idx - 1) % len(self.examples)
+            self._render_example()
+            plt.show()
+        elif event.key == 'q':
+            plt.close(self.fig)
+
+    def show(self):
+        """Display the viewer."""
+        if not self.examples:
+            print(f"No examples found for puzzle {self.puzzle_id}")
+            return
+
+        print(f"\nNavigation: Left/Right arrows or p/n to scroll, q to quit")
+        print(f"Total examples: {len(self.examples)} "
+              f"({sum(1 for e in self.examples if e['type'] == 'train')} train, "
+              f"{sum(1 for e in self.examples if e['type'] == 'test')} test)\n")
+
+        self._render_example()
+        plt.show()
+
+    def save(self, output_path: str):
+        """Save all examples to files."""
+        for i, example in enumerate(self.examples):
+            self.current_idx = i
+            self._render_example()
+
+            example_type = example["type"]
+            example_num = example["index"]
+
+            # Generate filename
+            base, ext = os.path.splitext(output_path)
+            filename = f"{base}_{example_type}_{example_num}{ext}"
+
+            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            print(f"Saved: {filename}")
+            plt.close(self.fig)
+
+
+def visualize_puzzle_thresholds(puzzle_id: str, puzzle_data: dict, thresholds: list,
+                                 output_path: str = None, use_background_detection: bool = True):
+    """
+    Visualize component grouping at different merge thresholds for a puzzle.
+    Uses an interactive viewer to scroll through all training and test examples.
+    """
+    viewer = PuzzleViewer(puzzle_id, puzzle_data, thresholds, use_background_detection)
 
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to {output_path}")
+        viewer.save(output_path)
+    else:
+        viewer.show()
 
-    plt.show()
+    # Print summary for first example
+    if viewer.examples:
+        example = viewer.examples[0]
+        input_grid = example["input"]
 
-    # Print affinity matrix summary
-    print(f"\n=== Affinity Analysis for {puzzle_id} ===")
-    print(f"Number of connected components: {num_components}")
-    print(f"Background components: {num_background_components}")
-    if background_color is not None:
-        print(f"Background color: {background_color}")
-    
-    if num_components > 0 and num_components <= 20:
-        print("\nAffinity matrix (non-zero values):")
-        for i in range(num_components):
-            for j in range(i + 1, num_components):
-                if affinity[i, j] > 0:
-                    bg_i = " [BG]" if component_is_background[i] else ""
-                    bg_j = " [BG]" if component_is_background[j] else ""
-                    print(f"  Component {i+1} (color {component_colors[i]}{bg_i}) <-> "
-                          f"Component {j+1} (color {component_colors[j]}{bg_j}): {affinity[i, j]:.1f}")
+        background_color = None
+        if use_background_detection:
+            background_color = detect_background_color(input_grid)
 
-    print("\nGroups at each threshold:")
-    for threshold in thresholds:
-        group_ids = merge_components(affinity, num_components, threshold)
-        num_groups = len(np.unique(group_ids)) if len(group_ids) > 0 else 0
-        print(f"  Threshold {threshold}: {num_groups} groups")
+        component_labels, component_colors, component_bboxes, component_is_background = \
+            compute_connected_components(input_grid, background_color)
+        affinity = compute_pairwise_affinity(component_labels, component_colors, component_bboxes,
+                                              component_is_background)
+        num_components = len(component_colors)
+        num_background_components = sum(component_is_background)
+
+        print(f"\n=== Affinity Analysis for {puzzle_id} (first example) ===")
+        print(f"Number of connected components: {num_components}")
+        print(f"Background components: {num_background_components}")
+        if background_color is not None:
+            print(f"Background color: {background_color}")
+
+        if num_components > 0 and num_components <= 20:
+            print("\nAffinity matrix (non-zero values):")
+            for i in range(num_components):
+                for j in range(i + 1, num_components):
+                    if affinity[i, j] > 0:
+                        bg_i = " [BG]" if component_is_background[i] else ""
+                        bg_j = " [BG]" if component_is_background[j] else ""
+                        print(f"  Component {i+1} (color {component_colors[i]}{bg_i}) <-> "
+                              f"Component {j+1} (color {component_colors[j]}{bg_j}): {affinity[i, j]:.1f}")
+
+        print("\nGroups at each threshold:")
+        for threshold in thresholds:
+            group_ids = merge_components(affinity, num_components, threshold)
+            num_groups = len(np.unique(group_ids)) if len(group_ids) > 0 else 0
+            print(f"  Threshold {threshold}: {num_groups} groups")
 
 
 def main():

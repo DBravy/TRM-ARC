@@ -25,6 +25,9 @@ import torch
 
 from crm import VentralCNN, AffinitySlotAttention
 
+# Object correspondence matching
+from correspondence_module import find_correspondences_from_similarity_matrix
+
 
 # ARC color palette
 ARC_COLORS = [
@@ -783,6 +786,9 @@ def find_correspondences(similarity_matrix: np.ndarray,
                          margin: float = 0.1) -> List[Tuple[int, int, float]]:
     """Find matches from similarity matrix, allowing many-to-many when scores are close.
 
+    This is a thin wrapper around correspondence_module.find_correspondences_from_similarity_matrix
+    for backwards compatibility.
+
     For each output slot, includes the best matching input slot plus any others
     whose score is within `margin` of the best. Similarly for each input slot.
     This allows many-to-many correspondences only when multiple slots are
@@ -800,39 +806,9 @@ def find_correspondences(similarity_matrix: np.ndarray,
         List of (input_slot_idx, output_slot_idx, similarity_score)
         sorted by similarity score (highest first)
     """
-    if similarity_matrix.size == 0:
-        return []
-
-    # Compute best scores for each row (input) and column (output)
-    best_per_output = similarity_matrix.max(axis=0)  # Best input score for each output
-    best_per_input = similarity_matrix.max(axis=1)   # Best output score for each input
-
-    correspondences_set = set()
-
-    # Include a correspondence only if it passes the margin check from BOTH directions:
-    # 1. Score is within margin of the best input for this output
-    # 2. Score is within margin of the best output for this input
-    for in_i, in_idx in enumerate(valid_input_idx):
-        for out_i, out_idx in enumerate(valid_output_idx):
-            score = similarity_matrix[in_i, out_i]
-            if score < threshold:
-                continue
-
-            # Check margin from output's perspective (best input for this output)
-            if score < best_per_output[out_i] - margin:
-                continue
-
-            # Check margin from input's perspective (best output for this input)
-            if score < best_per_input[in_i] - margin:
-                continue
-
-            correspondences_set.add((in_idx, out_idx, float(score)))
-
-    # Convert to list and sort by similarity score (highest first)
-    correspondences = list(correspondences_set)
-    correspondences.sort(key=lambda x: x[2], reverse=True)
-
-    return correspondences
+    return find_correspondences_from_similarity_matrix(
+        similarity_matrix, valid_input_idx, valid_output_idx, threshold, margin
+    )
 
 
 def get_mask_centroid(mask: np.ndarray) -> Tuple[float, float]:
@@ -1344,6 +1320,8 @@ def main():
                         help="Run shape feature extraction test instead of puzzle visualization")
     parser.add_argument('--verbose-shapes', action='store_true',
                         help="Print detailed shape features for each slot")
+    parser.add_argument('--changes-only', action='store_true',
+                        help="Only show correspondences involving change (filter out stable objects)")
     args = parser.parse_args()
     
     # Run shape test mode if requested
@@ -1412,8 +1390,28 @@ def main():
         correspondences = find_correspondences(similarity, valid_in, valid_out, args.threshold, args.margin)
         print(f"  Found {len(correspondences)} correspondences")
 
-        for in_idx, out_idx, score in correspondences:
-            print(f"    Input slot {in_idx} -> Output slot {out_idx} (similarity: {score:.3f})")
+        # Filter out stable correspondences if --changes-only is set
+        if args.changes_only:
+            filtered_correspondences = []
+            stable_count = 0
+            for in_idx, out_idx, score in correspondences:
+                if score >= 0.99:  # Near-perfect similarity = stable/unchanged
+                    stable_count += 1
+                    print(f"    [STABLE] Input slot {in_idx} -> Output slot {out_idx} (similarity: {score:.3f})")
+                else:
+                    filtered_correspondences.append((in_idx, out_idx, score))
+                    print(f"    Input slot {in_idx} -> Output slot {out_idx} (similarity: {score:.3f})")
+            correspondences = filtered_correspondences
+            print(f"  Filtered to {len(correspondences)} changed correspondences ({stable_count} stable objects hidden)")
+
+            # Also filter valid indices to only show slots involved in changed correspondences
+            changed_input_slots = set(c[0] for c in correspondences)
+            changed_output_slots = set(c[1] for c in correspondences)
+            valid_in = [idx for idx in valid_in if idx in changed_input_slots]
+            valid_out = [idx for idx in valid_out if idx in changed_output_slots]
+        else:
+            for in_idx, out_idx, score in correspondences:
+                print(f"    Input slot {in_idx} -> Output slot {out_idx} (similarity: {score:.3f})")
 
         # Collect data for visualization
         examples_data.append({
