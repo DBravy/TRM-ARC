@@ -70,6 +70,7 @@ class Object:
         color: Color value (0-9)
         pixels: Set of (row, col) tuples for all pixels in this object
         is_background: Whether this object is part of the background
+        is_divider: Whether this object is a divider line
     """
     id: int
     row: int          # top-left row
@@ -79,6 +80,7 @@ class Object:
     color: int
     pixels: Set[Tuple[int, int]] = field(default_factory=set)
     is_background: bool = False
+    is_divider: bool = False
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -203,6 +205,526 @@ def compute_exterior_mask(grid: np.ndarray, background_color: int) -> np.ndarray
 
 
 # =============================================================================
+# Divider Line Detection
+# =============================================================================
+
+def detect_divider_lines(
+    grid: np.ndarray,
+    max_divider_ratio: float = 0.5,
+    verbose: bool = False
+) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
+    """
+    Detect horizontal and vertical divider lines in a grid with semantic validation.
+
+    A divider line is a contiguous band of a single color spanning the
+    full width (horizontal) or full height (vertical) of the grid.
+    The divider must have non-empty regions on both sides.
+
+    Additional semantic checks (improvements over original):
+    - Not a stripe pattern (not ALL rows or ALL cols uniform)
+    - Divider area should be reasonable (not overwhelming content)
+    - Dividers should not split connected objects
+    - Separated regions should be meaningfully different
+
+    Args:
+        grid: (H, W) integer color values 0-9
+        max_divider_ratio: Maximum fraction of grid that single-axis dividers can occupy (default 0.5)
+        verbose: Print debug info
+
+    Returns:
+        horizontal_dividers: List of (start_row, end_row_exclusive, color) tuples
+        vertical_dividers: List of (start_col, end_col_exclusive, color) tuples
+    """
+    H, W = grid.shape
+    total_pixels = H * W
+    
+    if verbose:
+        print(f"\n--- Analyzing {H}x{W} grid ---")
+    
+    # ==========================================================================
+    # Step 1: Find candidate dividers (same as original)
+    # ==========================================================================
+    
+    h_candidates = []
+    row = 0
+    while row < H:
+        row_colors = grid[row, :]
+        if np.all(row_colors == row_colors[0]):
+            color = int(row_colors[0])
+            start_row = row
+            while row < H and np.all(grid[row, :] == color):
+                row += 1
+            end_row = row
+            if start_row > 0 and end_row < H:
+                h_candidates.append((start_row, end_row, color))
+        else:
+            row += 1
+    
+    v_candidates = []
+    col = 0
+    while col < W:
+        col_colors = grid[:, col]
+        if np.all(col_colors == col_colors[0]):
+            color = int(col_colors[0])
+            start_col = col
+            while col < W and np.all(grid[:, col] == color):
+                col += 1
+            end_col = col
+            if start_col > 0 and end_col < W:
+                v_candidates.append((start_col, end_col, color))
+        else:
+            col += 1
+    
+    if verbose:
+        print(f"Candidates: {len(h_candidates)} H, {len(v_candidates)} V")
+    
+    if not h_candidates and not v_candidates:
+        return [], []
+    
+    # ==========================================================================
+    # Step 1b: Filter dividers - each side must have meaningful variation
+    # ==========================================================================
+    # A region has "meaningful variation" if it's not dominated by one color.
+    # This handles cases where a mostly-uniform region (95% black) has one
+    # different pixel - that's not real variation, just noise.
+    
+    def region_has_meaningful_variation(region: np.ndarray, 
+                                         min_colors: int = 2,
+                                         max_dominant_ratio: float = 0.90) -> bool:
+        """
+        Check if a region has meaningful variation (not dominated by one color).
+        
+        Args:
+            region: The region to check
+            min_colors: Minimum number of distinct colors required
+            max_dominant_ratio: If one color is more than this ratio, not varied
+        """
+        if region.size == 0:
+            return False
+        
+        unique, counts = np.unique(region, return_counts=True)
+        
+        # Must have at least min_colors distinct colors
+        if len(unique) < min_colors:
+            return False
+        
+        # The dominant color shouldn't be more than max_dominant_ratio of the region
+        dominant_ratio = counts.max() / region.size
+        if dominant_ratio > max_dominant_ratio:
+            return False
+        
+        return True
+    
+    def filter_h_dividers(dividers: list, grid: np.ndarray) -> list:
+        """Keep H dividers that separate meaningfully varied regions."""
+        H, W = grid.shape
+        valid = []
+        
+        for start, end, color in dividers:
+            above = grid[:start, :]
+            below = grid[end:, :]
+            
+            above_varied = region_has_meaningful_variation(above)
+            below_varied = region_has_meaningful_variation(below)
+            
+            # A valid divider has varied content on at least one side,
+            # AND the other side is either varied OR a different uniform color
+            if above_varied and below_varied:
+                valid.append((start, end, color))
+            elif above_varied and not below_varied:
+                # Below is uniform - check it's different from the divider
+                below_colors = np.unique(below)
+                if len(below_colors) > 0 and below_colors[0] != color:
+                    valid.append((start, end, color))
+                elif verbose:
+                    print(f"  Rejecting H divider rows {start}-{end-1}: below is uniform same color")
+            elif below_varied and not above_varied:
+                above_colors = np.unique(above)
+                if len(above_colors) > 0 and above_colors[0] != color:
+                    valid.append((start, end, color))
+                elif verbose:
+                    print(f"  Rejecting H divider rows {start}-{end-1}: above is uniform same color")
+            else:
+                if verbose:
+                    print(f"  Rejecting H divider rows {start}-{end-1}: neither side varied")
+        
+        return valid
+    
+    def filter_v_dividers(dividers: list, grid: np.ndarray) -> list:
+        """Keep V dividers that separate meaningfully varied regions."""
+        H, W = grid.shape
+        valid = []
+        
+        for start, end, color in dividers:
+            left = grid[:, :start]
+            right = grid[:, end:]
+            
+            left_varied = region_has_meaningful_variation(left)
+            right_varied = region_has_meaningful_variation(right)
+            
+            if left_varied and right_varied:
+                valid.append((start, end, color))
+            elif left_varied and not right_varied:
+                right_colors = np.unique(right)
+                if len(right_colors) > 0 and right_colors[0] != color:
+                    valid.append((start, end, color))
+                elif verbose:
+                    print(f"  Rejecting V divider cols {start}-{end-1}: right is uniform same color")
+            elif right_varied and not left_varied:
+                left_colors = np.unique(left)
+                if len(left_colors) > 0 and left_colors[0] != color:
+                    valid.append((start, end, color))
+                elif verbose:
+                    print(f"  Rejecting V divider cols {start}-{end-1}: left is uniform same color")
+            else:
+                if verbose:
+                    print(f"  Rejecting V divider cols {start}-{end-1}: neither side varied")
+        
+        return valid
+    
+    h_candidates = filter_h_dividers(h_candidates, grid)
+    v_candidates = filter_v_dividers(v_candidates, grid)
+    
+    if verbose:
+        print(f"After content filter: {len(h_candidates)} H, {len(v_candidates)} V")
+    
+    # ==========================================================================
+    # Step 1c: Reject dividers that would create tiny cells
+    # ==========================================================================
+    # If accepting multiple dividers would create a cell smaller than min_cell_size,
+    # keep only the first one (greedy approach).
+    
+    min_cell_size = 2  # Minimum rows/cols for a cell to be meaningful
+    
+    def filter_by_cell_size(dividers: list, total_size: int) -> list:
+        """Remove dividers that would create cells smaller than min_cell_size."""
+        if len(dividers) <= 1:
+            return dividers
+        
+        sorted_divs = sorted(dividers, key=lambda x: x[0])
+        
+        # Build cell boundaries: [0, div1_start, div1_end, div2_start, ...]
+        kept = []
+        prev_end = 0
+        
+        for start, end, color in sorted_divs:
+            # Cell before this divider
+            cell_size = start - prev_end
+            
+            if cell_size >= min_cell_size:
+                kept.append((start, end, color))
+                prev_end = end
+            elif verbose:
+                print(f"  Rejecting divider {start}-{end-1}: would create cell of size {cell_size}")
+        
+        # Check final cell (after last kept divider)
+        if kept:
+            last_end = kept[-1][1]
+            final_cell_size = total_size - last_end
+            if final_cell_size < min_cell_size:
+                if verbose:
+                    print(f"  Removing last divider: final cell size {final_cell_size}")
+                kept = kept[:-1]
+        
+        return kept
+    
+    h_candidates = filter_by_cell_size(h_candidates, H)
+    v_candidates = filter_by_cell_size(v_candidates, W)
+    
+    if verbose:
+        print(f"After cell size filter: {len(h_candidates)} H, {len(v_candidates)} V")
+    
+    if not h_candidates and not v_candidates:
+        return [], []
+    
+    # ==========================================================================
+    # Step 2: Analyze row/column uniformity patterns
+    # ==========================================================================
+    
+    uniform_row_colors = {}
+    for r in range(H):
+        if np.all(grid[r,:] == grid[r,0]):
+            uniform_row_colors[r] = int(grid[r,0])
+    
+    uniform_col_colors = {}
+    for c in range(W):
+        if np.all(grid[:,c] == grid[0,c]):
+            uniform_col_colors[c] = int(grid[0,c])
+    
+    h_uniform_colors = set(uniform_row_colors.values())
+    v_uniform_colors = set(uniform_col_colors.values())
+    
+    if verbose:
+        print(f"Uniform rows: {len(uniform_row_colors)}/{H}, colors: {h_uniform_colors}")
+        print(f"Uniform cols: {len(uniform_col_colors)}/{W}, colors: {v_uniform_colors}")
+    
+    # ==========================================================================
+    # Step 3: Stripe pattern detection
+    # ==========================================================================
+    
+    def is_stripe_pattern(uniform_dict: dict, total: int, candidates: list) -> bool:
+        """Detect if this is a stripe pattern rather than a grid."""
+        if len(uniform_dict) < total * 0.6:
+            return False
+        
+        div_colors = set(c for _, _, c in candidates)
+        non_div_uniform = set()
+        for idx, color in uniform_dict.items():
+            is_divider = any(start <= idx < end for start, end, c in candidates if c == color)
+            if not is_divider:
+                non_div_uniform.add(color)
+        
+        # Valid grid with uniform cells: one non-div color, one div color, different
+        if len(non_div_uniform) == 1 and len(div_colors) == 1:
+            if non_div_uniform != div_colors:
+                return False
+        
+        # If 80%+ rows/cols are uniform, it's a stripe pattern
+        if len(uniform_dict) >= total * 0.8:
+            return True
+        
+        return False
+    
+    is_h_stripes = is_stripe_pattern(uniform_row_colors, H, h_candidates)
+    is_v_stripes = is_stripe_pattern(uniform_col_colors, W, v_candidates)
+    
+    if is_h_stripes:
+        if verbose:
+            print("H stripe pattern detected - rejecting H dividers")
+        h_candidates = []
+        
+    if is_v_stripes:
+        if verbose:
+            print("V stripe pattern detected - rejecting V dividers")
+        v_candidates = []
+    
+    if not h_candidates and not v_candidates:
+        return [], []
+    
+    # ==========================================================================
+    # Step 4: Connected object detection
+    # ==========================================================================
+    
+    def check_connected_split(grid, h_divs, v_divs) -> bool:
+        """Check if dividers would split a single connected component."""
+        div_colors = set()
+        for _, _, c in h_divs + v_divs:
+            div_colors.add(c)
+        
+        for div_color in div_colors:
+            mask = (grid == div_color)
+            labeled, num_components = ndimage.label(mask)
+            
+            if num_components == 1:
+                rows, cols = np.where(mask)
+                
+                h_div_rows = set()
+                for start, end, c in h_divs:
+                    if c == div_color:
+                        for r in range(start, end):
+                            h_div_rows.add(r)
+                
+                v_div_cols = set()
+                for start, end, c in v_divs:
+                    if c == div_color:
+                        for c_idx in range(start, end):
+                            v_div_cols.add(c_idx)
+                
+                non_div_pixels = sum(1 for r, c in zip(rows, cols) 
+                                    if r not in h_div_rows and c not in v_div_cols)
+                
+                if non_div_pixels > 0:
+                    for h_start, h_end, c in h_divs:
+                        if c == div_color:
+                            above = any(r < h_start for r in rows)
+                            below = any(r >= h_end for r in rows)
+                            if above and below:
+                                return True
+                    
+                    for v_start, v_end, c in v_divs:
+                        if c == div_color:
+                            left = any(col < v_start for col in cols)
+                            right = any(col >= v_end for col in cols)
+                            if left and right:
+                                return True
+        
+        return False
+    
+    if check_connected_split(grid, h_candidates, v_candidates):
+        if verbose:
+            print("Connected object split detected - rejecting dividers")
+        return [], []
+    
+    # ==========================================================================
+    # Step 5: Ratio check (for single-axis dividers only)
+    # ==========================================================================
+    
+    h_pixels = sum((end - start) * W for start, end, _ in h_candidates)
+    v_pixels = sum((end - start) * H for start, end, _ in v_candidates)
+    
+    intersect = 0
+    for h_start, h_end, _ in h_candidates:
+        for v_start, v_end, _ in v_candidates:
+            intersect += (h_end - h_start) * (v_end - v_start)
+    
+    total_div_pixels = h_pixels + v_pixels - intersect
+    div_ratio = total_div_pixels / total_pixels if total_pixels > 0 else 0
+    
+    if verbose:
+        print(f"Divider ratio: {div_ratio:.1%}")
+    
+    is_grid_pattern = len(h_candidates) > 0 and len(v_candidates) > 0
+    
+    if not is_grid_pattern and div_ratio > max_divider_ratio:
+        if verbose:
+            print(f"Single-axis dividers exceed ratio ({div_ratio:.1%} > {max_divider_ratio:.0%})")
+        return [], []
+    
+    if is_grid_pattern and div_ratio > 0.75:
+        if verbose:
+            print(f"Grid divider ratio too high ({div_ratio:.1%} > 75%)")
+        return [], []
+    
+    # ==========================================================================
+    # Step 6: Content differentiation check
+    # ==========================================================================
+    
+    def get_region_signature(region: np.ndarray) -> tuple:
+        hist = np.zeros(10, dtype=int)
+        for c in range(10):
+            hist[c] = np.sum(region == c)
+        return tuple(hist)
+    
+    row_bounds = [0]
+    for start, end, _ in sorted(h_candidates):
+        row_bounds.extend([start, end])
+    row_bounds.append(H)
+    row_bounds = sorted(set(row_bounds))
+    
+    col_bounds = [0]
+    for start, end, _ in sorted(v_candidates):
+        col_bounds.extend([start, end])
+    col_bounds.append(W)
+    col_bounds = sorted(set(col_bounds))
+    
+    content_signatures = []
+    for i in range(len(row_bounds) - 1):
+        r_start, r_end = row_bounds[i], row_bounds[i+1]
+        is_h_div = any(start == r_start and end == r_end for start, end, _ in h_candidates)
+        
+        for j in range(len(col_bounds) - 1):
+            c_start, c_end = col_bounds[j], col_bounds[j+1]
+            is_v_div = any(start == c_start and end == c_end for start, end, _ in v_candidates)
+            
+            if not is_h_div and not is_v_div:
+                region = grid[r_start:r_end, c_start:c_end]
+                content_signatures.append(get_region_signature(region))
+    
+    if len(content_signatures) > 1:
+        unique_sigs = set(content_signatures)
+        if len(unique_sigs) == 1 and len(content_signatures) > 2:
+            if verbose:
+                print(f"All {len(content_signatures)} content regions identical - suspicious")
+            return [], []
+    
+    if verbose:
+        print(f"Content regions: {len(content_signatures)}, unique: {len(set(content_signatures))}")
+        print(f"Final: {len(h_candidates)} H, {len(v_candidates)} V")
+    
+    return h_candidates, v_candidates
+
+
+def segment_by_dividers(
+    grid: np.ndarray,
+    horizontal_dividers: List[Tuple[int, int, int]],
+    vertical_dividers: List[Tuple[int, int, int]]
+) -> Tuple[np.ndarray, List[int], List[Tuple[int, int, int, int]], List[bool], List[bool]]:
+    """
+    Segment a grid based on detected divider lines.
+
+    Creates objects for each region separated by dividers, plus the dividers themselves.
+    Regions are labeled in reading order (top-to-bottom, left-to-right).
+
+    Args:
+        grid: (H, W) integer color values 0-9
+        horizontal_dividers: List of (start_row, end_row_exclusive, color)
+        vertical_dividers: List of (start_col, end_col_exclusive, color)
+
+    Returns:
+        labels: (H, W) component IDs (0 = none, 1+ = component IDs)
+        colors: List of dominant colors for each component
+        bboxes: List of (min_row, min_col, max_row, max_col) for each component
+        is_background: List of bool (all False for divider-based segmentation)
+        is_divider: List of bool indicating which components are dividers
+    """
+    H, W = grid.shape
+    labels = np.zeros((H, W), dtype=np.int32)
+    colors = []
+    bboxes = []
+    is_background = []
+    is_divider = []
+
+    # Build row boundaries from horizontal dividers
+    row_boundaries = [0]
+    h_divider_rows = set()
+    for start_row, end_row, _ in sorted(horizontal_dividers):
+        row_boundaries.append(start_row)
+        row_boundaries.append(end_row)
+        h_divider_rows.add((start_row, end_row))
+    row_boundaries.append(H)
+
+    # Build col boundaries from vertical dividers
+    col_boundaries = [0]
+    v_divider_cols = set()
+    for start_col, end_col, _ in sorted(vertical_dividers):
+        col_boundaries.append(start_col)
+        col_boundaries.append(end_col)
+        v_divider_cols.add((start_col, end_col))
+    col_boundaries.append(W)
+
+    # Remove duplicates and sort
+    row_boundaries = sorted(set(row_boundaries))
+    col_boundaries = sorted(set(col_boundaries))
+
+    component_id = 0
+
+    # Create regions for each cell in the grid formed by boundaries
+    for i in range(len(row_boundaries) - 1):
+        row_start = row_boundaries[i]
+        row_end = row_boundaries[i + 1]
+
+        for j in range(len(col_boundaries) - 1):
+            col_start = col_boundaries[j]
+            col_end = col_boundaries[j + 1]
+
+            # Skip empty regions
+            if row_start >= row_end or col_start >= col_end:
+                continue
+
+            component_id += 1
+
+            # Label this region
+            labels[row_start:row_end, col_start:col_end] = component_id
+
+            # Find dominant color in this region
+            region = grid[row_start:row_end, col_start:col_end]
+            unique, counts = np.unique(region, return_counts=True)
+            dominant_color = int(unique[np.argmax(counts)])
+
+            # Check if this region is a divider
+            is_h_divider = (row_start, row_end) in h_divider_rows
+            is_v_divider = (col_start, col_end) in v_divider_cols
+            region_is_divider = is_h_divider or is_v_divider
+
+            colors.append(dominant_color)
+            bboxes.append((row_start, col_start, row_end - 1, col_end - 1))
+            is_background.append(False)
+            is_divider.append(region_is_divider)
+
+    return labels, colors, bboxes, is_background, is_divider
+
+
+# =============================================================================
 # Core Object Extraction Functions
 # =============================================================================
 
@@ -244,6 +766,14 @@ def extract_connected_components(
         >>> print(f"Found {len(colors)} components")
     """
     H, W = grid.shape
+
+    # Check for divider lines first (takes priority over connectivity-based detection)
+    horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
+    if horizontal_dividers or vertical_dividers:
+        labels, colors, bboxes, is_bg, _ = segment_by_dividers(
+            grid, horizontal_dividers, vertical_dividers
+        )
+        return labels, colors, bboxes, is_bg
 
     # Detect background color if requested
     if background_color is None and auto_detect_background:
@@ -343,6 +873,9 @@ def extract_objects_from_grid(
     This is a convenience wrapper around extract_connected_components that
     returns Object instances instead of the (labels, colors, bboxes) format.
 
+    If divider lines are detected, segments by dividers (takes priority).
+    Objects will have is_divider=True for divider regions.
+
     Args:
         grid: (H, W) integer color values 0-9
         skip_background: If True, exclude background objects from results.
@@ -358,6 +891,15 @@ def extract_objects_from_grid(
         >>> for obj in objects:
         ...     print(f"Object {obj.id}: color={obj.color}, area={obj.area}")
     """
+    # Check for divider lines first (to get is_divider info for Objects)
+    horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
+    if horizontal_dividers or vertical_dividers:
+        labels, colors, bboxes, is_background, is_divider = segment_by_dividers(
+            grid, horizontal_dividers, vertical_dividers
+        )
+        return labels_to_objects(labels, colors, bboxes, is_background, is_divider)
+
+    # No dividers - use standard extraction
     labels, colors, bboxes, is_background = extract_connected_components(
         grid,
         skip_background=skip_background,
@@ -370,7 +912,8 @@ def labels_to_objects(
     labels: np.ndarray,
     colors: List[int],
     bboxes: List[Tuple[int, int, int, int]],
-    is_background: Optional[List[bool]] = None
+    is_background: Optional[List[bool]] = None,
+    is_divider: Optional[List[bool]] = None
 ) -> List[Object]:
     """
     Convert label-based representation to Object instances.
@@ -380,15 +923,18 @@ def labels_to_objects(
         colors: List of colors for each component (indexed by component_id - 1)
         bboxes: List of (min_row, min_col, max_row, max_col) for each component
         is_background: Optional list of bool indicating if each component is background
+        is_divider: Optional list of bool indicating if each component is a divider
 
     Returns:
         List of Object instances
     """
     if is_background is None:
         is_background = [False] * len(colors)
+    if is_divider is None:
+        is_divider = [False] * len(colors)
 
     objects = []
-    for i, (color, bbox, is_bg) in enumerate(zip(colors, bboxes, is_background)):
+    for i, (color, bbox, is_bg, is_div) in enumerate(zip(colors, bboxes, is_background, is_divider)):
         min_row, min_col, max_row, max_col = bbox
         height = max_row - min_row + 1
         width = max_col - min_col + 1
@@ -405,7 +951,8 @@ def labels_to_objects(
             width=width,
             color=color,
             pixels=pixels,
-            is_background=is_bg
+            is_background=is_bg,
+            is_divider=is_div
         ))
 
     return objects

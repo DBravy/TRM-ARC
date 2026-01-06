@@ -1,0 +1,95 @@
+{
+  "metadata": {
+    "timestamp": "2026-01-06T01:52:10.462382",
+    "total_puzzles": 3,
+    "processed_puzzles": 3,
+    "total_runtime_seconds": 44.24163007736206
+  },
+  "summary": {
+    "solved_immediately": 1,
+    "solved_immediately_pct": 33.333333333333336,
+    "solved_with_training": 0,
+    "solved_with_training_pct": 0.0,
+    "unsolved": 2,
+    "unsolved_pct": 66.66666666666667,
+    "errors": 0,
+    "errors_pct": 0.0,
+    "avg_train_accuracy": 0.5277777777777778,
+    "avg_test_accuracy": 0.3333333333333333,
+    "avg_runtime_per_puzzle": 14.746885617574057
+  },
+  "results": [
+    {
+      "puzzle_id": "007bbfb7",
+      "solved_immediately": false,
+      "solved_with_training": false,
+      "epochs_needed": -1,
+      "train_accuracy": 0.0,
+      "test_accuracy": 0.0,
+      "train_mean_pixel_error": 2.132200761274858,
+      "test_mean_pixel_error": 3.2706570625305176,
+      "num_train_examples": 5,
+      "num_test_examples": 1,
+      "num_objects": 3,
+      "ordering_strategy": "adaptive_reading_order",
+      "framings_used": [
+        "grid_tl",
+        "object_relative",
+        "object_relative"
+      ],
+      "error": null,
+      "runtime_seconds": 19.169625997543335,
+      "auto_skipped_training": false
+    },
+    {
+      "puzzle_id": "03560426",
+      "solved_immediately": true,
+      "solved_with_training": false,
+      "epochs_needed": 0,
+      "train_accuracy": 1.0,
+      "test_accuracy": 1.0,
+      "train_mean_pixel_error": 3.874301910400391e-08,
+      "test_mean_pixel_error": 6.705522537231445e-08,
+      "num_train_examples": 3,
+      "num_test_examples": 1,
+      "num_objects": 4,
+      "ordering_strategy": "left_to_right",
+      "framings_used": [
+        "grid_bl",
+        "object_relative",
+        "object_relative",
+        "object_relative"
+      ],
+      "error": null,
+      "runtime_seconds": 2.3107688426971436,
+      "auto_skipped_training": false
+    },
+    {
+      "puzzle_id": "00d62c1b",
+      "solved_immediately": false,
+      "solved_with_training": false,
+      "epochs_needed": -1,
+      "train_accuracy": 0.5833333333333334,
+      "test_accuracy": 0.0,
+      "train_mean_pixel_error": 1.710767428080241,
+      "test_mean_pixel_error": 2.8621912002563477,
+      "num_train_examples": 5,
+      "num_test_examples": 1,
+      "num_objects": 8,
+      "ordering_strategy": "adaptive_reading_order",
+      "framings_used": [
+        "delta",
+        "object_relative",
+        "object_relative",
+        "object_relative",
+        "delta",
+        "object_relative",
+        "delta",
+        "object_relative"
+      ],
+      "error": null,
+      "runtime_seconds": 22.76026201248169,
+      "auto_skipped_training": false
+    }
+  ]
+}
