@@ -179,17 +179,45 @@ class SpatialRelation:
             return f"source.{src} is at target.{tgt} + ({dr}, {dc})"
 
 
-@dataclass 
+@dataclass
 class DiscoveredRelation:
     """Result of relation discovery, including confidence metrics."""
     relation: SpatialRelation
     variance: float  # Lower is better - more consistent across examples
     mean_offset: Tuple[float, float]  # The discovered mean offset
     offsets: List[Tuple[int, int]]  # Individual offsets per example
-    
+
     def __repr__(self):
         return (f"DiscoveredRelation({self.relation}, "
                 f"var={self.variance:.4f})")
+
+
+@dataclass
+class ParentRelation:
+    """Describes how a child object is positioned within its parent.
+
+    Similar to SpatialRelation but specifically for parent-child relationships
+    in hierarchical objects. The offset is from child's anchor to parent's anchor.
+
+    Examples:
+        - Child's TL at parent's TL + (1,1): inset by 1 pixel from corner
+        - Child's C at parent's C + (0,0): centered in parent
+    """
+    child_anchor: AnchorPoint
+    parent_anchor: AnchorPoint
+    offset: Tuple[int, int]  # (row_offset, col_offset)
+
+    def describe(self) -> str:
+        """Human-readable description."""
+        ca = self.child_anchor.value.upper()
+        pa = self.parent_anchor.value.upper()
+        dr, dc = self.offset
+        if dr == 0 and dc == 0:
+            return f"child.{ca} at parent.{pa}"
+        return f"child.{ca} at parent.{pa} + ({dr}, {dc})"
+
+    def __repr__(self):
+        return f"ParentRelation({self.describe()})"
 
 
 # =============================================================================
@@ -363,6 +391,97 @@ def discover_relation_to_grid(
     
     results.sort(key=lambda x: x.variance)
     return results[:top_k]
+
+
+def discover_parent_child_relation(
+    examples: List[Tuple['OrderingObject', 'OrderingObject']],  # (child, parent) pairs
+    top_k: int = 5
+) -> List[DiscoveredRelation]:
+    """Discover the best anchor relationship between child and parent objects.
+
+    This is specifically for hierarchical objects where a child is contained
+    within a parent. It finds the most consistent way to describe the child's
+    position relative to its parent across multiple examples.
+
+    Args:
+        examples: List of (child_object, parent_object) tuples from different
+                  training examples. Each child should have consistent
+                  positioning relative to its parent.
+        top_k: Number of best relations to return
+
+    Returns:
+        List of DiscoveredRelation sorted by variance (best first).
+        The relation describes child positioning relative to parent.
+
+    Example:
+        >>> # If children are consistently at parent's top-left + (1,1)
+        >>> examples = [(child1, parent1), (child2, parent2), ...]
+        >>> relations = discover_parent_child_relation(examples)
+        >>> print(relations[0].relation.describe())
+        'source.TL is at target.TL + (1, 1)'
+    """
+    # Convert Object pairs to ExamplePair format (child is source, parent is target)
+    example_pairs = []
+    for child, parent in examples:
+        child_test = TestObject(
+            top_left=(child.row, child.col),
+            size=(child.height, child.width),
+            object_id=child.id
+        )
+        parent_test = TestObject(
+            top_left=(parent.row, parent.col),
+            size=(parent.height, parent.width),
+            object_id=parent.id
+        )
+        example_pairs.append(ExamplePair(source=child_test, target=parent_test))
+
+    return discover_relation(example_pairs, top_k)
+
+
+def compute_position_in_parent(
+    relation: SpatialRelation,
+    child_size: Tuple[int, int],
+    parent_pos: Tuple[int, int],
+    parent_size: Tuple[int, int]
+) -> Tuple[int, int]:
+    """Compute where a child object's top-left should be within its parent.
+
+    Given a spatial relation that describes how the child is positioned
+    relative to the parent, compute the absolute position of the child.
+
+    Args:
+        relation: The parent-child spatial relation (from discover_parent_child_relation)
+        child_size: (height, width) of the child object
+        parent_pos: (row, col) top-left position of the parent object
+        parent_size: (height, width) of the parent object
+
+    Returns:
+        (row, col) absolute top-left position for the child object
+
+    Example:
+        >>> relation = SpatialRelation(AnchorPoint.TOP_LEFT, AnchorPoint.TOP_LEFT, (1, 1))
+        >>> pos = compute_position_in_parent(relation, (2, 2), (0, 0), (5, 5))
+        >>> print(pos)  # Child's TL is at parent's TL + (1,1)
+        (1, 1)
+    """
+    # Get parent anchor position
+    parent_anchor_pos = get_anchor_position(parent_pos, parent_size, relation.target_anchor)
+
+    # Child anchor should be at parent_anchor + offset
+    child_anchor_target = (
+        parent_anchor_pos[0] + relation.offset[0],
+        parent_anchor_pos[1] + relation.offset[1]
+    )
+
+    # Compute child's top-left from its anchor position
+    child_anchor_offset = get_anchor_offset(relation.source_anchor, child_size[0], child_size[1])
+
+    child_top_left = (
+        child_anchor_target[0] - child_anchor_offset[0],
+        child_anchor_target[1] - child_anchor_offset[1]
+    )
+
+    return child_top_left
 
 
 # =============================================================================

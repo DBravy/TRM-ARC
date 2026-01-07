@@ -17,6 +17,7 @@ from typing import List, Tuple, Callable, Dict, Optional, Any
 from enum import Enum, auto
 from itertools import permutations
 from abc import ABC, abstractmethod
+from collections import defaultdict
 
 # Object detection and extraction
 from object_module import (
@@ -323,26 +324,26 @@ class AdaptiveReadingOrder(OrderingStrategy):
 class QuadrantOrder(OrderingStrategy):
     """
     Assign objects to quadrants based on median position, then order in reading order.
-    
+
     Unlike AdaptiveReadingOrder which clusters by vertical gaps, this strategy
     divides space into quadrants using the median object position as the center.
     Objects are assigned to quadrants (TL, TR, BL, BR) and ordered accordingly.
-    
+
     This is useful when objects should be grouped by spatial region regardless
     of their exact vertical positions (e.g., when "top-left" conceptually means
     "in the top-left area" not "in the topmost row").
     """
     name = "quadrant_order"
-    
+
     def order(self, objects: List[Object]) -> List[Object]:
         if len(objects) <= 1:
             return objects
-        
+
         # Find the dividing point using medians of object positions
         centers = [o.center for o in objects]
         mid_row = np.median([c[0] for c in centers])
         mid_col = np.median([c[1] for c in centers])
-        
+
         def quadrant_key(obj: Object) -> Tuple[int, float, float]:
             cr, cc = obj.center
             # Determine quadrant: 0=TL, 1=TR, 2=BL, 3=BR (reading order)
@@ -351,20 +352,20 @@ class QuadrantOrder(OrderingStrategy):
             quadrant = is_bottom * 2 + is_right
             # Within quadrant, use reading order as tiebreaker
             return (quadrant, cr, cc)
-        
+
         return sorted(objects, key=quadrant_key)
-    
+
     def get_quadrant_structure(self, objects: List[Object]) -> Dict[str, List[int]]:
         """Return objects grouped by quadrant (for debugging)."""
         if not objects:
             return {}
-        
+
         centers = [o.center for o in objects]
         mid_row = np.median([c[0] for c in centers])
         mid_col = np.median([c[1] for c in centers])
-        
+
         quadrants = {'TL': [], 'TR': [], 'BL': [], 'BR': []}
-        
+
         for obj in objects:
             cr, cc = obj.center
             if cr < mid_row:
@@ -372,11 +373,480 @@ class QuadrantOrder(OrderingStrategy):
             else:
                 q = 'BL' if cc < mid_col else 'BR'
             quadrants[q].append(obj.id)
-        
+
         return quadrants
 
 
-# Registry of all ordering strategies
+# =============================================================================
+# Per-Parent Ordering (for hierarchical objects)
+# =============================================================================
+
+class PerParentOrdering(OrderingStrategy):
+    """
+    Orders children within each parent using a consistent strategy.
+
+    This is an OrderingStrategy that:
+    1. Separates parents from children
+    2. Orders parents using a parent ordering strategy
+    3. Orders children within each parent using a child ordering strategy
+    4. Returns objects in order: [parent1, child1a, child1b, parent2, child2a, ...]
+
+    For hierarchical objects, this enables rules like:
+    "the 1st child (by left-to-right) in each parent goes to position X"
+
+    Example:
+        Parent A has children [c1, c2, c3] at positions [(2,5), (2,10), (2,15)]
+        Parent B has children [c4, c5] at positions [(8,3), (8,9)]
+
+        With left_to_right child ordering:
+        - Parent A's children ordered: [c1, c2, c3] (indices 0, 1, 2)
+        - Parent B's children ordered: [c4, c5] (indices 0, 1)
+
+        If the rule is "child at index 0 goes to parent.top_left + (1, 1)",
+        this applies consistently to c1 and c4.
+    """
+
+    def __init__(self, child_ordering: OrderingStrategy, parent_ordering: Optional[OrderingStrategy] = None):
+        """
+        Args:
+            child_ordering: Strategy to order children within each parent
+            parent_ordering: Strategy to order parents (default: left_to_right)
+        """
+        self.child_ordering = child_ordering
+        self.parent_ordering = parent_ordering or LeftToRight()
+
+    @property
+    def name(self) -> str:
+        return f"per_parent({self.child_ordering.name})"
+
+    def order(self, objects: List[Object]) -> List[Object]:
+        """
+        Order objects: parents first (in parent_ordering), then children within each parent.
+
+        For objects without hierarchy (no parent/children), falls back to child_ordering.
+
+        Args:
+            objects: List of objects (may include parents with children)
+
+        Returns:
+            Ordered list of objects
+        """
+        if not objects:
+            return []
+
+        # Separate parents (objects with children) and children (objects with parent)
+        parents = [o for o in objects if o.children]
+        children = [o for o in objects if o.parent is not None]
+        standalone = [o for o in objects if not o.children and o.parent is None]
+
+        # If no hierarchy, fall back to child ordering on all objects
+        if not parents and not children:
+            return self.child_ordering.order(objects)
+
+        # Order parents
+        ordered_parents = self.parent_ordering.order(parents)
+
+        # Build result: for each parent, add parent then its ordered children
+        result = []
+        for parent in ordered_parents:
+            result.append(parent)
+            parent_children = [c for c in children if c.parent and c.parent.id == parent.id]
+            ordered_children = self.child_ordering.order(parent_children)
+            result.extend(ordered_children)
+
+        # Add any standalone objects at the end
+        result.extend(self.child_ordering.order(standalone))
+
+        return result
+
+    def order_children_by_parent(self, objects: List[Object]) -> Dict[int, List[Object]]:
+        """
+        Group objects by parent and order children within each group.
+
+        Args:
+            objects: List of objects (should be children with parent references)
+
+        Returns:
+            Dict mapping parent_id -> ordered list of children
+        """
+        # Group by parent
+        by_parent: Dict[Optional[int], List[Object]] = defaultdict(list)
+        for obj in objects:
+            parent_id = obj.parent.id if obj.parent else None
+            by_parent[parent_id].append(obj)
+
+        # Order children within each parent
+        result = {}
+        for parent_id, children in by_parent.items():
+            if parent_id is not None:  # Only process actual children
+                result[parent_id] = self.child_ordering.order(children)
+
+        return result
+
+    def get_child_index(self, obj: Object, all_children: List[Object]) -> Optional[int]:
+        """
+        Get the index of an object within its parent's ordered children.
+
+        Args:
+            obj: The child object to find
+            all_children: All children across all parents
+
+        Returns:
+            Index within parent (0-based), or None if obj has no parent
+        """
+        if obj.parent is None:
+            return None
+
+        # Get siblings (children of same parent)
+        siblings = [o for o in all_children if o.parent and o.parent.id == obj.parent.id]
+        ordered_siblings = self.child_ordering.order(siblings)
+
+        for idx, sibling in enumerate(ordered_siblings):
+            if sibling.id == obj.id:
+                return idx
+        return None
+
+    def get_indexed_children(self, objects: List[Object]) -> Dict[int, List[Tuple[Object, int]]]:
+        """
+        Get all children with their per-parent indices.
+
+        Args:
+            objects: List of child objects
+
+        Returns:
+            Dict mapping parent_id -> list of (child, index) tuples
+        """
+        ordered_by_parent = self.order_children_by_parent(objects)
+        result = {}
+        for parent_id, ordered_children in ordered_by_parent.items():
+            result[parent_id] = [(child, idx) for idx, child in enumerate(ordered_children)]
+        return result
+
+    def group_by_child_index(self, objects: List[Object]) -> Dict[int, List[Object]]:
+        """
+        Group children across all parents by their index within parent.
+
+        This is useful for finding patterns like "all index-0 children
+        have the same offset from their parent".
+
+        Args:
+            objects: List of child objects
+
+        Returns:
+            Dict mapping child_index -> list of children at that index
+        """
+        by_index: Dict[int, List[Object]] = defaultdict(list)
+        ordered_by_parent = self.order_children_by_parent(objects)
+
+        for parent_id, ordered_children in ordered_by_parent.items():
+            for idx, child in enumerate(ordered_children):
+                by_index[idx].append(child)
+
+        return dict(by_index)
+
+
+@dataclass
+class PerParentOrderingResult:
+    """Result of screening per-parent orderings."""
+    ordering_name: str
+    child_ordering: OrderingStrategy
+    per_parent_ordering: PerParentOrdering
+    # For each child index, the variance of parent-relative offsets
+    index_variances: Dict[int, float]
+    # Average variance across all indices
+    avg_variance: float
+    # Whether all indices have zero (or near-zero) variance
+    is_consistent: bool
+    # Learned offsets per index (if consistent)
+    learned_offsets: Dict[int, Tuple[int, int]]
+
+
+@dataclass
+class OrderingScreenResult:
+    """Comprehensive result from unified ordering screening.
+
+    This is the return type of find_best_ordering(), providing all information
+    needed to apply the best ordering strategy to a puzzle.
+    """
+    # Best overall configuration
+    best_mode: str  # 'global' or 'per_parent'
+    best_ordering_name: str
+    is_consistent: bool
+
+    # For global ordering (always populated)
+    global_ordering: Optional[OrderingStrategy]
+    global_results: Dict[str, Dict]  # Per-strategy results
+
+    # For per-parent ordering (populated if hierarchy exists)
+    per_parent_result: Optional[PerParentOrderingResult]
+    has_hierarchy: bool
+
+    def get_ordering_strategy(self) -> Optional[OrderingStrategy]:
+        """Get the OrderingStrategy instance for the best global ordering."""
+        return self.global_ordering
+
+    def describe(self) -> str:
+        """Human-readable description of the best ordering."""
+        if self.best_mode == 'per_parent' and self.per_parent_result:
+            return (f"Per-parent ordering using {self.per_parent_result.child_ordering.name} "
+                    f"(consistent: {self.is_consistent})")
+        else:
+            return f"Global ordering: {self.best_ordering_name} (consistent: {self.is_consistent})"
+
+
+def screen_per_parent_orderings(
+    output_roots: List[Object],
+    verbose: bool = False
+) -> Optional[PerParentOrderingResult]:
+    """
+    Screen ordering strategies to find one where children at the same index
+    across different parents have consistent parent-relative positions.
+
+    Args:
+        output_roots: List of root objects from output (with children)
+        verbose: Print detailed results
+
+    Returns:
+        PerParentOrderingResult for best ordering, or None if no hierarchy
+    """
+    # Collect all children from output roots
+    all_output_children = []
+    for root in output_roots:
+        all_output_children.extend(root.children)
+
+    if len(all_output_children) < 2:
+        return None
+
+    # Check we have multiple parents with children
+    parents_with_children = [r for r in output_roots if r.children]
+    if len(parents_with_children) < 2:
+        return None
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("PER-PARENT ORDERING SCREENING")
+        print("=" * 60)
+        print(f"Parents with children: {len(parents_with_children)}")
+        print(f"Total children: {len(all_output_children)}")
+
+    best_result = None
+    best_variance = float('inf')
+
+    # Try each base ordering strategy
+    for base_ordering in ALL_ORDERINGS:
+        per_parent = PerParentOrdering(base_ordering)
+
+        # Group children by index
+        by_index = per_parent.group_by_child_index(all_output_children)
+
+        if not by_index:
+            continue
+
+        # For each index, compute variance of parent-relative offsets
+        index_variances = {}
+        learned_offsets = {}
+
+        for idx, children in by_index.items():
+            if len(children) < 2:
+                # Can't compute variance with single sample
+                index_variances[idx] = 0.0
+                if children:
+                    child = children[0]
+                    offset = (child.row - child.parent.row, child.col - child.parent.col)
+                    learned_offsets[idx] = offset
+                continue
+
+            # Compute parent-relative offsets
+            offsets = []
+            for child in children:
+                offset_row = child.row - child.parent.row
+                offset_col = child.col - child.parent.col
+                offsets.append((offset_row, offset_col))
+
+            # Compute variance (sum of row variance + col variance)
+            rows = [o[0] for o in offsets]
+            cols = [o[1] for o in offsets]
+            var_row = np.var(rows)
+            var_col = np.var(cols)
+            total_var = var_row + var_col
+
+            index_variances[idx] = total_var
+
+            # Learn offset (use mean, rounded)
+            mean_row = int(round(np.mean(rows)))
+            mean_col = int(round(np.mean(cols)))
+            learned_offsets[idx] = (mean_row, mean_col)
+
+        # Average variance across indices
+        if index_variances:
+            avg_variance = np.mean(list(index_variances.values()))
+        else:
+            avg_variance = float('inf')
+
+        is_consistent = avg_variance < 0.1  # Near-zero variance threshold
+
+        if verbose:
+            status = "CONSISTENT" if is_consistent else "inconsistent"
+            print(f"\n  {base_ordering.name}: {status} (avg_var={avg_variance:.4f})")
+            for idx, var in sorted(index_variances.items()):
+                offset = learned_offsets.get(idx, (0, 0))
+                print(f"    Index {idx}: variance={var:.4f}, offset={offset}")
+
+        if avg_variance < best_variance:
+            best_variance = avg_variance
+            best_result = PerParentOrderingResult(
+                ordering_name=per_parent.name,
+                child_ordering=base_ordering,
+                per_parent_ordering=per_parent,
+                index_variances=index_variances,
+                avg_variance=avg_variance,
+                is_consistent=is_consistent,
+                learned_offsets=learned_offsets,
+            )
+
+    if verbose and best_result:
+        print("\n" + "-" * 60)
+        print(f"Best per-parent ordering: {best_result.ordering_name}")
+        print(f"Consistent: {best_result.is_consistent}")
+        print(f"Learned offsets by child index:")
+        for idx, offset in sorted(best_result.learned_offsets.items()):
+            print(f"  Index {idx}: parent + {offset}")
+
+    return best_result
+
+
+def screen_per_parent_orderings_for_puzzle(
+    puzzle: Dict,
+    verbose: bool = False
+) -> Optional[PerParentOrderingResult]:
+    """
+    Screen per-parent orderings across all training examples of a puzzle.
+
+    Aggregates children from all training examples to find an ordering where
+    children at the same index (across all parents in all examples) have
+    consistent parent-relative positions.
+
+    Args:
+        puzzle: Puzzle dict with 'train' examples
+        verbose: Print detailed results
+
+    Returns:
+        PerParentOrderingResult for best ordering, or None if no hierarchy
+    """
+    from object_module import extract_objects_from_grid
+
+    # Collect all output children across all training examples
+    all_output_children = []
+    total_parents = 0
+
+    for pair in puzzle.get('train', []):
+        if 'output' not in pair:
+            continue
+
+        output_grid = np.array(pair['output'])
+        output_roots = extract_objects_from_grid(output_grid, build_hierarchy=True)
+
+        for root in output_roots:
+            if root.children:
+                total_parents += 1
+                all_output_children.extend(root.children)
+
+    if len(all_output_children) < 2 or total_parents < 2:
+        if verbose:
+            print("Not enough hierarchical structure for per-parent ordering")
+        return None
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("PER-PARENT ORDERING SCREENING (across all training examples)")
+        print("=" * 60)
+        print(f"Total parents with children: {total_parents}")
+        print(f"Total children: {len(all_output_children)}")
+
+    best_result = None
+    best_variance = float('inf')
+
+    # Try each base ordering strategy
+    for base_ordering in ALL_ORDERINGS:
+        per_parent = PerParentOrdering(base_ordering)
+
+        # Group children by index
+        by_index = per_parent.group_by_child_index(all_output_children)
+
+        if not by_index:
+            continue
+
+        # For each index, compute variance of parent-relative offsets
+        index_variances = {}
+        learned_offsets = {}
+
+        for idx, children in by_index.items():
+            if len(children) < 2:
+                index_variances[idx] = 0.0
+                if children:
+                    child = children[0]
+                    offset = (child.row - child.parent.row, child.col - child.parent.col)
+                    learned_offsets[idx] = offset
+                continue
+
+            # Compute parent-relative offsets
+            offsets = []
+            for child in children:
+                offset_row = child.row - child.parent.row
+                offset_col = child.col - child.parent.col
+                offsets.append((offset_row, offset_col))
+
+            # Compute variance
+            rows = [o[0] for o in offsets]
+            cols = [o[1] for o in offsets]
+            var_row = np.var(rows)
+            var_col = np.var(cols)
+            total_var = var_row + var_col
+
+            index_variances[idx] = total_var
+
+            mean_row = int(round(np.mean(rows)))
+            mean_col = int(round(np.mean(cols)))
+            learned_offsets[idx] = (mean_row, mean_col)
+
+        if index_variances:
+            avg_variance = np.mean(list(index_variances.values()))
+        else:
+            avg_variance = float('inf')
+
+        is_consistent = avg_variance < 0.1
+
+        if verbose:
+            status = "CONSISTENT" if is_consistent else "inconsistent"
+            print(f"\n  {base_ordering.name}: {status} (avg_var={avg_variance:.4f})")
+            for idx, var in sorted(index_variances.items()):
+                offset = learned_offsets.get(idx, (0, 0))
+                print(f"    Index {idx}: variance={var:.4f}, offset={offset}")
+
+        if avg_variance < best_variance:
+            best_variance = avg_variance
+            best_result = PerParentOrderingResult(
+                ordering_name=per_parent.name,
+                child_ordering=base_ordering,
+                per_parent_ordering=per_parent,
+                index_variances=index_variances,
+                avg_variance=avg_variance,
+                is_consistent=is_consistent,
+                learned_offsets=learned_offsets,
+            )
+
+    if verbose and best_result:
+        print("\n" + "-" * 60)
+        print(f"Best per-parent ordering: {best_result.ordering_name}")
+        print(f"Consistent: {best_result.is_consistent}")
+        print(f"Learned offsets by child index:")
+        for idx, offset in sorted(best_result.learned_offsets.items()):
+            print(f"  Index {idx}: parent + {offset}")
+
+    return best_result
+
+
+# Registry of all ordering strategies (global orderings)
 ALL_ORDERINGS: List[OrderingStrategy] = [
     LeftToRight(),
     RightToLeft(),
@@ -390,6 +860,105 @@ ALL_ORDERINGS: List[OrderingStrategy] = [
     AdaptiveReadingOrder(),
     QuadrantOrder(),
 ]
+
+# Per-parent orderings (for hierarchical objects)
+# These use different child ordering strategies within each parent
+PER_PARENT_ORDERINGS: List[PerParentOrdering] = [
+    PerParentOrdering(LeftToRight()),
+    PerParentOrdering(RightToLeft()),
+    PerParentOrdering(TopToBottom()),
+    PerParentOrdering(BottomToTop()),
+    PerParentOrdering(LargestFirst()),
+    PerParentOrdering(SmallestFirst()),
+    PerParentOrdering(ByColor()),
+]
+
+
+# =============================================================================
+# Unified Ordering Discovery (like find_correspondences)
+# =============================================================================
+
+def find_best_ordering(
+    puzzle: Dict,
+    verbose: bool = False,
+    selection_criterion: Optional[str] = None,
+    selection_rule: Optional[str] = None,
+    use_color_only: bool = False
+) -> OrderingScreenResult:
+    """
+    Unified ordering screening - THE canonical function for discovering the best ordering.
+
+    Similar to find_correspondences() for matching, this is the single entry point
+    for ordering discovery. It automatically handles:
+    - All global orderings (left_to_right, top_to_bottom, adaptive_reading_order, etc.)
+    - Per-parent orderings (if hierarchy exists in the puzzle)
+
+    All orderings go through the same ConsistencyChecker system, which evaluates
+    whether framings produce consistent (zero-variance) parameters across training examples.
+
+    Strategy:
+    1. Try all global orderings first
+    2. If hierarchy exists, also try per-parent orderings
+    3. Select the best based on: consistency first, then number of framings, then preference
+
+    Args:
+        puzzle: Puzzle dict with 'train' examples (each having 'input' and 'output')
+        verbose: Print detailed screening results
+        selection_criterion: Optional criterion for pre-filtering objects
+        selection_rule: Optional rule for pre-filtering objects
+        use_color_only: Object extraction mode
+
+    Returns:
+        OrderingScreenResult with:
+        - best_mode: 'global' or 'per_parent'
+        - best_ordering_name: Name of the best strategy
+        - is_consistent: Whether the best strategy has consistent framings
+        - global_ordering: The OrderingStrategy instance
+        - global_results: Per-strategy results for all orderings
+        - per_parent_result: None (deprecated, per-parent now in global_results)
+        - has_hierarchy: Whether hierarchical structure was detected
+
+    Usage:
+        result = find_best_ordering(puzzle, verbose=True)
+        ordering = result.global_ordering
+        # Apply ordering to objects
+    """
+    if verbose:
+        print("\n" + "=" * 60)
+        print("UNIFIED ORDERING SCREENING")
+        print("=" * 60)
+
+    # Screen all orderings (global + per-parent if hierarchy exists)
+    screen_result = screen_orderings_for_puzzle(
+        puzzle,
+        verbose=verbose,
+        selection_criterion=selection_criterion,
+        selection_rule=selection_rule,
+        use_color_only=use_color_only,
+        include_per_parent=True
+    )
+
+    best_ordering = screen_result['best_ordering']
+    best_name = screen_result['best_name']
+    is_consistent = screen_result['is_consistent']
+    all_results = screen_result['all_results']
+    has_hierarchy = screen_result.get('has_hierarchy', False)
+
+    # Determine if best is per-parent
+    best_mode = 'per_parent' if best_name.startswith('per_parent(') else 'global'
+
+    if verbose:
+        print(f"\n*** Best: {best_mode} - {best_name} (consistent: {is_consistent}) ***")
+
+    return OrderingScreenResult(
+        best_mode=best_mode,
+        best_ordering_name=best_name,
+        is_consistent=is_consistent,
+        global_ordering=best_ordering,
+        global_results=all_results,
+        per_parent_result=None,  # Deprecated - per-parent now goes through same system
+        has_hierarchy=has_hierarchy,
+    )
 
 
 # =============================================================================
@@ -480,28 +1049,28 @@ class GridAbsoluteFraming(Framing):
 
 class ObjectRelativeFraming(Framing):
     """Predict position relative to an earlier object in the sequence."""
-    
+
     def __init__(self, ref_index: int):
         self.ref_index = ref_index  # index in the ordered sequence (must be < current)
-        
+
     @property
     def name(self) -> str:
         return f"object_relative(ref={self.ref_index})"
-    
+
     def predict(self, input_obj, earlier_outputs, grid_shape, **params) -> Tuple[int, int]:
         if self.ref_index >= len(earlier_outputs):
             # Reference doesn't exist yet - this framing is invalid
             return (-999, -999)
-        
+
         ref_obj = earlier_outputs[self.ref_index]
         rel_row = params.get('rel_row', 0)
         rel_col = params.get('rel_col', 0)
         return (ref_obj.row + rel_row, ref_obj.col + rel_col)
-    
+
     def learn(self, input_obj, output_obj, earlier_outputs, grid_shape) -> Dict:
         if self.ref_index >= len(earlier_outputs):
             return {'rel_row': -999, 'rel_col': -999}  # invalid
-        
+
         ref_obj = earlier_outputs[self.ref_index]
         return {
             'rel_row': output_obj.row - ref_obj.row,
@@ -509,8 +1078,50 @@ class ObjectRelativeFraming(Framing):
         }
 
 
-def get_all_framings(max_object_refs: int = 3) -> List[Framing]:
-    """Generate all framings to try."""
+class ParentRelativeFraming(Framing):
+    """Predict position relative to parent object (for hierarchical objects).
+
+    This framing is used when objects have been organized into a hierarchy
+    using build_containment_hierarchy(). It predicts a child's position
+    based on its offset from its parent container.
+
+    Note: This framing only works for objects with a parent. For root objects
+    (those with no parent), it returns an invalid position (-999, -999).
+    """
+    name = "parent_relative"
+
+    def predict(self, input_obj, earlier_outputs, grid_shape, **params) -> Tuple[int, int]:
+        # Check if the object has a parent
+        if not hasattr(input_obj, 'parent') or input_obj.parent is None:
+            return (-999, -999)  # Invalid for non-hierarchical objects
+
+        parent = input_obj.parent
+        rel_row = params.get('rel_row', 0)
+        rel_col = params.get('rel_col', 0)
+        return (parent.row + rel_row, parent.col + rel_col)
+
+    def learn(self, input_obj, output_obj, earlier_outputs, grid_shape) -> Dict:
+        # Check if the output object has a parent
+        if not hasattr(output_obj, 'parent') or output_obj.parent is None:
+            return {'rel_row': -999, 'rel_col': -999}  # invalid
+
+        parent = output_obj.parent
+        return {
+            'rel_row': output_obj.row - parent.row,
+            'rel_col': output_obj.col - parent.col
+        }
+
+
+def get_all_framings(max_object_refs: int = 3, include_parent: bool = False) -> List[Framing]:
+    """Generate all framings to try.
+
+    Args:
+        max_object_refs: Maximum number of object-relative framings to include
+        include_parent: If True, include ParentRelativeFraming for hierarchical objects
+
+    Returns:
+        List of Framing instances to evaluate
+    """
     framings = [
         DeltaFraming(),
         GridAbsoluteFraming('tl'),
@@ -518,11 +1129,15 @@ def get_all_framings(max_object_refs: int = 3) -> List[Framing]:
         GridAbsoluteFraming('bl'),
         GridAbsoluteFraming('br'),
     ]
-    
+
     # Add object-relative framings for each possible reference
     for i in range(max_object_refs):
         framings.append(ObjectRelativeFraming(ref_index=i))
-    
+
+    # Add parent-relative framing for hierarchical objects
+    if include_parent:
+        framings.append(ParentRelativeFraming())
+
     return framings
 
 
@@ -809,10 +1424,14 @@ def screen_orderings_for_puzzle(
     verbose: bool = False,
     selection_criterion: Optional[str] = None,
     selection_rule: Optional[str] = None,
-    use_color_only: bool = False
+    use_color_only: bool = False,
+    include_per_parent: bool = True
 ) -> Dict:
     """
     Screen all ordering strategies for a puzzle and find the best one.
+
+    This includes both global orderings (left_to_right, top_to_bottom, etc.)
+    and per-parent orderings (if hierarchy exists in the puzzle).
 
     If selection_criterion and selection_rule are provided, applies selection
     filtering BEFORE ordering evaluation (selection first, then ordering).
@@ -823,6 +1442,7 @@ def screen_orderings_for_puzzle(
         selection_criterion: Optional ranking criterion for pre-filtering objects
         selection_rule: Optional selection rule for pre-filtering objects
         use_color_only: Object extraction mode (passed to extract_connected_components)
+        include_per_parent: Whether to also try per-parent orderings (default: True)
 
     Returns:
         Dict with:
@@ -830,6 +1450,7 @@ def screen_orderings_for_puzzle(
             - best_name: str
             - is_consistent: bool
             - all_results: Dict[str, Dict] with per-ordering results
+            - has_hierarchy: bool (whether hierarchy was detected)
     """
     checker = ConsistencyChecker()
 
@@ -839,7 +1460,10 @@ def screen_orderings_for_puzzle(
         from selection_module import apply_object_selection
 
     # Build examples list: (correspondences, grid_shape) for each training pair
-    examples = []
+    # We build two sets: flat examples (no hierarchy) and hierarchical examples
+    flat_examples = []
+    hierarchical_examples = []
+    has_hierarchy = False
 
     for pair in puzzle.get('train', []):
         if 'output' not in pair:
@@ -866,7 +1490,7 @@ def screen_orderings_for_puzzle(
                 selection_criterion, selection_rule
             )
 
-            # Convert to Object instances
+            # Convert to Object instances (flat, no hierarchy)
             input_objects = labels_to_objects(input_labels, input_colors, input_bboxes)
             output_objects = labels_to_objects(output_labels, output_colors, output_bboxes)
         else:
@@ -882,16 +1506,31 @@ def screen_orderings_for_puzzle(
         grid_shape = (max(input_grid.shape[0], output_grid.shape[0]),
                      max(input_grid.shape[1], output_grid.shape[1]))
 
-        examples.append((correspondences, grid_shape))
+        flat_examples.append((correspondences, grid_shape))
 
-    if not examples:
+        # Also extract with hierarchy for per-parent orderings
+        if include_per_parent:
+            input_objects_hier = extract_objects_from_grid(input_grid, build_hierarchy=True)
+            output_objects_hier = extract_objects_from_grid(output_grid, build_hierarchy=True)
+
+            # Check if any object has children
+            if any(o.children for o in output_objects_hier):
+                has_hierarchy = True
+
+            correspondences_hier = find_object_correspondences_simple(
+                input_objects_hier, output_objects_hier
+            )
+            hierarchical_examples.append((correspondences_hier, grid_shape))
+
+    if not flat_examples:
         # No valid examples - return default
         default_ordering = AdaptiveReadingOrder()
         return {
             'best_ordering': default_ordering,
             'best_name': default_ordering.name,
             'is_consistent': False,
-            'all_results': {}
+            'all_results': {},
+            'has_hierarchy': False
         }
 
     # Evaluate all orderings
@@ -900,9 +1539,11 @@ def screen_orderings_for_puzzle(
     if verbose:
         print("\nScreening ordering strategies...")
         print("-" * 60)
+        print("Global orderings:")
 
+    # Evaluate global orderings on flat examples
     for ordering in ALL_ORDERINGS:
-        consistency_result = checker.check_consistency(examples, ordering)
+        consistency_result = checker.check_consistency(flat_examples, ordering)
         results[ordering.name] = {
             'consistent': consistency_result['consistent'],
             'framings': consistency_result['framings'],
@@ -914,6 +1555,24 @@ def screen_orderings_for_puzzle(
             num_framings = results[ordering.name]['num_framings']
             print(f"  {ordering.name:25s}: {status} ({num_framings} framings)")
 
+    # Evaluate per-parent orderings on hierarchical examples (if hierarchy exists)
+    if include_per_parent and has_hierarchy and hierarchical_examples:
+        if verbose:
+            print("\nPer-parent orderings (hierarchy detected):")
+
+        for ordering in PER_PARENT_ORDERINGS:
+            consistency_result = checker.check_consistency(hierarchical_examples, ordering)
+            results[ordering.name] = {
+                'consistent': consistency_result['consistent'],
+                'framings': consistency_result['framings'],
+                'num_framings': sum(len(f) for f in consistency_result.get('framings', []))
+            }
+
+            if verbose:
+                status = "CONSISTENT" if consistency_result['consistent'] else "inconsistent"
+                num_framings = results[ordering.name]['num_framings']
+                print(f"  {ordering.name:25s}: {status} ({num_framings} framings)")
+
     # Find best ordering: prefer consistent, then by number of framings
     # When scores tie, prefer reading-order strategies over arbitrary ones
     PREFERRED_ORDERINGS = [
@@ -922,6 +1581,9 @@ def screen_orderings_for_puzzle(
         'top_to_bottom',
         'left_to_right',
         'diagonal_tl_br',
+        # Per-parent orderings have lower preference than global
+        'per_parent(left_to_right)',
+        'per_parent(top_to_bottom)',
     ]
 
     best_name = None
@@ -950,7 +1612,7 @@ def screen_orderings_for_puzzle(
 
     # Get the ordering instance
     best_ordering = None
-    for ordering in ALL_ORDERINGS:
+    for ordering in ALL_ORDERINGS + PER_PARENT_ORDERINGS:
         if ordering.name == best_name:
             best_ordering = ordering
             break
@@ -964,8 +1626,176 @@ def screen_orderings_for_puzzle(
         'best_ordering': best_ordering,
         'best_name': best_name,
         'is_consistent': results.get(best_name, {}).get('consistent', False),
-        'all_results': results
+        'all_results': results,
+        'has_hierarchy': has_hierarchy
     }
+
+
+def screen_hierarchy_strategies(
+    puzzle: Dict,
+    verbose: bool = False
+) -> Dict:
+    """
+    Screen flat vs hierarchical object representations for a puzzle.
+
+    Compares:
+    1. Flat mode: Objects as independent peers (existing behavior)
+    2. Hierarchy mode: Objects with containment-based parent/child relationships
+
+    The hierarchy mode wins when:
+    - Parent-child anchor relations have lower variance than peer relations
+    - Scoped operations (within containers) produce more consistent results
+
+    Args:
+        puzzle: Puzzle dict with 'train' examples
+
+    Returns:
+        Dict with:
+            - best_mode: 'flat' or 'hierarchy'
+            - use_hierarchy: bool
+            - flat_score: float (lower is better - based on anchor variance)
+            - hierarchy_score: float
+            - hierarchy_stats: dict with hierarchy info (if hierarchy detected)
+            - parent_child_relations: list of best relations (if hierarchy)
+    """
+    from object_module import (
+        extract_objects_from_grid,
+        get_hierarchy_stats,
+    )
+    from anchoring_module import discover_parent_child_relation
+
+    results = {
+        'best_mode': 'flat',
+        'use_hierarchy': False,
+        'flat_score': float('inf'),
+        'hierarchy_score': float('inf'),
+        'hierarchy_stats': None,
+        'parent_child_relations': None,
+    }
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("HIERARCHY SCREENING")
+        print("=" * 60)
+
+    # Collect data for both modes across all training examples
+    flat_examples = []
+    hierarchy_examples = []
+    all_child_parent_pairs = []
+    has_hierarchy = False
+
+    for pair in puzzle.get('train', []):
+        if 'output' not in pair:
+            continue
+
+        input_grid = np.array(pair['input'])
+        output_grid = np.array(pair['output'])
+
+        # === FLAT MODE ===
+        input_objects_flat = extract_objects_from_grid(input_grid, build_hierarchy=False)
+        output_objects_flat = extract_objects_from_grid(output_grid, build_hierarchy=False)
+        flat_examples.append({
+            'input_objects': input_objects_flat,
+            'output_objects': output_objects_flat,
+            'input_grid': input_grid,
+            'output_grid': output_grid,
+        })
+
+        # === HIERARCHY MODE ===
+        input_roots = extract_objects_from_grid(input_grid, build_hierarchy=True)
+        output_roots = extract_objects_from_grid(output_grid, build_hierarchy=True)
+
+        # Check if hierarchy was actually detected
+        input_has_composite = any(r.is_composite for r in input_roots)
+        output_has_composite = any(r.is_composite for r in output_roots)
+
+        if input_has_composite or output_has_composite:
+            has_hierarchy = True
+            hierarchy_examples.append({
+                'input_roots': input_roots,
+                'output_roots': output_roots,
+                'input_grid': input_grid,
+                'output_grid': output_grid,
+            })
+
+            # Collect child-parent pairs from output
+            for root in output_roots:
+                for child in root.children:
+                    all_child_parent_pairs.append((child, root))
+
+    if verbose:
+        print(f"\nFlat mode: {len(flat_examples)} examples")
+        print(f"Hierarchy detected: {has_hierarchy}")
+        if has_hierarchy:
+            print(f"  - Examples with composites: {len(hierarchy_examples)}")
+            print(f"  - Total child-parent pairs: {len(all_child_parent_pairs)}")
+
+    # If no hierarchy detected, flat wins by default
+    if not has_hierarchy:
+        results['best_mode'] = 'flat'
+        results['use_hierarchy'] = False
+        if verbose:
+            print("\nNo containment hierarchy detected - using flat mode")
+        return results
+
+    # === EVALUATE FLAT MODE ===
+    # Score based on consistency of object-to-object relations
+    # (We use a simple heuristic: count how many objects have consistent positions)
+    flat_consistent_count = 0
+    flat_total_count = 0
+    for ex in flat_examples:
+        # Simple check: do objects maintain relative positions?
+        for in_obj in ex['input_objects']:
+            for out_obj in ex['output_objects']:
+                if in_obj.color == out_obj.color:
+                    flat_total_count += 1
+                    # Check if position delta is consistent (very simplified)
+                    flat_consistent_count += 1  # Placeholder
+    flat_score = 1.0  # Baseline score for flat mode
+
+    # === EVALUATE HIERARCHY MODE ===
+    hierarchy_score = float('inf')
+    best_relations = []
+
+    if all_child_parent_pairs and len(all_child_parent_pairs) >= 2:
+        # Discover parent-child anchor relations
+        relations = discover_parent_child_relation(all_child_parent_pairs, top_k=5)
+        best_relations = relations
+
+        if relations:
+            # Use variance of best relation as score (lower is better)
+            hierarchy_score = relations[0].variance
+
+            if verbose:
+                print(f"\nParent-child anchor analysis:")
+                for i, rel in enumerate(relations[:3]):
+                    print(f"  {i+1}. {rel.relation.describe()} (variance: {rel.variance:.4f})")
+
+    # Get hierarchy stats from first example
+    if hierarchy_examples:
+        stats = get_hierarchy_stats(hierarchy_examples[0]['input_roots'])
+        results['hierarchy_stats'] = stats
+
+    results['flat_score'] = flat_score
+    results['hierarchy_score'] = hierarchy_score
+    results['parent_child_relations'] = best_relations
+
+    # Decision: use hierarchy if it has low variance (< 1.0 is good)
+    # and lower than a threshold indicating consistent parent-child positioning
+    HIERARCHY_VARIANCE_THRESHOLD = 0.1
+
+    if hierarchy_score < HIERARCHY_VARIANCE_THRESHOLD:
+        results['best_mode'] = 'hierarchy'
+        results['use_hierarchy'] = True
+        if verbose:
+            print(f"\n*** Hierarchy mode selected (variance {hierarchy_score:.4f} < {HIERARCHY_VARIANCE_THRESHOLD}) ***")
+    else:
+        results['best_mode'] = 'flat'
+        results['use_hierarchy'] = False
+        if verbose:
+            print(f"\n*** Flat mode selected (hierarchy variance {hierarchy_score:.4f} too high) ***")
+
+    return results
 
 
 def visualize_ordering(grid: np.ndarray, objects: List[Object],
@@ -1045,13 +1875,24 @@ def visualize_puzzle_ordering(puzzle_id: str, ordering_name: str = "auto"):
 
     # Get the ordering strategy
     if ordering_name == "auto":
-        # Auto-detect best ordering
-        screen_result = screen_orderings_for_puzzle(puzzle, verbose=True)
-        ordering = screen_result['best_ordering']
-        ordering_name = screen_result['best_name']
-        print(f"\nUsing auto-detected ordering: {ordering_name}")
-        if screen_result['is_consistent']:
-            print("(This ordering has consistent framings across all training examples)")
+        # Auto-detect best ordering using unified screening
+        screen_result = find_best_ordering(puzzle, verbose=True)
+        ordering = screen_result.global_ordering
+        ordering_name = screen_result.best_ordering_name
+
+        print(f"\nBest ordering configuration:")
+        print(f"  Mode: {screen_result.best_mode}")
+        print(f"  Strategy: {ordering_name}")
+        print(f"  Consistent: {screen_result.is_consistent}")
+        print(f"  Has hierarchy: {screen_result.has_hierarchy}")
+
+        if screen_result.best_mode == 'per_parent' and screen_result.per_parent_result:
+            # For per-parent mode, use the child ordering for visualization
+            ordering = screen_result.per_parent_result.child_ordering
+            print(f"\nPer-parent ordering details:")
+            print(f"  Child ordering: {ordering.name}")
+            for idx, offset in sorted(screen_result.per_parent_result.learned_offsets.items()):
+                print(f"    Index {idx}: parent + {offset}")
         print()
     else:
         ordering = None
@@ -1643,6 +2484,98 @@ def test_adaptive_reading_order():
     print("=" * 70)
 
 
+def test_per_parent_ordering():
+    """
+    Test PerParentOrdering with hierarchical objects.
+
+    Demonstrates ordering children within each parent consistently,
+    enabling rules like "the 1st child in each parent goes to position X".
+    """
+    print("=" * 70)
+    print("TEST: PER-PARENT ORDERING")
+    print("=" * 70)
+
+    # Create hierarchical objects: 2 parents, each with 3 children
+    # Parent A at (0, 0) with children at various positions
+    parent_a = Object(id=100, row=0, col=0, height=10, width=15, color=5)
+    child_a1 = Object(id=1, row=2, col=2, height=2, width=2, color=1)
+    child_a2 = Object(id=2, row=2, col=8, height=2, width=2, color=2)
+    child_a3 = Object(id=3, row=6, col=5, height=2, width=2, color=3)
+
+    # Set parent references
+    child_a1.parent = parent_a
+    child_a2.parent = parent_a
+    child_a3.parent = parent_a
+    parent_a.children = [child_a1, child_a2, child_a3]
+
+    # Parent B at (12, 0) with children at various positions
+    parent_b = Object(id=200, row=12, col=0, height=10, width=15, color=5)
+    child_b1 = Object(id=4, row=14, col=3, height=2, width=2, color=1)
+    child_b2 = Object(id=5, row=14, col=10, height=2, width=2, color=2)
+    child_b3 = Object(id=6, row=18, col=6, height=2, width=2, color=3)
+
+    child_b1.parent = parent_b
+    child_b2.parent = parent_b
+    child_b3.parent = parent_b
+    parent_b.children = [child_b1, child_b2, child_b3]
+
+    all_children = [child_a1, child_a2, child_a3, child_b1, child_b2, child_b3]
+
+    print("\nScenario: 2 parent objects, each with 3 children")
+    print("\nParent A children:")
+    for c in parent_a.children:
+        print(f"  id={c.id}, pos=({c.row},{c.col}), color={c.color}")
+    print("\nParent B children:")
+    for c in parent_b.children:
+        print(f"  id={c.id}, pos=({c.row},{c.col}), color={c.color}")
+
+    # Test different orderings
+    print("\n" + "-" * 50)
+    print("Testing per-parent orderings:")
+    print("-" * 50)
+
+    for base_ordering in [LeftToRight(), TopToBottom(), ByColor()]:
+        per_parent = PerParentOrdering(base_ordering)
+
+        print(f"\n{per_parent.name}:")
+
+        # Order children within each parent
+        ordered_by_parent = per_parent.order_children_by_parent(all_children)
+        for parent_id, ordered_children in ordered_by_parent.items():
+            parent_name = "A" if parent_id == 100 else "B"
+            child_ids = [c.id for c in ordered_children]
+            print(f"  Parent {parent_name}: {child_ids}")
+
+        # Group by child index
+        by_index = per_parent.group_by_child_index(all_children)
+        print("  Grouped by index:")
+        for idx, children in sorted(by_index.items()):
+            child_ids = [c.id for c in children]
+            print(f"    Index {idx}: {child_ids}")
+
+    # Test variance computation
+    print("\n" + "-" * 50)
+    print("Testing parent-relative offset consistency:")
+    print("-" * 50)
+
+    # Children have consistent offsets from their parents
+    # child_a1 at (2,2) in parent at (0,0) -> offset (2,2)
+    # child_b1 at (14,3) in parent at (12,0) -> offset (2,3)
+
+    for base_ordering in [LeftToRight(), TopToBottom()]:
+        per_parent = PerParentOrdering(base_ordering)
+        by_index = per_parent.group_by_child_index(all_children)
+
+        print(f"\n{per_parent.name}:")
+        for idx, children in sorted(by_index.items()):
+            offsets = [(c.row - c.parent.row, c.col - c.parent.col) for c in children]
+            print(f"  Index {idx}: offsets = {offsets}")
+
+    print("\n" + "=" * 70)
+    print("PER-PARENT ORDERING TESTS COMPLETE")
+    print("=" * 70)
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1673,16 +2606,48 @@ Available ordering strategies:
     parser.add_argument("--demo", action="store_true", help="Run demonstration")
     parser.add_argument("--test", action="store_true", help="Run tests")
     parser.add_argument("--adaptive", action="store_true", help="Test adaptive reading order")
+    parser.add_argument("--per-parent", action="store_true", help="Test per-parent ordering")
     parser.add_argument("--puzzle-id", type=str, help="ARC puzzle ID to visualize (e.g., 1990f7a8)")
     parser.add_argument("--ordering", type=str, default="auto",
                         help="Ordering strategy to use (default: auto)")
     parser.add_argument("--compare", action="store_true",
                         help="Compare multiple ordering strategies for the puzzle")
+    parser.add_argument("--screen-per-parent", action="store_true",
+                        help="Screen per-parent orderings only (requires --puzzle-id)")
+    parser.add_argument("--screen-all", action="store_true",
+                        help="Unified screening: global + per-parent orderings (requires --puzzle-id)")
 
     args = parser.parse_args()
 
     if args.puzzle_id:
-        if args.compare:
+        if args.screen_all:
+            # Unified ordering screening (the canonical approach)
+            puzzles = load_puzzles("arc-agi-1")
+            if args.puzzle_id not in puzzles:
+                puzzles.update(load_puzzles("arc-agi-2"))
+            if args.puzzle_id not in puzzles:
+                print(f"Error: Puzzle '{args.puzzle_id}' not found")
+            else:
+                result = find_best_ordering(puzzles[args.puzzle_id], verbose=True)
+                print("\n" + "=" * 60)
+                print("SUMMARY")
+                print("=" * 60)
+                print(f"Best configuration: {result.describe()}")
+                print(f"Has hierarchy: {result.has_hierarchy}")
+        elif args.screen_per_parent:
+            # Screen per-parent orderings only
+            puzzles = load_puzzles("arc-agi-1")
+            if args.puzzle_id not in puzzles:
+                puzzles.update(load_puzzles("arc-agi-2"))
+            if args.puzzle_id not in puzzles:
+                print(f"Error: Puzzle '{args.puzzle_id}' not found")
+            else:
+                result = screen_per_parent_orderings_for_puzzle(
+                    puzzles[args.puzzle_id], verbose=True
+                )
+                if result is None:
+                    print("\nNo hierarchical structure found for per-parent ordering")
+        elif args.compare:
             compare_orderings(args.puzzle_id)
         else:
             visualize_puzzle_ordering(args.puzzle_id, args.ordering)
@@ -1692,6 +2657,8 @@ Available ordering strategies:
         test()
     elif args.adaptive:
         test_adaptive_reading_order()
+    elif args.per_parent:
+        test_per_parent_ordering()
     else:
         # Default: show help
         parser.print_help()

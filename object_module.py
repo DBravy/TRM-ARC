@@ -18,9 +18,15 @@ Key functions:
     detect_background_color: Find background using edge-connected heuristic
     compute_exterior_mask: Find background pixels reachable from edges
 
+Segmentation modes (SegmentationMode enum):
+    CONNECTIVITY: Default. Connected component analysis with divider detection.
+    PIXEL: Each non-background pixel becomes its own object.
+    COLOR: All pixels of the same color form a single object.
+
 Usage:
     from object_module import (
         Object,
+        SegmentationMode,
         extract_connected_components,
         extract_objects_from_grid,
         detect_background_color,
@@ -33,6 +39,7 @@ Usage:
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Set, Optional, Any
+from enum import Enum
 from scipy import ndimage
 
 
@@ -42,6 +49,105 @@ from scipy import ndimage
 
 NUM_COLORS = 10
 MAX_OBJECTS = 40
+
+
+# =============================================================================
+# Segmentation Modes
+# =============================================================================
+
+class SegmentationMode(Enum):
+    """Defines how objects are segmented from the grid.
+
+    CONNECTIVITY: Default mode. Uses connected component analysis with
+                  8-connectivity for foreground colors and 4-connectivity
+                  for background. Respects divider lines.
+
+    PIXEL: Each non-background pixel becomes its own object. Useful for
+           puzzles where individual pixel positions matter.
+
+    COLOR: All pixels of the same color form a single object, regardless
+           of connectivity. Useful for color-based transformations.
+    """
+    CONNECTIVITY = "connectivity"
+    PIXEL = "pixel"
+    COLOR = "color"
+
+
+@dataclass
+class SegmentationStrategy:
+    """Configures how input and output grids are segmented.
+
+    Allows different segmentation strategies for input vs output grids.
+    This is useful when input objects are connected components but output
+    treats each pixel separately, or vice versa.
+
+    Attributes:
+        input_mode: Segmentation mode for input grids
+        output_mode: Segmentation mode for output grids
+
+    Usage:
+        # Different modes for input vs output
+        strategy = SegmentationStrategy(
+            input_mode=SegmentationMode.CONNECTIVITY,
+            output_mode=SegmentationMode.PIXEL
+        )
+
+        # Uniform mode (same for both)
+        strategy = SegmentationStrategy.uniform(SegmentationMode.COLOR)
+
+        # From legacy single mode (backward compatible)
+        strategy = SegmentationStrategy.from_mode(SegmentationMode.CONNECTIVITY)
+    """
+    input_mode: SegmentationMode = SegmentationMode.CONNECTIVITY
+    output_mode: SegmentationMode = SegmentationMode.CONNECTIVITY
+
+    def get_mode(self, context: str = "input") -> SegmentationMode:
+        """Get the segmentation mode for a given context.
+
+        Args:
+            context: "input" or "output"
+
+        Returns:
+            The appropriate SegmentationMode for the context
+        """
+        if context == "output":
+            return self.output_mode
+        return self.input_mode
+
+    @classmethod
+    def uniform(cls, mode: SegmentationMode) -> 'SegmentationStrategy':
+        """Create a strategy that uses the same mode for input and output.
+
+        Args:
+            mode: The segmentation mode to use for both grids
+
+        Returns:
+            A SegmentationStrategy with uniform mode
+        """
+        return cls(input_mode=mode, output_mode=mode)
+
+    @classmethod
+    def from_mode(cls, mode: Optional[SegmentationMode]) -> 'SegmentationStrategy':
+        """Convert a legacy SegmentationMode to a SegmentationStrategy.
+
+        This provides backward compatibility with code that passes a single
+        SegmentationMode instead of a SegmentationStrategy.
+
+        Args:
+            mode: A SegmentationMode, or None for default (CONNECTIVITY)
+
+        Returns:
+            A SegmentationStrategy with uniform mode
+        """
+        if mode is None:
+            return cls()
+        return cls.uniform(mode)
+
+    def __repr__(self) -> str:
+        if self.input_mode == self.output_mode:
+            return f"SegmentationStrategy(uniform={self.input_mode.value})"
+        return f"SegmentationStrategy(input={self.input_mode.value}, output={self.output_mode.value})"
+
 
 # Connectivity structures
 STRUCTURE_8CONN = np.array([[1, 1, 1],
@@ -71,6 +177,8 @@ class Object:
         pixels: Set of (row, col) tuples for all pixels in this object
         is_background: Whether this object is part of the background
         is_divider: Whether this object is a divider line
+        parent: Reference to containing parent object (None if top-level)
+        children: List of objects contained within this object
     """
     id: int
     row: int          # top-left row
@@ -81,6 +189,9 @@ class Object:
     pixels: Set[Tuple[int, int]] = field(default_factory=set)
     is_background: bool = False
     is_divider: bool = False
+    # Hierarchy fields (backward-compatible defaults)
+    parent: Optional['Object'] = field(default=None, repr=False)
+    children: List['Object'] = field(default_factory=list, repr=False)
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -102,16 +213,177 @@ class Object:
         """Get bounding box as (min_row, min_col, max_row, max_col)."""
         return (self.row, self.col, self.row + self.height - 1, self.col + self.width - 1)
 
+    # -------------------------------------------------------------------------
+    # Hierarchy Properties
+    # -------------------------------------------------------------------------
+
+    @property
+    def is_atomic(self) -> bool:
+        """True if this object has no children (leaf node)."""
+        return len(self.children) == 0
+
+    @property
+    def is_composite(self) -> bool:
+        """True if this object contains other objects."""
+        return len(self.children) > 0
+
+    @property
+    def is_root(self) -> bool:
+        """True if this object has no parent (top-level)."""
+        return self.parent is None
+
+    @property
+    def depth(self) -> int:
+        """Nesting depth (0 for root objects)."""
+        return 0 if self.parent is None else 1 + self.parent.depth
+
+    # -------------------------------------------------------------------------
+    # Hierarchy Methods
+    # -------------------------------------------------------------------------
+
+    def flatten(self) -> List['Object']:
+        """Returns this object plus all descendants in pre-order traversal.
+
+        Useful for getting all objects in a hierarchy as a flat list.
+
+        Returns:
+            List starting with self, then all children recursively.
+        """
+        result = [self]
+        for child in self.children:
+            result.extend(child.flatten())
+        return result
+
+    def get_atomic_objects(self) -> List['Object']:
+        """Returns only the leaf (childless) objects in the hierarchy.
+
+        Returns:
+            List of all atomic objects under this object (may include self).
+        """
+        if self.is_atomic:
+            return [self]
+        result = []
+        for child in self.children:
+            result.extend(child.get_atomic_objects())
+        return result
+
+    def local_bbox(self) -> Tuple[int, int, int, int]:
+        """Get bounding box relative to parent's top-left corner.
+
+        Returns:
+            (local_row, local_col, height, width) relative to parent.
+            For root objects, returns (row, col, height, width).
+        """
+        if self.parent is None:
+            return (self.row, self.col, self.height, self.width)
+        return (
+            self.row - self.parent.row,
+            self.col - self.parent.col,
+            self.height,
+            self.width
+        )
+
+    def local_center(self) -> Tuple[float, float]:
+        """Get center relative to parent's top-left corner.
+
+        Returns:
+            (local_row, local_col) center position relative to parent.
+        """
+        if self.parent is None:
+            return self.center
+        return (
+            self.center[0] - self.parent.row,
+            self.center[1] - self.parent.col
+        )
+
+    # -------------------------------------------------------------------------
+    # Utility Methods for Genesis
+    # -------------------------------------------------------------------------
+
+    def contains_point(self, row: int, col: int) -> bool:
+        """Check if a point is within this object's bounding box.
+
+        Args:
+            row: Row coordinate to check
+            col: Column coordinate to check
+
+        Returns:
+            True if point is within bounding box
+        """
+        return (self.row <= row < self.row + self.height and
+                self.col <= col < self.col + self.width)
+
+    def get_local_mask(self) -> np.ndarray:
+        """Get this object's shape as a local mask (height x width).
+
+        The mask is a boolean array where True indicates pixels
+        that belong to this object.
+
+        Returns:
+            Boolean numpy array of shape (height, width)
+        """
+        mask = np.zeros((self.height, self.width), dtype=bool)
+        if self.pixels:
+            for r, c in self.pixels:
+                local_r = r - self.row
+                local_c = c - self.col
+                if 0 <= local_r < self.height and 0 <= local_c < self.width:
+                    mask[local_r, local_c] = True
+        else:
+            # If no pixels set, assume filled rectangle
+            mask[:] = True
+        return mask
+
+    def overlaps(self, other: 'Object') -> bool:
+        """Check if this object's bounding box overlaps with another's.
+
+        Args:
+            other: Another Object to check overlap with
+
+        Returns:
+            True if bounding boxes overlap
+        """
+        # Check for no overlap conditions
+        if self.row + self.height <= other.row:  # self is above other
+            return False
+        if other.row + other.height <= self.row:  # other is above self
+            return False
+        if self.col + self.width <= other.col:   # self is left of other
+            return False
+        if other.col + other.width <= self.col:   # other is left of self
+            return False
+        return True
+
+    def contains_object(self, other: 'Object') -> bool:
+        """Check if this object's bounding box fully contains another.
+
+        Args:
+            other: Another Object to check containment for
+
+        Returns:
+            True if other is fully inside this object's bbox
+        """
+        return (self.row <= other.row and
+                self.col <= other.col and
+                self.row + self.height >= other.row + other.height and
+                self.col + self.width >= other.col + other.width)
+
 
 # =============================================================================
 # Background Detection (from AffinitySlotAttention)
 # =============================================================================
 
-def detect_background_color(grid: np.ndarray, min_bg_coverage: float = 0.1) -> Optional[int]:
+def detect_background_color(
+    grid: np.ndarray,
+    min_bg_coverage: float = 0.1,
+    prefer_black: bool = True,
+    black_min_coverage: float = 0.05
+) -> Optional[int]:
     """
     Detect the background color using the largest edge-connected component heuristic.
 
-    This matches the approach in AffinitySlotAttention._detect_background_color.
+    This matches the approach in AffinitySlotAttention._detect_background_color,
+    with an added preference for black (0) since it's the conventional ARC background.
 
     The background is identified as the color with the largest connected component
     that touches any edge of the grid, provided it covers at least min_bg_coverage
@@ -121,6 +393,9 @@ def detect_background_color(grid: np.ndarray, min_bg_coverage: float = 0.1) -> O
         grid: (H, W) integer color values 0-9
         min_bg_coverage: Minimum fraction of grid that must be covered to be
                         considered background (default 0.1 = 10%)
+        prefer_black: If True, prefer black (0) as background when it touches
+                     edges and covers at least black_min_coverage (default True)
+        black_min_coverage: Minimum coverage for black to be preferred (default 0.05 = 5%)
 
     Returns:
         The background color (0-9), or None if no clear background is detected
@@ -140,6 +415,14 @@ def detect_background_color(grid: np.ndarray, min_bg_coverage: float = 0.1) -> O
     edge_colors.update(grid[H-1, :].tolist())    # bottom
     edge_colors.update(grid[:, 0].tolist())      # left
     edge_colors.update(grid[:, W-1].tolist())    # right
+
+    # Prefer black (0) if it touches edges and covers enough of the grid
+    # This handles ARC's convention where black is typically background
+    if prefer_black and 0 in edge_colors:
+        black_mask = (grid == 0)
+        black_coverage = black_mask.sum() / total_cells
+        if black_coverage >= black_min_coverage:
+            return 0
 
     best_color = None
     best_size = 0
@@ -637,7 +920,9 @@ def detect_divider_lines(
 def segment_by_dividers(
     grid: np.ndarray,
     horizontal_dividers: List[Tuple[int, int, int]],
-    vertical_dividers: List[Tuple[int, int, int]]
+    vertical_dividers: List[Tuple[int, int, int]],
+    skip_background: bool = True,
+    background_color: Optional[int] = None
 ) -> Tuple[np.ndarray, List[int], List[Tuple[int, int, int, int]], List[bool], List[bool]]:
     """
     Segment a grid based on detected divider lines.
@@ -649,12 +934,14 @@ def segment_by_dividers(
         grid: (H, W) integer color values 0-9
         horizontal_dividers: List of (start_row, end_row_exclusive, color)
         vertical_dividers: List of (start_col, end_col_exclusive, color)
+        skip_background: If True, skip regions whose dominant color matches background_color
+        background_color: The background color to skip (if skip_background is True)
 
     Returns:
         labels: (H, W) component IDs (0 = none, 1+ = component IDs)
         colors: List of dominant colors for each component
         bboxes: List of (min_row, min_col, max_row, max_col) for each component
-        is_background: List of bool (all False for divider-based segmentation)
+        is_background: List of bool indicating if each component is background-colored
         is_divider: List of bool indicating which components are dividers
     """
     H, W = grid.shape
@@ -701,28 +988,276 @@ def segment_by_dividers(
             if row_start >= row_end or col_start >= col_end:
                 continue
 
-            # Check if this region is a divider (skip divider cells entirely)
+            # Check if this region is a divider
             is_h_divider = (row_start, row_end) in h_divider_rows
             is_v_divider = (col_start, col_end) in v_divider_cols
-            if is_h_divider or is_v_divider:
-                continue
+            region_is_divider = is_h_divider or is_v_divider
+
+            # Find colors in this region
+            region = grid[row_start:row_end, col_start:col_end]
+            unique, counts = np.unique(region, return_counts=True)
+
+            # Check if region has any non-background content
+            if skip_background and background_color is not None:
+                # Filter to non-background colors
+                non_bg_mask = unique != background_color
+                if not np.any(non_bg_mask):
+                    # Region contains only background color - skip it
+                    continue
+                # Use most common non-background color as the region's color
+                non_bg_unique = unique[non_bg_mask]
+                non_bg_counts = counts[non_bg_mask]
+                dominant_color = int(non_bg_unique[np.argmax(non_bg_counts)])
+                region_is_background = False
+            else:
+                # No background filtering - use overall dominant color
+                dominant_color = int(unique[np.argmax(counts)])
+                region_is_background = (background_color is not None and
+                                        dominant_color == background_color)
 
             component_id += 1
 
             # Label this region
             labels[row_start:row_end, col_start:col_end] = component_id
 
-            # Find dominant color in this region
-            region = grid[row_start:row_end, col_start:col_end]
-            unique, counts = np.unique(region, return_counts=True)
-            dominant_color = int(unique[np.argmax(counts)])
-
             colors.append(dominant_color)
             bboxes.append((row_start, col_start, row_end - 1, col_end - 1))
-            is_background.append(False)
-            is_divider.append(False)
+            is_background.append(region_is_background)
+            is_divider.append(region_is_divider)
 
     return labels, colors, bboxes, is_background, is_divider
+
+
+def extract_children_in_region(
+    sub_grid: np.ndarray,
+    parent_row_offset: int,
+    parent_col_offset: int,
+    start_id: int = 0,
+    background_color: Optional[int] = None
+) -> List[Object]:
+    """
+    Extract child objects within a region (sub-grid) using connectivity-based detection.
+
+    This function is used after divider-based segmentation to find the objects
+    within each divided region. It uses connectivity-based detection (not divider
+    detection) to avoid infinite recursion.
+
+    Args:
+        sub_grid: The region's grid data (H, W) integer color values 0-9
+        parent_row_offset: Row offset to add to child coordinates (parent's top-left row)
+        parent_col_offset: Col offset to add to child coordinates (parent's top-left col)
+        start_id: Starting ID for child objects
+        background_color: Background color to skip (from global grid detection).
+                         If None, detects background within the sub-grid.
+
+    Returns:
+        List of Object instances with coordinates in global (full grid) space.
+        Returns empty list if region has only one color (parent is atomic).
+    """
+    # Check if region has only one color - if so, it's atomic (no children)
+    unique_colors = np.unique(sub_grid)
+    if len(unique_colors) <= 1:
+        return []
+
+    H, W = sub_grid.shape
+
+    # Use provided background color, or detect within this region
+    if background_color is None:
+        background_color = detect_background_color(sub_grid, min_bg_coverage=0.1)
+
+    # Use connectivity-based extraction (NOT divider detection)
+    labels = np.zeros((H, W), dtype=np.int32)
+    colors = []
+    bboxes = []
+    is_background_list = []
+    component_id = 0
+
+    for c in range(NUM_COLORS):
+        # Skip background color
+        if c == background_color:
+            continue
+
+        mask = (sub_grid == c)
+        if not mask.any():
+            continue
+
+        # Use 8-connectivity for foreground colors
+        structure = STRUCTURE_8CONN
+        labeled, num_features = ndimage.label(mask, structure=structure)
+
+        for comp in range(1, num_features + 1):
+            comp_mask = (labeled == comp)
+            component_id += 1
+            labels[comp_mask] = component_id
+            colors.append(c)
+            is_background_list.append(False)
+
+            rows, cols = np.where(comp_mask)
+            bbox = (rows.min(), cols.min(), rows.max(), cols.max())
+            bboxes.append(bbox)
+
+    if component_id == 0:
+        return []
+
+    # Convert to Object instances with global coordinates
+    children = []
+    for i, (color, bbox, is_bg) in enumerate(zip(colors, bboxes, is_background_list)):
+        local_min_row, local_min_col, local_max_row, local_max_col = bbox
+        height = local_max_row - local_min_row + 1
+        width = local_max_col - local_min_col + 1
+
+        # Extract pixels and convert to global coordinates
+        mask = (labels == i + 1)
+        local_pixels = list(zip(*np.where(mask)))
+        global_pixels = set(
+            (r + parent_row_offset, c + parent_col_offset)
+            for r, c in local_pixels
+        )
+
+        # Global coordinates
+        global_row = local_min_row + parent_row_offset
+        global_col = local_min_col + parent_col_offset
+
+        children.append(Object(
+            id=start_id + i,
+            row=global_row,
+            col=global_col,
+            height=height,
+            width=width,
+            color=color,
+            pixels=global_pixels,
+            is_background=is_bg,
+            is_divider=False
+        ))
+
+    return children
+
+
+def segment_by_dividers_hierarchical(
+    grid: np.ndarray,
+    horizontal_dividers: List[Tuple[int, int, int]],
+    vertical_dividers: List[Tuple[int, int, int]]
+) -> List[Object]:
+    """
+    Segment a grid by dividers and build hierarchical parent/child structure.
+
+    Each region separated by dividers becomes a parent object. Within each parent,
+    child objects are extracted using connectivity-based detection. If a region
+    has only one color, the parent has no children (it's atomic).
+
+    Args:
+        grid: (H, W) integer color values 0-9
+        horizontal_dividers: List of (start_row, end_row_exclusive, color)
+        vertical_dividers: List of (start_col, end_col_exclusive, color)
+
+    Returns:
+        List of parent Object instances with children populated.
+        Divider regions are not included in the output.
+    """
+    H, W = grid.shape
+
+    # Detect background at the global level (used for all sub-regions)
+    global_background = detect_background_color(grid, min_bg_coverage=0.1)
+
+    # Build row boundaries from horizontal dividers
+    row_boundaries = [0]
+    h_divider_rows = set()
+    for start_row, end_row, _ in sorted(horizontal_dividers):
+        row_boundaries.append(start_row)
+        row_boundaries.append(end_row)
+        h_divider_rows.add((start_row, end_row))
+    row_boundaries.append(H)
+
+    # Build col boundaries from vertical dividers
+    col_boundaries = [0]
+    v_divider_cols = set()
+    for start_col, end_col, _ in sorted(vertical_dividers):
+        col_boundaries.append(start_col)
+        col_boundaries.append(end_col)
+        v_divider_cols.add((start_col, end_col))
+    col_boundaries.append(W)
+
+    # Remove duplicates and sort
+    row_boundaries = sorted(set(row_boundaries))
+    col_boundaries = sorted(set(col_boundaries))
+
+    parents = []
+    parent_id = 0
+    child_id_counter = 0
+
+    # Create parent objects for each cell in the grid formed by boundaries
+    for i in range(len(row_boundaries) - 1):
+        row_start = row_boundaries[i]
+        row_end = row_boundaries[i + 1]
+
+        for j in range(len(col_boundaries) - 1):
+            col_start = col_boundaries[j]
+            col_end = col_boundaries[j + 1]
+
+            # Skip empty regions
+            if row_start >= row_end or col_start >= col_end:
+                continue
+
+            # Skip divider regions
+            is_h_divider = (row_start, row_end) in h_divider_rows
+            is_v_divider = (col_start, col_end) in v_divider_cols
+            if is_h_divider or is_v_divider:
+                continue
+
+            # Extract the sub-grid for this region
+            sub_grid = grid[row_start:row_end, col_start:col_end]
+
+            # Find dominant color for the parent (excluding background if other colors exist)
+            unique, counts = np.unique(sub_grid, return_counts=True)
+            # Prefer non-background colors to avoid assigning color=0 to pattern regions
+            non_bg_mask = unique != global_background
+            if np.any(non_bg_mask):
+                # Use most frequent non-background color
+                non_bg_unique = unique[non_bg_mask]
+                non_bg_counts = counts[non_bg_mask]
+                dominant_color = int(non_bg_unique[np.argmax(non_bg_counts)])
+            else:
+                # All background - use background color
+                dominant_color = int(unique[np.argmax(counts)])
+
+            # Compute all pixels in this region (for the parent)
+            parent_pixels = set()
+            for r in range(row_start, row_end):
+                for c in range(col_start, col_end):
+                    parent_pixels.add((r, c))
+
+            # Create parent object
+            parent = Object(
+                id=parent_id,
+                row=row_start,
+                col=col_start,
+                height=row_end - row_start,
+                width=col_end - col_start,
+                color=dominant_color,
+                pixels=parent_pixels,
+                is_background=False,
+                is_divider=False
+            )
+
+            # Extract children within this region
+            children = extract_children_in_region(
+                sub_grid,
+                parent_row_offset=row_start,
+                parent_col_offset=col_start,
+                start_id=child_id_counter,
+                background_color=global_background
+            )
+
+            # Link parent and children
+            for child in children:
+                child.parent = parent
+            parent.children = children
+
+            child_id_counter += len(children)
+            parents.append(parent)
+            parent_id += 1
+
+    return parents
 
 
 # =============================================================================
@@ -735,7 +1270,8 @@ def extract_connected_components(
     background_color: Optional[int] = None,
     auto_detect_background: bool = True,
     min_bg_coverage: float = 0.1,
-    skip_background: bool = True
+    skip_background: bool = True,
+    segmentation_mode: Optional[SegmentationMode] = None
 ) -> Tuple[np.ndarray, List[int], List[Tuple[int, int, int, int]], List[bool]]:
     """
     Extract connected components from a grid with background-aware detection.
@@ -745,8 +1281,8 @@ def extract_connected_components(
 
     Args:
         grid: (H, W) integer color values 0-9
-        use_color_only: If True, each color is one "object" (no connectivity check)
-                       If False, use connectivity-based detection
+        use_color_only: DEPRECATED - use segmentation_mode=SegmentationMode.COLOR instead.
+                       If True, each color is one "object" (no connectivity check).
         background_color: Explicitly specify background color. If None and
                          auto_detect_background is True, will detect automatically.
         auto_detect_background: Whether to automatically detect background color
@@ -754,6 +1290,10 @@ def extract_connected_components(
         min_bg_coverage: Minimum fraction of grid for background detection.
         skip_background: If True, skip the detected background color entirely
                         (default True for backward compatibility).
+        segmentation_mode: How to segment objects. If provided, overrides use_color_only.
+                          - CONNECTIVITY (default): Connected component analysis
+                          - PIXEL: Each pixel is its own object
+                          - COLOR: All pixels of same color form one object
 
     Returns:
         labels: (H, W) component IDs (0 = no component, 1+ = component IDs)
@@ -768,25 +1308,70 @@ def extract_connected_components(
     """
     H, W = grid.shape
 
-    # Check for divider lines first (takes priority over connectivity-based detection)
-    horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
-    if horizontal_dividers or vertical_dividers:
-        labels, colors, bboxes, is_bg, _ = segment_by_dividers(
-            grid, horizontal_dividers, vertical_dividers
-        )
-        return labels, colors, bboxes, is_bg
+    # Resolve segmentation mode (new parameter takes priority over deprecated use_color_only)
+    if segmentation_mode is None:
+        if use_color_only:
+            segmentation_mode = SegmentationMode.COLOR
+        else:
+            segmentation_mode = SegmentationMode.CONNECTIVITY
 
-    # Detect background color if requested
+    # Detect background color early (needed for both divider and connectivity paths)
     if background_color is None and auto_detect_background:
         background_color = detect_background_color(grid, min_bg_coverage)
+
+    # Check for divider lines first (takes priority over connectivity-based detection)
+    # Only applies to CONNECTIVITY mode
+    if segmentation_mode == SegmentationMode.CONNECTIVITY:
+        horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
+        if horizontal_dividers or vertical_dividers:
+            labels, colors, bboxes, is_bg, _ = segment_by_dividers(
+                grid, horizontal_dividers, vertical_dividers,
+                skip_background=skip_background,
+                background_color=background_color
+            )
+            return labels, colors, bboxes, is_bg
 
     # Compute exterior mask if we have a background color (for marking, not skipping)
     exterior_mask = None
     if background_color is not None and not skip_background:
         exterior_mask = compute_exterior_mask(grid, background_color)
 
-    if use_color_only:
-        # Each color is one "object" - no connectivity check
+    # =========================================================================
+    # PIXEL mode: Each pixel is its own object
+    # =========================================================================
+    if segmentation_mode == SegmentationMode.PIXEL:
+        labels = np.zeros((H, W), dtype=np.int32)
+        colors = []
+        bboxes = []
+        is_background_list = []
+        component_id = 0
+
+        for r in range(H):
+            for c in range(W):
+                pixel_color = int(grid[r, c])
+
+                # Skip background pixels if requested
+                if skip_background and pixel_color == background_color:
+                    continue
+
+                # Determine if this pixel is background
+                is_bg = False
+                if background_color is not None and pixel_color == background_color:
+                    if exterior_mask is not None:
+                        is_bg = bool(exterior_mask[r, c])
+
+                component_id += 1
+                labels[r, c] = component_id
+                colors.append(pixel_color)
+                is_background_list.append(is_bg)
+                bboxes.append((r, c, r, c))  # Single pixel bbox
+
+        return labels, colors, bboxes, is_background_list
+
+    # =========================================================================
+    # COLOR mode: Each color is one object (no connectivity check)
+    # =========================================================================
+    if segmentation_mode == SegmentationMode.COLOR:
         labels = np.zeros((H, W), dtype=np.int32)
         colors = []
         bboxes = []
@@ -818,7 +1403,9 @@ def extract_connected_components(
 
         return labels, colors, bboxes, is_background_list
 
-    # Connectivity-based detection
+    # =========================================================================
+    # CONNECTIVITY mode: Connected component analysis (default)
+    # =========================================================================
     labels = np.zeros((H, W), dtype=np.int32)
     colors = []
     bboxes = []
@@ -866,7 +1453,9 @@ def extract_connected_components(
 def extract_objects_from_grid(
     grid: np.ndarray,
     skip_background: bool = True,
-    auto_detect_background: bool = True
+    auto_detect_background: bool = True,
+    build_hierarchy: bool = False,
+    segmentation_mode: Optional[SegmentationMode] = None
 ) -> List[Object]:
     """
     Extract connected components from a grid and return as Object instances.
@@ -874,17 +1463,30 @@ def extract_objects_from_grid(
     This is a convenience wrapper around extract_connected_components that
     returns Object instances instead of the (labels, colors, bboxes) format.
 
-    If divider lines are detected, segments by dividers (takes priority).
-    Objects will have is_divider=True for divider regions.
+    If divider lines are detected (CONNECTIVITY mode only), segments by dividers
+    and automatically builds parent/child hierarchy. Each region separated by
+    dividers becomes a parent, with child objects extracted within each region.
+    If a region has only one color, the parent has no children (atomic).
 
     Args:
         grid: (H, W) integer color values 0-9
         skip_background: If True, exclude background objects from results.
                         Default True for backward compatibility.
         auto_detect_background: Whether to detect background automatically.
+        build_hierarchy: If True, also build parent/child relationships
+                        based on bounding box containment. When True,
+                        returns only root objects (but all objects are
+                        accessible via .children). For divider-based grids,
+                        hierarchy is already built automatically.
+        segmentation_mode: How to segment objects:
+                          - CONNECTIVITY (default): Connected component analysis
+                          - PIXEL: Each pixel is its own object
+                          - COLOR: All pixels of same color form one object
 
     Returns:
-        List of Object instances, one per connected component
+        List of Object instances. For divider-based grids, returns parent
+        objects with children populated. For non-divider grids, returns
+        flat list unless build_hierarchy=True.
 
     Example:
         >>> grid = np.array([[0, 1, 1], [0, 1, 0], [2, 2, 0]])
@@ -892,21 +1494,34 @@ def extract_objects_from_grid(
         >>> for obj in objects:
         ...     print(f"Object {obj.id}: color={obj.color}, area={obj.area}")
     """
-    # Check for divider lines first (to get is_divider info for Objects)
-    horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
-    if horizontal_dividers or vertical_dividers:
-        labels, colors, bboxes, is_background, is_divider = segment_by_dividers(
-            grid, horizontal_dividers, vertical_dividers
-        )
-        return labels_to_objects(labels, colors, bboxes, is_background, is_divider)
+    # Default to CONNECTIVITY mode
+    if segmentation_mode is None:
+        segmentation_mode = SegmentationMode.CONNECTIVITY
 
-    # No dividers - use standard extraction
+    # Check for divider lines first (only in CONNECTIVITY mode)
+    if segmentation_mode == SegmentationMode.CONNECTIVITY:
+        horizontal_dividers, vertical_dividers = detect_divider_lines(grid)
+        if horizontal_dividers or vertical_dividers:
+            # Use hierarchical segmentation - parents with children populated
+            objects = segment_by_dividers_hierarchical(
+                grid, horizontal_dividers, vertical_dividers
+            )
+            return objects
+
+    # Use standard extraction with the specified segmentation mode
     labels, colors, bboxes, is_background = extract_connected_components(
         grid,
         skip_background=skip_background,
-        auto_detect_background=auto_detect_background
+        auto_detect_background=auto_detect_background,
+        segmentation_mode=segmentation_mode
     )
-    return labels_to_objects(labels, colors, bboxes, is_background)
+    objects = labels_to_objects(labels, colors, bboxes, is_background)
+
+    # Optionally build hierarchy based on containment
+    if build_hierarchy:
+        return build_containment_hierarchy(objects)
+
+    return objects
 
 
 def labels_to_objects(
@@ -957,6 +1572,236 @@ def labels_to_objects(
         ))
 
     return objects
+
+
+# =============================================================================
+# Hierarchy Construction
+# =============================================================================
+
+def build_containment_hierarchy(
+    objects: List[Object],
+    require_full_containment: bool = True,
+    skip_background: bool = True,
+    skip_dividers: bool = True
+) -> List[Object]:
+    """Build parent/child relationships based on bounding box containment.
+
+    If object A's bbox fully contains object B's bbox, B becomes a child of A.
+    Each object is assigned to its immediate (smallest containing) parent.
+
+    Args:
+        objects: List of Object instances (modified in place)
+        require_full_containment: If True, bbox must fully contain.
+                                  If False, partial overlap (center inside) counts.
+        skip_background: Exclude background objects from hierarchy
+        skip_dividers: Exclude divider objects from hierarchy
+
+    Returns:
+        List of root objects (those with no parent).
+        The objects list is modified in place with parent/children set.
+
+    Note:
+        Objects that don't contain anything and aren't contained by anything
+        remain as root objects with no children (atomic roots).
+    """
+    # Filter objects to consider for hierarchy
+    candidates = [
+        obj for obj in objects
+        if not (skip_background and obj.is_background)
+        and not (skip_dividers and obj.is_divider)
+    ]
+
+    if not candidates:
+        return list(objects)  # Return original list unchanged
+
+    # Clear any existing hierarchy
+    for obj in candidates:
+        obj.parent = None
+        obj.children = []
+
+    # Sort by area (largest first) - larger objects are potential parents
+    sorted_by_area = sorted(candidates, key=lambda o: o.area, reverse=True)
+
+    # Build containment relationships
+    for i, potential_child in enumerate(sorted_by_area):
+        child_bbox = potential_child.bbox  # (min_row, min_col, max_row, max_col)
+
+        # Find the smallest containing object (immediate parent)
+        best_parent = None
+        best_parent_area = float('inf')
+
+        for potential_parent in sorted_by_area[:i]:  # Only larger objects
+            if potential_parent is potential_child:
+                continue
+
+            parent_bbox = potential_parent.bbox
+
+            if require_full_containment:
+                # Check if parent_bbox fully contains child_bbox
+                contains = (
+                    parent_bbox[0] <= child_bbox[0] and  # parent.min_row <= child.min_row
+                    parent_bbox[1] <= child_bbox[1] and  # parent.min_col <= child.min_col
+                    parent_bbox[2] >= child_bbox[2] and  # parent.max_row >= child.max_row
+                    parent_bbox[3] >= child_bbox[3]      # parent.max_col >= child.max_col
+                )
+            else:
+                # Partial overlap - child center is within parent bbox
+                child_center = potential_child.center
+                contains = (
+                    parent_bbox[0] <= child_center[0] <= parent_bbox[2] and
+                    parent_bbox[1] <= child_center[1] <= parent_bbox[3]
+                )
+
+            if contains and potential_parent.area < best_parent_area:
+                best_parent = potential_parent
+                best_parent_area = potential_parent.area
+
+        if best_parent is not None:
+            potential_child.parent = best_parent
+            best_parent.children.append(potential_child)
+
+    # Return only root objects (those with no parent)
+    roots = [obj for obj in candidates if obj.parent is None]
+
+    return roots
+
+
+def get_hierarchy_stats(roots: List[Object]) -> Dict[str, Any]:
+    """Get statistics about a hierarchy for debugging.
+
+    Args:
+        roots: List of root objects from build_containment_hierarchy()
+
+    Returns:
+        Dict with hierarchy statistics including:
+            - num_roots: Number of root objects
+            - total_objects: Total objects in hierarchy
+            - max_depth: Maximum nesting depth
+            - num_composite: Number of composite (non-leaf) objects
+            - num_atomic_roots: Number of root objects with no children
+    """
+    def count_nodes(obj: Object) -> Tuple[int, int]:
+        """Returns (total_nodes, max_depth)"""
+        if obj.is_atomic:
+            return (1, 0)
+        total = 1
+        max_child_depth = 0
+        for child in obj.children:
+            child_total, child_depth = count_nodes(child)
+            total += child_total
+            max_child_depth = max(max_child_depth, child_depth + 1)
+        return (total, max_child_depth)
+
+    total_objects = 0
+    max_depth = 0
+    composite_count = 0
+
+    for root in roots:
+        nodes, depth = count_nodes(root)
+        total_objects += nodes
+        max_depth = max(max_depth, depth)
+        if root.is_composite:
+            composite_count += 1
+
+    return {
+        'num_roots': len(roots),
+        'total_objects': total_objects,
+        'max_depth': max_depth,
+        'num_composite': composite_count,
+        'num_atomic_roots': len(roots) - composite_count,
+    }
+
+
+def get_matchable_objects(objects: List[Object], grid_shape: Optional[Tuple[int, int]] = None) -> List[Object]:
+    """Get objects suitable for correspondence matching.
+
+    For hierarchical objects, returns children if present. For objects without
+    children, only returns them if they're actual patterns (multi-color).
+
+    This handles the asymmetric case where:
+    - Input has flat patterns (no hierarchy)
+    - Output has patterns as children inside divider-created containers
+
+    Key distinction:
+    - Uniform regions (parent with no children, solid color) = empty canvas, not matchable
+    - Patterns (multi-color objects) = matchable
+    - Composite regions (parent with children) = children are matchable
+    - Full-grid objects (object spans entire grid) = always matchable, not a "region"
+
+    This prevents uniform regions (like black areas) from incorrectly matching
+    with novel objects that appear inside them in the output. However, if an
+    entire grid is one color, that IS the output object, not a canvas.
+
+    Args:
+        objects: List of Object instances (may have parent/child relationships)
+        grid_shape: Optional (height, width) tuple of the grid for size thresholding
+
+    Returns:
+        List of objects suitable for matching - either children or multi-color atomic parents.
+
+    Example:
+        >>> output_objs = extract_objects_from_grid(output_grid)  # May have hierarchy
+        >>> matchable = get_matchable_objects(output_objs, grid_shape=output_grid.shape)
+        >>> correspondences = find_correspondences(input_objs, matchable, ...)
+    """
+    result = []
+    for obj in objects:
+        if obj.children:
+            # Composite: use children as the matchable patterns
+            result.extend(obj.children)
+        else:
+            # Atomic: determine if this is a pattern vs a uniform region
+            # A uniform region is a solid-color area that acts as a canvas
+            # for novel objects. We detect this by:
+            # 1. Checking if object fills its bounding box (solid rectangle)
+            # 2. Checking if it's black (color=0) - common canvas color
+            # 3. Checking if it's large enough to be a region
+            is_solid_rectangle = (obj.area == obj.height * obj.width)
+            # is_black = (obj.color == 0)
+
+            # Check if object spans the entire grid - if so, it's the output, not a region
+            is_full_grid = False
+            if grid_shape is not None:
+                grid_area = grid_shape[0] * grid_shape[1]
+                is_large = (obj.area >= (1 / 3) * grid_area)
+                # Full grid = object covers entire grid (same dimensions, starts at origin)
+                is_full_grid = (obj.height == grid_shape[0] and
+                               obj.width == grid_shape[1] and
+                               obj.row == 0 and obj.col == 0)
+            else:
+                is_large = (obj.area > 2)
+
+            if is_full_grid:
+                # Object IS the entire grid - always matchable, not a canvas region
+                result.append(obj)
+            elif is_solid_rectangle and is_large:
+                # Likely a uniform region (canvas) within the grid - don't include
+                # Novel objects that appear here will be detected as unmatched
+                pass
+            else:
+                # Pattern (non-rectangular shape or small non-black solid) - matchable
+                result.append(obj)
+    return result
+
+
+def flatten_hierarchy(objects: List[Object]) -> List[Object]:
+    """Flatten a hierarchy into a single list of all objects.
+
+    Unlike get_matchable_objects, this returns ALL objects (parents AND children).
+    Useful when you need to iterate over every object regardless of hierarchy level.
+
+    Args:
+        objects: List of root Object instances
+
+    Returns:
+        Flat list containing all objects in the hierarchy.
+    """
+    result = []
+    for obj in objects:
+        result.append(obj)
+        if obj.children:
+            result.extend(flatten_hierarchy(obj.children))
+    return result
 
 
 # =============================================================================
@@ -1329,11 +2174,24 @@ def _draw_grid(ax, grid: np.ndarray, title: str = ""):
     ax.axis('off')
 
 
-def _draw_segmentation(ax, grid: np.ndarray, objects: List[Object], title: str = ""):
-    """Draw object segmentation overlay on grid."""
+def _draw_segmentation(ax, grid: np.ndarray, objects: List[Object], title: str = "",
+                       horizontal_dividers: List[Tuple[int, int, int]] = None,
+                       vertical_dividers: List[Tuple[int, int, int]] = None):
+    """Draw object segmentation overlay on grid with dividers and hierarchy.
+
+    Args:
+        ax: Matplotlib axis
+        grid: The grid to draw
+        objects: List of Object instances
+        title: Title for the subplot
+        horizontal_dividers: List of (start_row, end_row, color) for H dividers
+        vertical_dividers: List of (start_col, end_col, color) for V dividers
+    """
     import matplotlib.patches as mpatches
 
     H, W = grid.shape
+    horizontal_dividers = horizontal_dividers or []
+    vertical_dividers = vertical_dividers or []
 
     # Create RGB image (dimmed original)
     rgb_image = np.zeros((H, W, 3), dtype=np.float32)
@@ -1342,33 +2200,111 @@ def _draw_segmentation(ax, grid: np.ndarray, objects: List[Object], title: str =
         mask = (grid == c)
         rgb_image[mask] = color * 0.5  # Dimmed background
 
-    # Overlay object colors
+    # Highlight divider regions with a distinct tint
+    divider_tint = np.array([1.0, 0.3, 0.3])  # Red tint for dividers
+    for start_row, end_row, _ in horizontal_dividers:
+        for r in range(start_row, end_row):
+            rgb_image[r, :] = rgb_image[r, :] * 0.5 + divider_tint * 0.5
+    for start_col, end_col, _ in vertical_dividers:
+        for c in range(start_col, end_col):
+            rgb_image[:, c] = rgb_image[:, c] * 0.5 + divider_tint * 0.5
+
+    # Collect all objects including children for pixel overlay
+    all_objects = []
     for obj in objects:
+        all_objects.append(obj)
+        if obj.children:
+            all_objects.extend(obj.children)
+
+    # Overlay object colors
+    for obj in all_objects:
         obj_color_hex = OBJECT_COLORS[obj.id % len(OBJECT_COLORS)]
         obj_color = np.array([int(obj_color_hex[i:i+2], 16) / 255.0 for i in (1, 3, 5)])
         for (r, c) in obj.pixels:
-            rgb_image[r, c] = obj_color
+            if 0 <= r < H and 0 <= c < W:
+                rgb_image[r, c] = obj_color
 
     ax.imshow(rgb_image, interpolation='nearest')
 
-    # Draw bounding boxes and labels
+    # Draw divider boundary lines (red dashed)
+    for start_row, end_row, div_color in horizontal_dividers:
+        # Draw lines at top and bottom of divider region
+        ax.axhline(y=start_row - 0.5, color='red', linewidth=2, linestyle='--', alpha=0.8)
+        ax.axhline(y=end_row - 0.5, color='red', linewidth=2, linestyle='--', alpha=0.8)
+        # Label the divider
+        mid_row = (start_row + end_row) / 2 - 0.5
+        ax.annotate(f'H-DIV c={div_color}', (W/2, mid_row),
+                   color='red', fontsize=7, fontweight='bold',
+                   ha='center', va='center', alpha=0.9)
+
+    for start_col, end_col, div_color in vertical_dividers:
+        # Draw lines at left and right of divider region
+        ax.axvline(x=start_col - 0.5, color='red', linewidth=2, linestyle='--', alpha=0.8)
+        ax.axvline(x=end_col - 0.5, color='red', linewidth=2, linestyle='--', alpha=0.8)
+        # Label the divider
+        mid_col = (start_col + end_col) / 2 - 0.5
+        ax.annotate(f'V-DIV c={div_color}', (mid_col, H/2),
+                   color='red', fontsize=7, fontweight='bold',
+                   ha='center', va='center', rotation=90, alpha=0.9)
+
+    # Draw bounding boxes and labels - parents first, then children
     for obj in objects:
         obj_color_hex = OBJECT_COLORS[obj.id % len(OBJECT_COLORS)]
-        rect = mpatches.Rectangle(
-            (obj.col - 0.5, obj.row - 0.5),
-            obj.width, obj.height,
-            linewidth=2, edgecolor=obj_color_hex, facecolor='none'
-        )
-        ax.add_patch(rect)
 
-        # Add object ID and color label
-        center_row = obj.row + obj.height / 2
-        center_col = obj.col + obj.width / 2
-        label = f'{obj.id}'
-        ax.annotate(label, (center_col, center_row),
-                   color='white', fontsize=8, fontweight='bold',
-                   ha='center', va='center',
-                   bbox=dict(boxstyle='circle', facecolor=obj_color_hex, alpha=0.9))
+        # Parents get thick solid boxes
+        if obj.is_composite:
+            rect = mpatches.Rectangle(
+                (obj.col - 0.5, obj.row - 0.5),
+                obj.width, obj.height,
+                linewidth=3, edgecolor=obj_color_hex, facecolor='none',
+                linestyle='-'
+            )
+            ax.add_patch(rect)
+
+            # Parent label at top-left corner (inside box) to avoid overlap with children
+            label = f'P{obj.id}'
+            ax.annotate(label, (obj.col - 0.3, obj.row - 0.3),
+                       color='white', fontsize=9, fontweight='bold',
+                       ha='left', va='top',
+                       bbox=dict(boxstyle='round', facecolor=obj_color_hex, alpha=0.9,
+                                edgecolor='white', linewidth=2))
+
+            # Draw children with dashed boxes
+            for child in obj.children:
+                child_color_hex = OBJECT_COLORS[child.id % len(OBJECT_COLORS)]
+                child_rect = mpatches.Rectangle(
+                    (child.col - 0.5, child.row - 0.5),
+                    child.width, child.height,
+                    linewidth=1.5, edgecolor=child_color_hex, facecolor='none',
+                    linestyle='--'
+                )
+                ax.add_patch(child_rect)
+
+                # Child label at center
+                child_center_row = child.row + child.height / 2
+                child_center_col = child.col + child.width / 2
+                child_label = f'C{child.id}'
+                ax.annotate(child_label, (child_center_col, child_center_row),
+                           color='white', fontsize=7, fontweight='bold',
+                           ha='center', va='center',
+                           bbox=dict(boxstyle='circle', facecolor=child_color_hex, alpha=0.85))
+        else:
+            # Atomic objects (no children) - regular boxes
+            rect = mpatches.Rectangle(
+                (obj.col - 0.5, obj.row - 0.5),
+                obj.width, obj.height,
+                linewidth=2, edgecolor=obj_color_hex, facecolor='none'
+            )
+            ax.add_patch(rect)
+
+            # Regular object label at center
+            center_row = obj.row + obj.height / 2
+            center_col = obj.col + obj.width / 2
+            label = f'{obj.id}'
+            ax.annotate(label, (center_col, center_row),
+                       color='white', fontsize=8, fontweight='bold',
+                       ha='center', va='center',
+                       bbox=dict(boxstyle='circle', facecolor=obj_color_hex, alpha=0.9))
 
     # Draw grid lines
     for i in range(H + 1):
@@ -1406,8 +2342,16 @@ class ObjectSegmentationNavigator:
         output_grid = data['output_grid']
         input_objects = data['input_objects']
         output_objects = data['output_objects']
+        input_h_dividers = data.get('input_h_dividers', [])
+        input_v_dividers = data.get('input_v_dividers', [])
+        output_h_dividers = data.get('output_h_dividers', [])
+        output_v_dividers = data.get('output_v_dividers', [])
         example_type = data['type']
         example_num = data['num']
+
+        # Count children for display
+        input_children = sum(len(obj.children) for obj in input_objects)
+        output_children = sum(len(obj.children) for obj in output_objects) if output_objects else 0
 
         # Layout: 2x2 grid (original and segmented for input/output)
         gs = self.fig.add_gridspec(2, 2, wspace=0.15, hspace=0.25)
@@ -1428,14 +2372,28 @@ class ObjectSegmentationNavigator:
 
         # Bottom-left: Input segmentation
         ax_in_seg = self.fig.add_subplot(gs[1, 0])
-        _draw_segmentation(ax_in_seg, input_grid, input_objects,
-                          f"Input Segmentation ({len(input_objects)} objects)")
+        n_dividers_in = len(input_h_dividers) + len(input_v_dividers)
+        title_in = f"Input: {len(input_objects)} obj"
+        if input_children > 0:
+            title_in += f" ({input_children} children)"
+        if n_dividers_in > 0:
+            title_in += f", {n_dividers_in} dividers"
+        _draw_segmentation(ax_in_seg, input_grid, input_objects, title_in,
+                          horizontal_dividers=input_h_dividers,
+                          vertical_dividers=input_v_dividers)
 
         # Bottom-right: Output segmentation
         ax_out_seg = self.fig.add_subplot(gs[1, 1])
         if output_grid is not None and output_objects:
-            _draw_segmentation(ax_out_seg, output_grid, output_objects,
-                              f"Output Segmentation ({len(output_objects)} objects)")
+            n_dividers_out = len(output_h_dividers) + len(output_v_dividers)
+            title_out = f"Output: {len(output_objects)} obj"
+            if output_children > 0:
+                title_out += f" ({output_children} children)"
+            if n_dividers_out > 0:
+                title_out += f", {n_dividers_out} dividers"
+            _draw_segmentation(ax_out_seg, output_grid, output_objects, title_out,
+                              horizontal_dividers=output_h_dividers,
+                              vertical_dividers=output_v_dividers)
         else:
             if output_grid is not None:
                 _draw_grid(ax_out_seg, output_grid, "Output (no objects detected)")
@@ -1475,12 +2433,55 @@ class ObjectSegmentationNavigator:
         plt.show()
 
 
+def _print_object_hierarchy(objects: List[Object], indent: int = 0):
+    """
+    Print objects with their parent/child hierarchy.
+
+    Shows composite objects (parents) with their children indented below them,
+    and marks atomic objects, dividers, and background objects.
+
+    Args:
+        objects: List of objects to print
+        indent: Base indentation level (spaces)
+    """
+    prefix = " " * indent
+
+    # Separate root objects from nested ones
+    root_objects = [obj for obj in objects if obj.is_root]
+
+    def print_obj(obj: Object, level: int = 0):
+        obj_prefix = prefix + "  " * level
+
+        # Build status flags
+        flags = []
+        if obj.is_divider:
+            flags.append("DIVIDER")
+        if obj.is_background:
+            flags.append("BG")
+        if obj.is_composite:
+            flags.append(f"PARENT: {len(obj.children)} children")
+        if obj.is_atomic and not obj.is_divider and not obj.is_background:
+            flags.append("atomic")
+
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+
+        print(f"{obj_prefix}Object {obj.id}: color={obj.color}, size={obj.area}, "
+              f"bbox=({obj.row},{obj.col})-({obj.row+obj.height-1},{obj.col+obj.width-1}){flag_str}")
+
+        # Print children indented
+        for child in obj.children:
+            print_obj(child, level + 1)
+
+    for obj in root_objects:
+        print_obj(obj)
+
+
 def visualize_puzzle_objects(puzzle_id: str, data_root: str = "kaggle/combined"):
     """
     Visualize object segmentation for a specific puzzle.
 
     Shows a scrollable view of all training and test examples with their
-    object segmentations.
+    object segmentations, including divider lines and parent/child hierarchy.
 
     Args:
         puzzle_id: The ARC puzzle ID (e.g., "1990f7a8")
@@ -1502,26 +2503,47 @@ def visualize_puzzle_objects(puzzle_id: str, data_root: str = "kaggle/combined")
         if output_grid is not None:
             print(f"  Output shape: {output_grid.shape}")
 
+        # Detect dividers separately for visualization
+        input_h_div, input_v_div = detect_divider_lines(input_grid)
+        output_h_div, output_v_div = ([], [])
+        if output_grid is not None:
+            output_h_div, output_v_div = detect_divider_lines(output_grid)
+
+        # Print divider info
+        if input_h_div or input_v_div:
+            print(f"  Input dividers: {len(input_h_div)} horizontal, {len(input_v_div)} vertical")
+            for start, end, color in input_h_div:
+                print(f"    H-DIV rows {start}-{end-1}, color={color}")
+            for start, end, color in input_v_div:
+                print(f"    V-DIV cols {start}-{end-1}, color={color}")
+
+        if output_h_div or output_v_div:
+            print(f"  Output dividers: {len(output_h_div)} horizontal, {len(output_v_div)} vertical")
+            for start, end, color in output_h_div:
+                print(f"    H-DIV rows {start}-{end-1}, color={color}")
+            for start, end, color in output_v_div:
+                print(f"    V-DIV cols {start}-{end-1}, color={color}")
+
         # Extract objects
         input_objects = extract_objects_from_grid(input_grid)
         output_objects = extract_objects_from_grid(output_grid) if output_grid is not None else []
 
         print(f"  Input objects: {len(input_objects)}")
-        for obj in input_objects:
-            print(f"    Object {obj.id}: color={obj.color}, size={obj.area}, "
-                  f"bbox=({obj.row},{obj.col})-({obj.row+obj.height-1},{obj.col+obj.width-1})")
+        _print_object_hierarchy(input_objects, indent=4)
 
         if output_objects:
             print(f"  Output objects: {len(output_objects)}")
-            for obj in output_objects:
-                print(f"    Object {obj.id}: color={obj.color}, size={obj.area}, "
-                      f"bbox=({obj.row},{obj.col})-({obj.row+obj.height-1},{obj.col+obj.width-1})")
+            _print_object_hierarchy(output_objects, indent=4)
 
         examples_data.append({
             'input_grid': input_grid,
             'output_grid': output_grid,
             'input_objects': input_objects,
             'output_objects': output_objects,
+            'input_h_dividers': input_h_div,
+            'input_v_dividers': input_v_div,
+            'output_h_dividers': output_h_div,
+            'output_v_dividers': output_v_div,
             'type': 'Training',
             'num': i + 1,
         })
@@ -1536,29 +2558,54 @@ def visualize_puzzle_objects(puzzle_id: str, data_root: str = "kaggle/combined")
         if output_grid is not None:
             print(f"  Output shape: {output_grid.shape}")
 
+        # Detect dividers separately for visualization
+        input_h_div, input_v_div = detect_divider_lines(input_grid)
+        output_h_div, output_v_div = ([], [])
+        if output_grid is not None:
+            output_h_div, output_v_div = detect_divider_lines(output_grid)
+
+        # Print divider info
+        if input_h_div or input_v_div:
+            print(f"  Input dividers: {len(input_h_div)} horizontal, {len(input_v_div)} vertical")
+            for start, end, color in input_h_div:
+                print(f"    H-DIV rows {start}-{end-1}, color={color}")
+            for start, end, color in input_v_div:
+                print(f"    V-DIV cols {start}-{end-1}, color={color}")
+
+        if output_h_div or output_v_div:
+            print(f"  Output dividers: {len(output_h_div)} horizontal, {len(output_v_div)} vertical")
+            for start, end, color in output_h_div:
+                print(f"    H-DIV rows {start}-{end-1}, color={color}")
+            for start, end, color in output_v_div:
+                print(f"    V-DIV cols {start}-{end-1}, color={color}")
+
         # Extract objects
         input_objects = extract_objects_from_grid(input_grid)
         output_objects = extract_objects_from_grid(output_grid) if output_grid is not None else []
 
         print(f"  Input objects: {len(input_objects)}")
-        for obj in input_objects:
-            print(f"    Object {obj.id}: color={obj.color}, size={obj.area}, "
-                  f"bbox=({obj.row},{obj.col})-({obj.row+obj.height-1},{obj.col+obj.width-1})")
+        _print_object_hierarchy(input_objects, indent=4)
 
         if output_objects:
             print(f"  Output objects: {len(output_objects)}")
+            _print_object_hierarchy(output_objects, indent=4)
 
         examples_data.append({
             'input_grid': input_grid,
             'output_grid': output_grid,
             'input_objects': input_objects,
             'output_objects': output_objects,
+            'input_h_dividers': input_h_div,
+            'input_v_dividers': input_v_div,
+            'output_h_dividers': output_h_div,
+            'output_v_dividers': output_v_div,
             'type': 'Test',
             'num': i + 1,
         })
 
     # Show interactive visualization
     print("\nGenerating visualization...")
+    print("Legend: Red dashed lines = dividers, P# = parent objects, C# = child objects")
     navigator = ObjectSegmentationNavigator(puzzle_id, examples_data)
     navigator.show()
 

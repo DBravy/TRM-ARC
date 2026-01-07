@@ -45,7 +45,10 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis_module import ObjectSpec
 
 import numpy as np
 import torch
@@ -59,6 +62,8 @@ import matplotlib.colors as mcolors
 from object_module import (
     NUM_COLORS,
     MAX_OBJECTS,
+    SegmentationMode,
+    SegmentationStrategy,
     extract_connected_components,
     extract_objects_from_grid,
     labels_to_objects,
@@ -81,11 +86,19 @@ from ordering_module import (
     OrderingStrategy,
     ALL_ORDERINGS,
     OrderingEvaluator,
-    screen_orderings_for_puzzle
+    screen_hierarchy_strategies,
+    find_best_ordering,
+    OrderingScreenResult,
+    PerParentOrdering,
+    PerParentOrderingResult,
 )
 
 # Object correspondence matching
-from correspondence_module import find_object_correspondences
+from correspondence_module import (
+    find_object_correspondences,
+    CorrespondenceMode,
+    DEFAULT_MARGIN
+)
 
 # Selection module for ranking-based object selection
 from selection_module import (
@@ -93,6 +106,15 @@ from selection_module import (
     compute_selection_mask,
     SelectionScreener
 )
+
+# Genesis module for novel object creation
+from genesis_module import (
+    find_novel_children,
+    ObjectSpec, ColorSpec, ShapeSpec, PositionSpec,
+    screen_color_hypotheses, screen_position_hypotheses, screen_shape_hypotheses,
+    render_object
+)
+from aggregation_module import aggregate_regions
 
 # Determine device
 if torch.cuda.is_available():
@@ -105,8 +127,9 @@ else:
 GRID_SIZE = 30
 
 # Per-object anchor framing options (from anchor_validation.py)
-FRAMINGS = ['delta', 'grid_tl', 'grid_tr', 'grid_bl', 'grid_br', 'object_relative']
-NUM_FRAMINGS = 6
+# 'genesis' added for novel object creation (objects with no input correspondence)
+FRAMINGS = ['delta', 'grid_tl', 'grid_tr', 'grid_bl', 'grid_br', 'object_relative', 'genesis']
+NUM_FRAMINGS = 7
 
 
 # =============================================================================
@@ -418,6 +441,10 @@ class AnchorFramingModule(nn.Module):
         # Used to determine if training can be skipped
         self.register_buffer('framing_variances', torch.full((max_objects,), float('inf')))
 
+        # Genesis specifications for novel object creation
+        # These are stored as a dictionary (not a tensor) since ObjectSpec is complex
+        self.genesis_specs: Dict[int, 'ObjectSpec'] = {}
+
     def set_framing(self, obj_idx: int, framing: str, reference_idx: int = -1,
                     accuracy: float = 0.0,
                     source_anchor: Optional[AnchorPoint] = None,
@@ -567,6 +594,54 @@ class AnchorFramingModule(nn.Module):
                 if var > max_var:
                     max_var = var
         return max_var
+
+    # -------------------------------------------------------------------------
+    # Genesis Framing Methods
+    # -------------------------------------------------------------------------
+
+    def set_genesis_spec(self, obj_idx: int, spec: 'ObjectSpec'):
+        """
+        Store a genesis specification for generating a novel object.
+
+        Genesis framing is used for objects that have no input correspondence
+        and must be created from scratch based on discovered rules.
+
+        Args:
+            obj_idx: Which object index
+            spec: The ObjectSpec describing how to generate this object
+        """
+        self.genesis_specs[obj_idx] = spec
+        # Also mark this as using genesis framing
+        framing_idx = FRAMINGS.index('genesis')
+        self.selected_framings[obj_idx] = framing_idx
+        self.is_configured[obj_idx] = True
+        self.framing_variances[obj_idx] = spec.variance
+        self.framing_accuracies[obj_idx] = spec.confidence
+
+    def get_genesis_spec(self, obj_idx: int) -> Optional['ObjectSpec']:
+        """
+        Get the genesis specification for an object.
+
+        Args:
+            obj_idx: Which object index
+
+        Returns:
+            ObjectSpec if this object uses genesis framing, None otherwise
+        """
+        return self.genesis_specs.get(obj_idx)
+
+    def has_genesis_spec(self, obj_idx: int) -> bool:
+        """Check if this object has a genesis specification."""
+        framing_idx = self.selected_framings[obj_idx].item()
+        return FRAMINGS[framing_idx] == 'genesis' and obj_idx in self.genesis_specs
+
+    def get_all_genesis_specs(self) -> Dict[int, 'ObjectSpec']:
+        """Get all genesis specifications."""
+        return dict(self.genesis_specs)
+
+    def clear_genesis_specs(self):
+        """Clear all genesis specifications."""
+        self.genesis_specs.clear()
 
 
 def compute_framing_target(
@@ -1426,7 +1501,10 @@ class PositionDataset(torch.utils.data.Dataset):
                  color_only: bool = False, ordering_strategy: Optional[str] = None,
                  predict_absolute: bool = False, per_object_anchor: bool = False,
                  selection_criterion: Optional[str] = None,
-                 selection_rule: Optional[str] = None):
+                 selection_rule: Optional[str] = None,
+                 per_parent_ordering: Optional[PerParentOrderingResult] = None,
+                 correspondence_mode: CorrespondenceMode = "one_to_one",
+                 correspondence_margin: float = DEFAULT_MARGIN):
         self.samples: List[PositionSample] = []
         self.use_color_only = use_color_only
         self.ordering_strategy = ordering_strategy
@@ -1434,6 +1512,9 @@ class PositionDataset(torch.utils.data.Dataset):
         self.per_object_anchor = per_object_anchor
         self.selection_criterion = selection_criterion
         self.selection_rule = selection_rule
+        self.per_parent_ordering = per_parent_ordering
+        self.correspondence_mode = correspondence_mode
+        self.correspondence_margin = correspondence_margin
 
         if puzzle_ids is None:
             puzzle_ids = list(puzzles.keys())
@@ -1566,11 +1647,55 @@ class PositionDataset(torch.utils.data.Dataset):
             output_labels, output_colors,
             iou_threshold=0.0,  # Allow any match with same color
             input_grid=input_grid,
-            output_grid=output_grid
+            output_grid=output_grid,
+            mode=self.correspondence_mode,
+            margin=self.correspondence_margin
         )
 
         if len(matches) == 0:
             return None
+
+        # Reorder input objects so that input[i] maps to output[i]
+        # This ensures consistent object indices across training examples
+        # (objects going to the same output slot always get the same index)
+        if len(matches) == len(input_colors) and len(matches) == len(output_colors):
+            # Sort matches by output index
+            matches_sorted = sorted(matches, key=lambda x: x[1])  # sort by out_idx
+
+            # Build old_idx -> new_idx mapping based on output order
+            old_to_new_input = {}
+            for new_idx, (old_in_idx, out_idx, score) in enumerate(matches_sorted):
+                old_to_new_input[old_in_idx] = new_idx
+
+            # Only reorder if this creates a different ordering
+            needs_reorder = any(old != new for old, new in old_to_new_input.items())
+
+            if needs_reorder:
+                new_input_colors = [None] * len(input_colors)
+                new_input_bboxes = np.zeros_like(input_bboxes)
+                new_input_labels = np.zeros_like(input_labels)
+
+                for old_idx, new_idx in old_to_new_input.items():
+                    new_input_colors[new_idx] = input_colors[old_idx]
+                    new_input_bboxes[new_idx] = input_bboxes[old_idx]
+                    # Relabel: old label (old_idx+1) -> new label (new_idx+1)
+                    new_input_labels[input_labels == old_idx + 1] = new_idx + 1
+
+                input_colors = new_input_colors
+                input_bboxes = new_input_bboxes
+                input_labels = new_input_labels
+
+                # Update selection_mask if it exists
+                if selection_mask is not None:
+                    new_selection_mask = np.zeros_like(selection_mask)
+                    for old_idx, new_idx in old_to_new_input.items():
+                        if old_idx < len(selection_mask):
+                            new_selection_mask[new_idx] = selection_mask[old_idx]
+                    selection_mask = new_selection_mask
+
+                # Update matches to reflect new ordering (now input[i] -> output[i])
+                matches = [(new_idx, new_idx, score)
+                           for new_idx, (_, _, score) in enumerate(matches_sorted)]
 
         # Compute properties
         grid_size = max(input_grid.shape[0], input_grid.shape[1],
@@ -1809,20 +1934,21 @@ def evaluate_per_object_anchor(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
-    grid_size: int = 20,
+    grid_size: int = 30,
     tolerance: float = 0.5
 ) -> Dict:
     """
     Evaluate per-object anchor model using pixel accuracy.
 
-    Note: Since training uses delta targets (not framing-specific targets),
-    we decode predictions as deltas for consistency.
+    Uses framing-specific decoding (decode_per_object_anchor) to properly
+    interpret predictions according to each object's configured framing
+    (delta, grid_tl, object_relative, etc.).
 
     Args:
         model: PerObjectAnchorTransformModule
         dataloader: DataLoader
         device: Device
-        grid_size: Grid dimension for coordinate scaling
+        grid_size: Grid dimension for coordinate scaling (default 30 to match GRID_SIZE)
         tolerance: Pixels within this distance count as correct
 
     Returns:
@@ -1860,25 +1986,42 @@ def evaluate_per_object_anchor(
             total_loss += loss.item() * matched_mask.sum().item()
             total_samples += matched_mask.sum().item()
 
-            # Compute pixel accuracy
-            # Since training uses delta targets, decode predictions as deltas:
-            # predicted_position = input_centroid + prediction * grid_size
-            input_centroids_pixels = centroids * grid_size  # (B, K, 2)
-            predicted_positions = input_centroids_pixels + predictions * grid_size  # (B, K, 2)
+            # Compute pixel accuracy using proper framing-specific decoding
+            B, K, _ = predictions.shape
+            input_centroids_pixels = (centroids * grid_size).cpu().numpy()
+            input_bboxes_pixels = (bboxes * grid_size).cpu().numpy()
+            predictions_np = predictions.cpu().numpy()
+            valid_np = valid.cpu().numpy()
+            matched_mask_np = matched_mask.cpu().numpy()
 
             # Get target output centroids from bboxes (center of bbox)
             target_centroids = (target_output_bboxes[..., :2] + target_output_bboxes[..., 2:]) / 2 * grid_size
+            target_centroids_np = target_centroids.cpu().numpy()
 
-            # Compute pixel error
-            pixel_errors = torch.sqrt(((predicted_positions - target_centroids) ** 2).sum(dim=-1))
+            # Decode predictions for each batch item using framing-specific logic
+            for b in range(B):
+                decoded_positions = decode_per_object_anchor(
+                    predictions_np[b],
+                    model.anchor_module,
+                    input_centroids_pixels[b],
+                    grid_size, grid_size,
+                    valid_np[b],
+                    input_bboxes=input_bboxes_pixels[b]
+                )
 
-            # Count correct predictions (within tolerance)
-            correct = ((pixel_errors <= tolerance) & matched_mask).sum().item()
-            total_correct += correct
+                # Compute pixel error for each object
+                for obj_idx in range(K):
+                    if not matched_mask_np[b, obj_idx]:
+                        continue
 
-            # Sum pixel errors for matched objects
-            total_pixel_error += (pixel_errors * matched_mask.float()).sum().item()
-            total_objects += matched_mask.sum().item()
+                    pred_pos = decoded_positions[obj_idx]
+                    target_pos = target_centroids_np[b, obj_idx]
+                    error = np.sqrt(((pred_pos - target_pos) ** 2).sum())
+
+                    if error <= tolerance:
+                        total_correct += 1
+                    total_pixel_error += error
+                    total_objects += 1
 
     return {
         'loss': total_loss / max(total_samples, 1),
@@ -2181,6 +2324,158 @@ def evaluate_no_train(
         'total_samples': total_samples,
         'per_object_accuracy': per_object_acc,
     }
+
+
+def evaluate_grid_accuracy(
+    puzzles: Dict,
+    puzzle_id: str,
+    model: nn.Module,
+    device: torch.device,
+    use_color_only: bool = False,
+    ordering_strategy: Optional[str] = None,
+    predict_absolute: bool = False,
+    per_object_anchor: bool = False,
+    selection_criterion: Optional[str] = None,
+    selection_rule: Optional[str] = None,
+    no_train: bool = False,
+    include_test: bool = False,
+    segmentation_mode: Optional[SegmentationMode] = None
+) -> Dict:
+    """
+    Evaluate grid-level pixel accuracy by comparing predicted grids to actual output grids.
+
+    This compares the entire reconstructed output grid pixel-by-pixel against the
+    ground truth output grid, rather than just checking object positions.
+
+    Args:
+        puzzles: Dictionary of puzzles
+        puzzle_id: ID of puzzle to evaluate
+        model: Trained model (or model with screening offsets)
+        device: Torch device
+        use_color_only: DEPRECATED - use segmentation_mode instead
+        ordering_strategy: Optional ordering strategy name
+        predict_absolute: If True, model predicts absolute positions
+        per_object_anchor: If True, use per-object anchor framing
+        selection_criterion: Optional ranking criterion for selection
+        selection_rule: Optional selection rule
+        no_train: If True, use screening offsets directly
+        include_test: If True, also evaluate on test examples
+        segmentation_mode: How to segment objects (CONNECTIVITY, PIXEL, or COLOR)
+
+    Returns:
+        Dict with train_accuracy, test_accuracy (if applicable), and per-example details
+    """
+    if puzzle_id not in puzzles:
+        return {'train_accuracy': 0.0, 'error': 'Puzzle not found'}
+
+    puzzle = puzzles[puzzle_id]
+    train_examples = puzzle.get('train', [])
+    test_examples = puzzle.get('test', []) if include_test else []
+
+    results = {
+        'train_correct': 0,
+        'train_total': len(train_examples),
+        'train_pixel_correct': 0,
+        'train_pixel_total': 0,
+        'train_per_example': [],
+    }
+
+    model.eval()
+
+    # Evaluate training examples
+    for i, example in enumerate(train_examples):
+        input_grid = np.array(example['input'])
+        output_grid = np.array(example['output'])
+        output_size = output_grid.shape
+
+        predicted_grid = apply_predicted_transformation(
+            input_grid, model, device, use_color_only, ordering_strategy,
+            predict_absolute, per_object_anchor,
+            output_size=output_size,
+            selection_criterion=selection_criterion,
+            selection_rule=selection_rule,
+            no_train=no_train,
+            segmentation_mode=segmentation_mode
+        )
+
+        # Compare pixel by pixel
+        if predicted_grid.shape == output_grid.shape:
+            matching_pixels = np.sum(predicted_grid == output_grid)
+            total_pixels = output_grid.size
+            is_exact_match = np.array_equal(predicted_grid, output_grid)
+        else:
+            # Shape mismatch - count as all wrong
+            matching_pixels = 0
+            total_pixels = output_grid.size
+            is_exact_match = False
+
+        results['train_pixel_correct'] += matching_pixels
+        results['train_pixel_total'] += total_pixels
+        if is_exact_match:
+            results['train_correct'] += 1
+
+        results['train_per_example'].append({
+            'example_idx': i,
+            'exact_match': is_exact_match,
+            'pixel_accuracy': matching_pixels / total_pixels if total_pixels > 0 else 0.0,
+            'matching_pixels': matching_pixels,
+            'total_pixels': total_pixels,
+        })
+
+    results['train_accuracy'] = results['train_correct'] / max(results['train_total'], 1)
+    results['train_pixel_accuracy'] = results['train_pixel_correct'] / max(results['train_pixel_total'], 1)
+
+    # Evaluate test examples if requested
+    if include_test and test_examples:
+        results['test_correct'] = 0
+        results['test_total'] = 0
+        results['test_pixel_correct'] = 0
+        results['test_pixel_total'] = 0
+        results['test_per_example'] = []
+
+        for i, example in enumerate(test_examples):
+            if 'output' not in example:
+                continue  # Skip if no ground truth
+
+            input_grid = np.array(example['input'])
+            output_grid = np.array(example['output'])
+            output_size = output_grid.shape
+            results['test_total'] += 1
+
+            predicted_grid = apply_predicted_transformation(
+                input_grid, model, device, use_color_only, ordering_strategy,
+                predict_absolute, per_object_anchor,
+                output_size=output_size,
+                selection_criterion=selection_criterion,
+                selection_rule=selection_rule,
+                no_train=no_train,
+                segmentation_mode=segmentation_mode
+            )
+
+            if predicted_grid.shape == output_grid.shape:
+                matching_pixels = np.sum(predicted_grid == output_grid)
+                total_pixels = output_grid.size
+                is_exact_match = np.array_equal(predicted_grid, output_grid)
+            else:
+                matching_pixels = 0
+                total_pixels = output_grid.size
+                is_exact_match = False
+
+            results['test_pixel_correct'] += matching_pixels
+            results['test_pixel_total'] += total_pixels
+            if is_exact_match:
+                results['test_correct'] += 1
+
+            results['test_per_example'].append({
+                'example_idx': i,
+                'exact_match': is_exact_match,
+                'pixel_accuracy': matching_pixels / total_pixels if total_pixels > 0 else 0.0,
+            })
+
+        results['test_accuracy'] = results['test_correct'] / max(results['test_total'], 1)
+        results['test_pixel_accuracy'] = results['test_pixel_correct'] / max(results['test_pixel_total'], 1)
+
+    return results
 
 
 class SimpleObjectPredictor(nn.Module):
@@ -2874,12 +3169,16 @@ class AnchorScreeningTrainer:
             prev_result = results.get(obj_idx - 1)
 
             # Check if this object could benefit from pattern inheritance
-            if (result['framing'] != 'object_relative' and
+            # Inherit when: no anchor points discovered (either non-object_relative framing,
+            # or object_relative with only 1 example so discovery returned None)
+            needs_inheritance = (
                 result['discovered_relation'] is None and
                 prev_result is not None and
                 prev_result['framing'] == 'object_relative' and
                 prev_result['discovered_relation'] is not None and
-                prev_result['discovered_relation'].variance < 0.01):
+                prev_result['discovered_relation'].variance < 0.01
+            )
+            if needs_inheritance:
 
                 # Inherit the pattern: use object_relative to previous object
                 # with the same anchor relationship
@@ -2905,6 +3204,159 @@ class AnchorScreeningTrainer:
 
         self.results = results
         return results
+
+
+def discover_genesis_for_puzzle(
+    puzzles: Dict,
+    puzzle_id: str,
+    anchor_module: 'AnchorFramingModule',
+    verbose: bool = False,
+    segmentation_strategy: Optional[SegmentationStrategy] = None
+) -> List[ObjectSpec]:
+    """
+    Discover genesis rules for novel children in the puzzle.
+
+    This function finds children that appear in output but not input,
+    and discovers rules for creating them.
+
+    Args:
+        puzzles: Dictionary of all puzzles
+        puzzle_id: ID of the puzzle to analyze
+        anchor_module: The anchor module to store genesis specs
+        verbose: Print detailed info
+        segmentation_strategy: How to segment input/output grids
+
+    Returns:
+        List of discovered ObjectSpecs
+    """
+    if segmentation_strategy is None:
+        segmentation_strategy = SegmentationStrategy()
+
+    if puzzle_id not in puzzles:
+        return []
+
+    puzzle = puzzles[puzzle_id]
+    examples = puzzle.get('train', [])
+
+    if not examples:
+        return []
+
+    # Process each example to find novel children
+    novel_per_ex = []
+    input_objs_per_ex = []
+    output_objs_per_ex = []
+    input_grids = []
+    grid_sizes = []
+    regions_per_ex = []
+
+    for ex in examples:
+        if 'output' not in ex:
+            continue
+
+        input_grid = np.array(ex['input'])
+        output_grid = np.array(ex['output'])
+
+        input_objects = extract_objects_from_grid(input_grid, segmentation_mode=segmentation_strategy.get_mode("input"))
+        output_objects = extract_objects_from_grid(output_grid, segmentation_mode=segmentation_strategy.get_mode("output"))
+
+        novel = find_novel_children(input_objects, output_objects, input_grid, output_grid)
+        regions = aggregate_regions(input_grid, input_objects)
+
+        novel_per_ex.append(novel)
+        input_objs_per_ex.append(input_objects)
+        output_objs_per_ex.append(output_objects)
+        input_grids.append(input_grid)
+        grid_sizes.append(output_grid.shape)
+        regions_per_ex.append(regions)
+
+    # Check if there are novel children
+    novel_counts = [len(n) for n in novel_per_ex]
+    if not any(c > 0 for c in novel_counts):
+        if verbose:
+            print("  No novel children found")
+        return []
+
+    # Check consistency
+    if not all(c == novel_counts[0] for c in novel_counts):
+        if verbose:
+            print(f"  Warning: Inconsistent novel child counts: {novel_counts}")
+        # Use minimum count
+        min_count = min(novel_counts)
+        for i in range(len(novel_per_ex)):
+            novel_per_ex[i] = novel_per_ex[i][:min_count]
+
+    num_novel = novel_counts[0] if novel_counts else 0
+    if num_novel == 0:
+        return []
+
+    if verbose:
+        print(f"  Found {num_novel} novel child(ren) per example")
+
+    # Discover specs for each novel child
+    discovered_specs = []
+
+    for novel_idx in range(num_novel):
+        # Collect this novel child across all examples
+        novel_at_idx = [[ex[novel_idx]] if novel_idx < len(ex) else []
+                        for ex in novel_per_ex]
+
+        if any(len(n) == 0 for n in novel_at_idx):
+            continue
+
+        # Screen color hypotheses
+        color_hyps = screen_color_hypotheses(
+            novel_at_idx, input_objs_per_ex, input_grids, regions_per_ex
+        )
+
+        # Screen position hypotheses
+        pos_hyps = screen_position_hypotheses(
+            novel_at_idx, input_objs_per_ex, output_objs_per_ex,
+            grid_sizes, regions_per_ex
+        )
+
+        # Screen shape hypotheses
+        shape_hyps = screen_shape_hypotheses(
+            novel_at_idx, input_objs_per_ex, input_grids
+        )
+
+        # Get best hypotheses
+        best_color = color_hyps[0][0] if color_hyps else ColorSpec.literal(0)
+        best_pos = pos_hyps[0][0] if pos_hyps else PositionSpec.grid_relative(
+            AnchorPoint.CENTER
+        )
+        best_shape = shape_hyps[0][0] if shape_hyps else ShapeSpec.pixel()
+
+        # Compute confidence
+        color_conf = color_hyps[0][1] if color_hyps else 0.0
+        pos_var = pos_hyps[0][1] if pos_hyps else float('inf')
+        shape_conf = shape_hyps[0][1] if shape_hyps else 0.0
+
+        confidence = (color_conf + shape_conf) / 2.0 if pos_var < 1e-6 else 0.0
+
+        spec = ObjectSpec(
+            color=best_color,
+            shape=best_shape,
+            position=best_pos,
+            confidence=confidence,
+            variance=pos_var,
+            discovered_from_examples=len(examples)
+        )
+
+        discovered_specs.append(spec)
+
+        if verbose:
+            print(f"  Novel child {novel_idx}: {spec.describe()}")
+            print(f"    Confidence: {confidence:.1%}, Position variance: {pos_var:.6f}")
+
+        # Assign a unique object index for this genesis object
+        # Use indices after max regular objects
+        genesis_obj_idx = MAX_OBJECTS - 1 - novel_idx
+        anchor_module.set_genesis_spec(genesis_obj_idx, spec)
+
+        if verbose:
+            print(f"    Stored as genesis object {genesis_obj_idx}")
+
+    return discovered_specs
 
 
 # =============================================================================
@@ -2996,7 +3448,8 @@ class InteractiveGridViewer:
                  verbose: bool = False,
                  selection_criterion: Optional[str] = None,
                  selection_rule: Optional[str] = None,
-                 no_train: bool = False):
+                 no_train: bool = False,
+                 segmentation_mode: Optional[SegmentationMode] = None):
         self.puzzle_id = puzzle_id
         self.model = model
         self.device = device
@@ -3008,6 +3461,7 @@ class InteractiveGridViewer:
         self.selection_criterion = selection_criterion
         self.selection_rule = selection_rule
         self.no_train = no_train
+        self.segmentation_mode = segmentation_mode
 
         # Create color map
         self.cmap = mcolors.ListedColormap(ARC_COLORS)
@@ -3030,7 +3484,8 @@ class InteractiveGridViewer:
                 self.predict_absolute, self.per_object_anchor,
                 verbose=False, output_size=output_size,
                 selection_criterion=self.selection_criterion, selection_rule=self.selection_rule,
-                no_train=self.no_train
+                no_train=self.no_train,
+                segmentation_mode=self.segmentation_mode
             )
             self.examples.append({
                 'type': 'train',
@@ -3058,7 +3513,8 @@ class InteractiveGridViewer:
                 self.predict_absolute, self.per_object_anchor,
                 verbose=verbose, output_size=output_size,
                 selection_criterion=self.selection_criterion, selection_rule=self.selection_rule,
-                no_train=self.no_train
+                no_train=self.no_train,
+                segmentation_mode=self.segmentation_mode
             )
             self.examples.append(entry)
 
@@ -3157,7 +3613,8 @@ def visualize_grids(puzzles: Dict, puzzle_id: str, model: nn.Module,
                     verbose: bool = False,
                     selection_criterion: Optional[str] = None,
                     selection_rule: Optional[str] = None,
-                    no_train: bool = False):
+                    no_train: bool = False,
+                    segmentation_mode: Optional[SegmentationMode] = None):
     """
     Visualize the training pairs and test prediction with actual grid shapes.
     Uses an interactive viewer with keyboard navigation.
@@ -3178,7 +3635,8 @@ def visualize_grids(puzzles: Dict, puzzle_id: str, model: nn.Module,
                                    ordering_strategy, predict_absolute,
                                    per_object_anchor, verbose=verbose,
                                    selection_criterion=selection_criterion, selection_rule=selection_rule,
-                                   no_train=no_train)
+                                   no_train=no_train,
+                                   segmentation_mode=segmentation_mode)
     viewer.show()
 
 
@@ -3188,7 +3646,8 @@ def save_overview_image(puzzles: Dict, puzzle_id: str, model: nn.Module,
                         per_object_anchor: bool = False,
                         selection_criterion: Optional[str] = None,
                         selection_rule: Optional[str] = None,
-                        no_train: bool = False):
+                        no_train: bool = False,
+                        segmentation_mode: Optional[SegmentationMode] = None):
     """Save a static overview image of all examples."""
     puzzle = puzzles[puzzle_id]
     train_examples = puzzle.get('train', [])
@@ -3232,7 +3691,8 @@ def save_overview_image(puzzles: Dict, puzzle_id: str, model: nn.Module,
             predict_absolute, per_object_anchor,
             output_size=output_size,
             selection_criterion=selection_criterion, selection_rule=selection_rule,
-            no_train=no_train
+            no_train=no_train,
+            segmentation_mode=segmentation_mode
         )
         axes[i, 2].imshow(predicted_grid, cmap=cmap, norm=norm)
         axes[i, 2].set_title(f'Train {i+1} Pred', fontsize=10)
@@ -3272,7 +3732,8 @@ def save_overview_image(puzzles: Dict, puzzle_id: str, model: nn.Module,
             predict_absolute, per_object_anchor,
             output_size=output_size,
             selection_criterion=selection_criterion, selection_rule=selection_rule,
-            no_train=no_train
+            no_train=no_train,
+            segmentation_mode=segmentation_mode
         )
         axes[row, 2].imshow(predicted_grid, cmap=cmap, norm=norm)
         axes[row, 2].set_title(f'Test {i+1} Pred', fontsize=10)
@@ -3782,7 +4243,8 @@ def apply_predicted_transformation(input_grid: np.ndarray, model: nn.Module,
                                      output_size: tuple = None,
                                      selection_criterion: Optional[str] = None,
                                      selection_rule: Optional[str] = None,
-                                     no_train: bool = False
+                                     no_train: bool = False,
+                                     segmentation_mode: Optional[SegmentationMode] = None
                                      ) -> np.ndarray:
     """
     Apply the model's predicted position deltas to create a predicted output grid.
@@ -3791,7 +4253,7 @@ def apply_predicted_transformation(input_grid: np.ndarray, model: nn.Module,
         input_grid: Input grid to transform
         model: Trained position prediction model
         device: Torch device
-        use_color_only: If True, use color-based object extraction
+        use_color_only: DEPRECATED - use segmentation_mode instead
         ordering_strategy: Optional ordering strategy name (e.g., 'left_to_right', 'top_to_bottom')
         predict_absolute: If True, model predicts absolute positions instead of deltas
         per_object_anchor: If True, use per-object anchor framing decoding
@@ -3800,15 +4262,20 @@ def apply_predicted_transformation(input_grid: np.ndarray, model: nn.Module,
         selection_criterion: Optional ranking criterion for object selection (e.g., 'largest', 'smallest')
         selection_rule: Optional selection rule (e.g., 'top_1', 'top_2')
         no_train: If True, use screening offsets directly instead of model predictions
+        segmentation_mode: How to segment objects (CONNECTIVITY, PIXEL, or COLOR)
     """
     H, W = input_grid.shape
     # Use output_size if provided, otherwise default to input size
     out_H, out_W = output_size if output_size is not None else (H, W)
     grid_size = max(H, W, out_H, out_W, GRID_SIZE)
 
+    # Resolve segmentation mode (backward compatibility)
+    if segmentation_mode is None:
+        segmentation_mode = SegmentationMode.COLOR if use_color_only else SegmentationMode.CONNECTIVITY
+
     # Extract objects from input
     input_labels, input_colors, input_bboxes, _ = extract_connected_components(
-        input_grid, use_color_only=use_color_only
+        input_grid, segmentation_mode=segmentation_mode
     )
 
     if len(input_colors) == 0:
@@ -4015,14 +4482,30 @@ def apply_predicted_transformation(input_grid: np.ndarray, model: nn.Module,
         delta_row = min(delta_row, out_H - 1 - current_max_row)
         delta_col = min(delta_col, out_W - 1 - current_max_col)
 
-        # Move each pixel of the object
+        # Move each pixel of the object, preserving original colors
         for r, c in zip(rows, cols):
             new_r = r + delta_row
             new_c = c + delta_col
 
             # Check bounds against output grid size
             if 0 <= new_r < out_H and 0 <= new_c < out_W:
-                output_grid[new_r, new_c] = obj_color
+                # Use actual input pixel color, not region's mode color
+                output_grid[new_r, new_c] = input_grid[r, c]
+
+    # Render genesis objects (novel children)
+    if per_object_anchor and hasattr(model, 'anchor_module'):
+        genesis_specs = model.anchor_module.get_all_genesis_specs()
+        if genesis_specs:
+            # Get input objects for reference
+            input_objects = extract_objects_from_grid(input_grid, segmentation_mode=segmentation_mode)
+            regions = aggregate_regions(input_grid, input_objects)
+
+            for obj_idx, spec in genesis_specs.items():
+                # Render the genesis object directly onto the output grid
+                render_object(spec, output_grid, input_grid, input_objects, None, regions)
+
+                if verbose:
+                    print(f"Genesis object {obj_idx}: rendered {spec.describe()}")
 
     return output_grid
 
@@ -4046,7 +4529,20 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
 
     parser.add_argument("--object-by-color", action="store_true",
-                        help="Use color-based object extraction (one object per color)")
+                        help="DEPRECATED: Use --segmentation-mode color instead")
+    parser.add_argument("--segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Object segmentation mode for BOTH grids (shorthand). "
+                             "Use --input-segmentation-mode and --output-segmentation-mode for different modes.")
+    parser.add_argument("--input-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for INPUT grids (overrides --segmentation-mode)")
+    parser.add_argument("--output-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for OUTPUT grids (overrides --segmentation-mode)")
 
     # Ordering strategy flags
     parser.add_argument("--ordering-strategy", type=str,
@@ -4087,6 +4583,17 @@ def main():
                         help="Selection rule to apply (e.g., top_1, top_2)")
     parser.add_argument("--screen-selection", action="store_true",
                         help="Auto-screen to find best selection criterion and rule for this puzzle")
+    parser.add_argument("--screen-hierarchy", action="store_true",
+                        help="Auto-screen to determine if hierarchical object representation is beneficial")
+
+    # Correspondence matching flags
+    parser.add_argument("--correspondence-mode", type=str, default="one_to_one",
+                        choices=["one_to_one", "many_to_one", "one_to_many"],
+                        help="Correspondence matching mode: one_to_one (default), "
+                             "many_to_one (multiple inputs to one output), "
+                             "one_to_many (one input to multiple outputs)")
+    parser.add_argument("--correspondence-margin", type=float, default=DEFAULT_MARGIN,
+                        help=f"For non-one_to_one modes, how close to best score to allow secondary matches (default: {DEFAULT_MARGIN})")
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-visualize", action="store_true",
@@ -4098,6 +4605,27 @@ def main():
 
     args = parser.parse_args()
 
+    # Build segmentation strategy from arguments
+    # Priority: specific mode > general mode > default (connectivity)
+    # Also handle backward compatibility with --object-by-color
+    if args.object_by_color:
+        base_mode = SegmentationMode.COLOR
+    elif args.segmentation_mode:
+        base_mode = SegmentationMode(args.segmentation_mode)
+    else:
+        base_mode = SegmentationMode.CONNECTIVITY
+
+    input_segmentation_mode = SegmentationMode(args.input_segmentation_mode) if args.input_segmentation_mode else base_mode
+    output_segmentation_mode = SegmentationMode(args.output_segmentation_mode) if args.output_segmentation_mode else base_mode
+
+    segmentation_strategy = SegmentationStrategy(
+        input_mode=input_segmentation_mode,
+        output_mode=output_segmentation_mode
+    )
+
+    # For backward compatibility, keep segmentation_mode as input mode (most common use case)
+    segmentation_mode = input_segmentation_mode
+
     # Set seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -4105,7 +4633,7 @@ def main():
 
     print(f"Device: {DEVICE}")
     print(f"Puzzle: {args.puzzle_id}")
-    print(f"Object extraction: {'by-color' if args.object_by_color else 'connected-components'}")
+    print(f"Object segmentation: {segmentation_strategy}")
     if args.per_object_anchor:
         print("Decoding mode: PER-OBJECT ANCHOR (discovers per-object-index framings via screening)")
         print(f"  Screening epochs per framing: {args.screening_epochs}")
@@ -4116,6 +4644,8 @@ def main():
         print(f"Augmentation: {args.num_augmentations} samples ({aug_type})")
     else:
         print("Augmentation: disabled")
+    if args.correspondence_mode != "one_to_one":
+        print(f"Correspondence mode: {args.correspondence_mode} (margin={args.correspondence_margin})")
 
     # Load puzzles
     print("\nLoading puzzles...")
@@ -4181,13 +4711,18 @@ def main():
         ordering_strategy = 'left_to_right'
         explicit_ordering = True
 
+    # Per-parent ordering result (populated if find_best_ordering selects per_parent mode)
+    per_parent_ordering_result: Optional[PerParentOrderingResult] = None
+
     if args.screen_ordering:
         print("\n" + "=" * 60)
-        print("ORDERING SCREENING")
+        print("ORDERING SCREENING (unified: global + per-parent)")
         print("=" * 60)
 
         puzzle = puzzles[args.puzzle_id]
-        screen_results = screen_orderings_for_puzzle(
+
+        # Use unified find_best_ordering which handles both global and per-parent orderings
+        ordering_screen_result = find_best_ordering(
             puzzle,
             verbose=args.verbose,
             selection_criterion=selection_criterion,
@@ -4195,16 +4730,25 @@ def main():
             use_color_only=args.object_by_color
         )
 
-        screened_ordering = screen_results['best_name']
+        print(f"\nBest ordering configuration found:")
+        print(f"  Mode: {ordering_screen_result.best_mode}")
+        print(f"  Strategy: {ordering_screen_result.best_ordering_name}")
+        print(f"  Consistent: {ordering_screen_result.is_consistent}")
+        print(f"  Has hierarchy: {ordering_screen_result.has_hierarchy}")
 
-        print(f"\nBest ordering strategy found:")
-        print(f"  Strategy: {screened_ordering}")
-        print(f"  Consistent framings: {screen_results['is_consistent']}")
+        if ordering_screen_result.best_mode == 'per_parent' and ordering_screen_result.per_parent_result:
+            per_parent_result = ordering_screen_result.per_parent_result
+            print(f"\nPer-parent ordering details:")
+            print(f"  Child ordering: {per_parent_result.child_ordering.name}")
+            print(f"  Avg variance: {per_parent_result.avg_variance:.4f}")
+            print(f"  Learned offsets by child index:")
+            for idx, offset in sorted(per_parent_result.learned_offsets.items()):
+                print(f"    Index {idx}: parent + {offset}")
 
-        # Show all results if verbose
+        # Show all global results if verbose
         if args.verbose:
-            print("\nAll ordering results:")
-            for name, result in screen_results['all_results'].items():
+            print("\nAll global ordering results:")
+            for name, result in ordering_screen_result.global_results.items():
                 status = "CONSISTENT" if result.get('consistent', False) else "inconsistent"
                 num_framings = result.get('num_framings', 0)
                 print(f"  {name:20s}: {status} ({num_framings} framings)")
@@ -4213,13 +4757,48 @@ def main():
         if explicit_ordering:
             print(f"\n*** Using explicitly provided ordering: {ordering_strategy} (overriding screening) ***")
         else:
-            ordering_strategy = screened_ordering
+            # Use global ordering name (per-parent mode uses child_ordering internally)
+            if ordering_screen_result.best_mode == 'per_parent':
+                # For per-parent mode, use the child ordering strategy for global sorting
+                # but also store the per-parent result for later use
+                ordering_strategy = ordering_screen_result.per_parent_result.child_ordering.name
+                per_parent_ordering_result = ordering_screen_result.per_parent_result
+                print(f"\n*** Using per-parent ordering with child strategy: {ordering_strategy} ***")
+            else:
+                ordering_strategy = ordering_screen_result.best_ordering_name
 
     # Print ordering config
     if ordering_strategy:
         print(f"\nObject ordering: {ordering_strategy}")
     else:
         print("\nObject ordering: disabled (extraction order)")
+
+    # Hierarchy screening
+    use_hierarchy = False
+    hierarchy_results = None
+    if args.screen_hierarchy:
+        print("\n" + "=" * 60)
+        print("HIERARCHY SCREENING")
+        print("=" * 60)
+
+        puzzle = puzzles[args.puzzle_id]
+        hierarchy_results = screen_hierarchy_strategies(puzzle, verbose=args.verbose)
+
+        use_hierarchy = hierarchy_results['use_hierarchy']
+        if use_hierarchy:
+            print(f"\n*** Hierarchy mode selected ***")
+            print(f"  Hierarchy score (variance): {hierarchy_results['hierarchy_score']:.4f}")
+            if hierarchy_results['hierarchy_stats']:
+                stats = hierarchy_results['hierarchy_stats']
+                print(f"  Composite roots: {stats['num_composite']}")
+                print(f"  Max depth: {stats['max_depth']}")
+            if hierarchy_results['parent_child_relations']:
+                rel = hierarchy_results['parent_child_relations'][0]
+                print(f"  Best parent-child relation: {rel.relation.describe()}")
+        else:
+            print(f"\n*** Flat mode selected (hierarchy not beneficial) ***")
+            print(f"  Flat score: {hierarchy_results['flat_score']:.4f}")
+            print(f"  Hierarchy score: {hierarchy_results['hierarchy_score']:.4f}")
 
     # Create TRAINING dataset (train examples only)
     print("\nCreating training dataset (train pairs only)...")
@@ -4235,7 +4814,10 @@ def main():
         predict_absolute=args.predict_absolute,
         per_object_anchor=args.per_object_anchor,
         selection_criterion=selection_criterion,
-        selection_rule=selection_rule
+        selection_rule=selection_rule,
+        per_parent_ordering=per_parent_ordering_result,
+        correspondence_mode=args.correspondence_mode,
+        correspondence_margin=args.correspondence_margin
     )
 
     if len(train_dataset) == 0:
@@ -4267,7 +4849,10 @@ def main():
         predict_absolute=args.predict_absolute,
         per_object_anchor=args.per_object_anchor,
         selection_criterion=selection_criterion,
-        selection_rule=selection_rule
+        selection_rule=selection_rule,
+        per_parent_ordering=per_parent_ordering_result,
+        correspondence_mode=args.correspondence_mode,
+        correspondence_margin=args.correspondence_margin
     )
 
     has_test_data = len(test_dataset) > 0
@@ -4319,6 +4904,21 @@ def main():
         print("\nScreening Results:")
         max_obj = max(sum(s.input_valid) for s in train_dataset.samples) if train_dataset.samples else 0
         print(model.get_framing_summary(max_obj))
+
+        # Phase 1b: Genesis discovery - find novel children and create rules for them
+        print("\n" + "-" * 40)
+        print("GENESIS DISCOVERY (novel children)")
+        print("-" * 40)
+        genesis_specs = discover_genesis_for_puzzle(
+            puzzles, args.puzzle_id, model.anchor_module, verbose=args.verbose,
+            segmentation_strategy=segmentation_strategy
+        )
+        if genesis_specs:
+            print(f"Discovered {len(genesis_specs)} genesis rule(s)")
+            for i, spec in enumerate(genesis_specs):
+                print(f"  Genesis {i}: {spec.describe()}")
+        else:
+            print("No genesis rules needed (no novel children)")
 
         # Check if all configured objects have low variance - auto-skip training if so
         auto_no_train = False
@@ -4480,6 +5080,37 @@ def main():
             visualize_predictions(model, test_dataset, DEVICE,
                                   title="Test Set Predictions")
 
+    # Grid-level pixel accuracy evaluation
+    print("\n" + "=" * 60)
+    print("Grid Pixel Accuracy")
+    print("=" * 60)
+    grid_results = evaluate_grid_accuracy(
+        puzzles, args.puzzle_id, model, DEVICE,
+        use_color_only=args.object_by_color,
+        ordering_strategy=ordering_strategy,
+        predict_absolute=args.predict_absolute,
+        per_object_anchor=args.per_object_anchor,
+        selection_criterion=selection_criterion,
+        selection_rule=selection_rule,
+        no_train=skip_training,
+        include_test=has_test_data,
+        segmentation_mode=segmentation_mode
+    )
+    print(f"\n--- Training Set ---")
+    print(f"Grid Accuracy: {grid_results['train_accuracy']:.1%} ({grid_results['train_correct']}/{grid_results['train_total']} exact matches)")
+    print(f"Pixel Accuracy: {grid_results['train_pixel_accuracy']:.1%} ({grid_results['train_pixel_correct']}/{grid_results['train_pixel_total']} pixels)")
+    for ex in grid_results['train_per_example']:
+        status = "PASS" if ex['exact_match'] else "FAIL"
+        print(f"  Example {ex['example_idx'] + 1}: {status} ({ex['pixel_accuracy']:.1%} pixels correct)")
+
+    if has_test_data and 'test_accuracy' in grid_results:
+        print(f"\n--- Test Set ---")
+        print(f"Grid Accuracy: {grid_results['test_accuracy']:.1%} ({grid_results['test_correct']}/{grid_results['test_total']} exact matches)")
+        print(f"Pixel Accuracy: {grid_results['test_pixel_accuracy']:.1%} ({grid_results['test_pixel_correct']}/{grid_results['test_pixel_total']} pixels)")
+        for ex in grid_results['test_per_example']:
+            status = "PASS" if ex['exact_match'] else "FAIL"
+            print(f"  Example {ex['example_idx'] + 1}: {status} ({ex['pixel_accuracy']:.1%} pixels correct)")
+
     # Visualize grids with matplotlib
     if not args.no_visualize:
         print("\n" + "=" * 60)
@@ -4490,7 +5121,8 @@ def main():
                         args.predict_absolute,
                         args.per_object_anchor, verbose=args.verbose,
                         selection_criterion=selection_criterion, selection_rule=selection_rule,
-                        no_train=skip_training)
+                        no_train=skip_training,
+                        segmentation_mode=segmentation_mode)
 
     print("\nDone!")
 

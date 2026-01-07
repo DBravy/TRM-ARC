@@ -5,18 +5,75 @@ This module provides functions for finding correspondences between input and out
 objects in ARC puzzles. It uses shape features including structural properties,
 Hu moments, color distribution, Fourier descriptors, and location encoding.
 
+Canonical Functions (use these):
+    find_correspondences: Shape-based matching with hierarchy support
+    find_unmatched_objects: Find novel objects (no input correspondence)
+
+Constants:
+    CorrespondenceMode: Type alias for valid mode strings
+    DEFAULT_MARGIN: Default margin value (0.1) for non-one_to_one modes
+
+Correspondence Modes:
+    - "one_to_one": Each input matches at most one output and vice versa (default)
+    - "many_to_one": Multiple inputs can map to one output (outputs used once)
+    - "one_to_many": One input can map to multiple outputs (inputs used once)
+
 Usage:
-    from correspondence_module import find_object_correspondences, compute_iou
+    from correspondence_module import (
+        find_correspondences, find_unmatched_objects,
+        CorrespondenceMode, DEFAULT_MARGIN
+    )
+
+    # Find correspondences with hierarchy support (default: one-to-one)
+    correspondences, in_objs, out_objs = find_correspondences(
+        input_grid, output_grid, input_objects, output_objects
+    )
+
+    # Many-to-one: multiple inputs can map to one output
+    correspondences, in_objs, out_objs = find_correspondences(
+        input_grid, output_grid, input_objects, output_objects,
+        mode="many_to_one", margin=0.1
+    )
+
+    # One-to-many: one input can map to multiple outputs
+    correspondences, in_objs, out_objs = find_correspondences(
+        input_grid, output_grid, input_objects, output_objects,
+        mode="one_to_many", margin=0.15
+    )
+
+    # Find novel objects (output objects with no input match)
+    _, novel_objects, _ = find_unmatched_objects(
+        input_grid, output_grid, input_objects, output_objects
+    )
 
     # Command-line visualization:
     python correspondence_module.py --puzzle-id 1990f7a8
+    python correspondence_module.py --puzzle-id 1990f7a8 --segmentation-mode pixel
+
+    # Different segmentation for input vs output grids:
+    python correspondence_module.py --puzzle-id 1990f7a8 \\
+        --input-segmentation-mode connectivity \\
+        --output-segmentation-mode pixel
 """
 
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Literal
 from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
 from scipy.ndimage import label as scipy_label, binary_fill_holes
+
+from object_module import get_matchable_objects, SegmentationMode, SegmentationStrategy
+
+
+# =============================================================================
+# Correspondence Modes
+# =============================================================================
+
+# Valid correspondence mode strings
+CorrespondenceMode = Literal["one_to_one", "many_to_one", "one_to_many"]
+
+# Default margin for non-strict matching modes
+DEFAULT_MARGIN = 0.1
 
 
 # =============================================================================
@@ -628,12 +685,25 @@ def find_correspondences_greedy_shape(
     input_grid: np.ndarray,
     output_grid: np.ndarray,
     threshold: float = 0.3,
-    weights: Optional[Dict[str, float]] = None
+    weights: Optional[Dict[str, float]] = None,
+    shape_match_threshold: float = 0.85,
+    mode: CorrespondenceMode = "one_to_one",
+    margin: float = DEFAULT_MARGIN
 ) -> List[Tuple[int, int, float]]:
-    """Find correspondences using shape features with greedy one-to-one matching.
+    """Find correspondences using shape features with configurable matching mode.
 
-    This uses the shape feature system (structural, moments, color, Fourier, location)
-    but enforces one-to-one matching by greedily selecting the best matches first.
+    Strategy: Shape takes priority over location.
+    1. First compute shape-only similarity (no location features)
+    2. If an input has exactly one output with high shape similarity → match directly
+    3. Only when multiple outputs have similar shapes, use location as tiebreaker
+
+    Modes:
+        - "one_to_one": Each input matches at most one output and vice versa (default)
+        - "many_to_one": Multiple inputs can map to one output (outputs used once)
+        - "one_to_many": One input can map to multiple outputs (inputs used once)
+
+    For many_to_one and one_to_many modes, margin controls how close to the best
+    score a secondary match must be to be included.
 
     Args:
         input_masks: (N, H_in, W_in) array of binary masks
@@ -641,51 +711,179 @@ def find_correspondences_greedy_shape(
         input_grid: (H_in, W_in) color grid for shape features
         output_grid: (H_out, W_out) color grid for shape features
         threshold: Minimum similarity to consider a match
-        weights: Optional dict with feature weights
+        weights: Optional dict with feature weights (used for location tiebreaker)
+        shape_match_threshold: Similarity threshold to consider shapes "identical" (default 0.85)
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
 
     Returns:
         List of (input_idx, output_idx, similarity_score) sorted by score (highest first)
     """
-    similarity, valid_input_idx, valid_output_idx = compute_shape_similarity_matrix(
-        input_masks, output_masks, input_grid, output_grid, weights
+    # Step 1: Compute shape-only similarity (without location)
+    shape_only_weights = {
+        'structural': 1.0,
+        'moments': 1.0,
+        'color': 1.0,
+        'fourier': 1.0,
+        'location': 0.0,  # No location for shape matching
+    }
+    shape_similarity, valid_input_idx, valid_output_idx = compute_shape_similarity_matrix(
+        input_masks, output_masks, input_grid, output_grid, shape_only_weights
     )
 
-    if similarity.size == 0:
+    if shape_similarity.size == 0:
         return []
 
-    # Greedy one-to-one matching
-    matches = []
-    used_input = set()
-    used_output = set()
     num_in = len(valid_input_idx)
     num_out = len(valid_output_idx)
 
-    while True:
-        # Find best remaining match
-        best_score = -1
-        best_i, best_j = -1, -1
+    # Step 2: Extract features for location tiebreaking (computed lazily)
+    extractor = ShapeFeatureExtractor(n_fourier_coefficients=32)
+    input_features = None
+    output_features = None
 
-        for i in range(num_in):
-            if i in used_input:
-                continue
-            for j in range(num_out):
-                if j in used_output:
+    def get_features():
+        nonlocal input_features, output_features
+        if input_features is None:
+            input_features = []
+            for idx in valid_input_idx:
+                input_features.append(extractor.extract(input_masks[idx], input_grid))
+            output_features = []
+            for idx in valid_output_idx:
+                output_features.append(extractor.extract(output_masks[idx], output_grid))
+        return input_features, output_features
+
+    # Step 3: Mode-aware matching
+    matches = []
+    used_input = set()
+    used_output = set()
+
+    if mode == "one_to_one":
+        # Greedy one-to-one matching (original behavior)
+        while True:
+            best_score = -1
+            best_i, best_j = -1, -1
+
+            for i in range(num_in):
+                if i in used_input:
                     continue
-                if similarity[i, j] > best_score:
-                    best_score = similarity[i, j]
-                    best_i, best_j = i, j
 
-        if best_score < threshold:
-            break
+                # Find candidates: outputs with shape similarity above threshold
+                candidates = []
+                for j in range(num_out):
+                    if j in used_output:
+                        continue
+                    if shape_similarity[i, j] >= threshold:
+                        candidates.append((j, shape_similarity[i, j]))
 
-        # Map back to original indices
-        in_idx = valid_input_idx[best_i]
-        out_idx = valid_output_idx[best_j]
-        matches.append((in_idx, out_idx, best_score))
-        used_input.add(best_i)
-        used_output.add(best_j)
+                if not candidates:
+                    continue
 
-    # Sort by score (highest first)
+                # Sort by shape similarity
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                best_shape_score = candidates[0][1]
+
+                # Check if there are multiple candidates with similar shape scores
+                similar_shape_candidates = [
+                    (j, s) for j, s in candidates
+                    if s >= best_shape_score - 0.05  # Within 5% of best shape match
+                ]
+
+                if len(similar_shape_candidates) == 1:
+                    # Unique best shape match - use it directly
+                    j, score = similar_shape_candidates[0]
+                    if score > best_score:
+                        best_score = score
+                        best_i, best_j = i, j
+                else:
+                    # Multiple similar shapes - use location as tiebreaker
+                    in_feats, out_feats = get_features()
+                    best_combined = -1
+                    best_j_for_i = -1
+
+                    for j, shape_score in similar_shape_candidates:
+                        # Compute location similarity
+                        loc1 = np.array([in_feats[i].centroid_y, in_feats[i].centroid_x])
+                        loc2 = np.array([out_feats[j].centroid_y, out_feats[j].centroid_x])
+                        loc_dist = np.linalg.norm(loc1 - loc2)
+                        loc_similarity = np.exp(-2.0 * loc_dist)
+
+                        # Shape is primary (90%), location is tiebreaker (10%)
+                        combined = 0.9 * shape_score + 0.1 * loc_similarity
+
+                        if combined > best_combined:
+                            best_combined = combined
+                            best_j_for_i = j
+
+                    if best_combined > best_score:
+                        best_score = best_combined
+                        best_i = i
+                        best_j = best_j_for_i
+
+            if best_score < threshold:
+                break
+
+            # Map back to original indices
+            in_idx = valid_input_idx[best_i]
+            out_idx = valid_output_idx[best_j]
+            matches.append((in_idx, out_idx, best_score))
+            used_input.add(best_i)
+            used_output.add(best_j)
+
+    elif mode == "many_to_one":
+        # Many-to-one: multiple inputs can map to one output
+        # For each output, find all inputs within margin of the best
+        for j in range(num_out):
+            # Find all inputs above threshold for this output
+            candidates = []
+            for i in range(num_in):
+                if shape_similarity[i, j] >= threshold:
+                    candidates.append((i, shape_similarity[i, j]))
+
+            if not candidates:
+                continue
+
+            # Sort by score descending
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_score = candidates[0][1]
+
+            # Include all inputs within margin of best
+            for i, score in candidates:
+                if score >= best_score - margin:
+                    in_idx = valid_input_idx[i]
+                    out_idx = valid_output_idx[j]
+                    matches.append((in_idx, out_idx, score))
+
+    elif mode == "one_to_many":
+        # One-to-many: one input can map to multiple outputs
+        # For each input, find all outputs within margin of the best
+        for i in range(num_in):
+            # Find all outputs above threshold for this input
+            candidates = []
+            for j in range(num_out):
+                if shape_similarity[i, j] >= threshold:
+                    candidates.append((j, shape_similarity[i, j]))
+
+            if not candidates:
+                continue
+
+            # Sort by score descending
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_score = candidates[0][1]
+
+            # Include all outputs within margin of best
+            for j, score in candidates:
+                if score >= best_score - margin:
+                    in_idx = valid_input_idx[i]
+                    out_idx = valid_output_idx[j]
+                    matches.append((in_idx, out_idx, score))
+
+    else:
+        raise ValueError(f"Unknown correspondence mode: {mode}. "
+                        f"Valid modes: 'one_to_one', 'many_to_one', 'one_to_many'")
+
+    # Sort by score (highest first) and deduplicate
+    matches = list(set(matches))
     matches.sort(key=lambda x: x[2], reverse=True)
     return matches
 
@@ -696,12 +894,24 @@ def find_object_correspondences_shape(
     input_objects: List,
     output_objects: List,
     threshold: float = 0.3,
-    weights: Optional[Dict[str, float]] = None
+    weights: Optional[Dict[str, float]] = None,
+    shape_match_threshold: float = 0.85,
+    mode: CorrespondenceMode = "one_to_one",
+    margin: float = DEFAULT_MARGIN
 ) -> List[Tuple[int, int, float]]:
     """Find correspondences between Object instances using shape features.
 
     This is a convenience function that converts Object instances (with row, col,
     height, width, pixels attributes) to masks and uses shape feature matching.
+
+    Strategy: Shape takes priority over location.
+    - If two regions have the exact same shape, that is a correspondence
+    - Only when multiple items have the same shape is location used as tiebreaker
+
+    Modes:
+        - "one_to_one": Each input matches at most one output and vice versa (default)
+        - "many_to_one": Multiple inputs can map to one output
+        - "one_to_many": One input can map to multiple outputs
 
     Args:
         input_grid: The input grid array
@@ -710,6 +920,9 @@ def find_object_correspondences_shape(
         output_objects: List of output objects with pixels attribute
         threshold: Minimum similarity threshold for a match
         weights: Optional dict with feature weights
+        shape_match_threshold: Similarity threshold to consider shapes "identical" (default 0.85)
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
 
     Returns:
         List of (input_idx, output_idx, score) tuples
@@ -732,8 +945,169 @@ def find_object_correspondences_shape(
             output_masks[i, r, c] = True
 
     return find_correspondences_greedy_shape(
-        input_masks, output_masks, input_grid, output_grid, threshold, weights
+        input_masks, output_masks, input_grid, output_grid, threshold, weights,
+        shape_match_threshold, mode, margin
     )
+
+
+# =============================================================================
+# Canonical Correspondence Functions
+# =============================================================================
+
+def find_correspondences(
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    input_objects: List,
+    output_objects: List,
+    threshold: float = 0.3,
+    use_matchable: bool = True,
+    weights: Optional[Dict[str, float]] = None,
+    shape_match_threshold: float = 0.85,
+    mode: CorrespondenceMode = "one_to_one",
+    margin: float = DEFAULT_MARGIN
+) -> Tuple[List[Tuple[int, int, float]], List, List]:
+    """
+    Canonical correspondence function: shape-based matching with hierarchy support.
+
+    This is THE function to use for finding correspondences between input and output
+    objects. It combines:
+    - Rich shape features (structural, Hu moments, color distribution, Fourier descriptors)
+    - Hierarchy awareness via get_matchable_objects()
+    - Configurable matching mode (one-to-one, many-to-one, one-to-many)
+
+    Modes:
+        - "one_to_one": Each input matches at most one output and vice versa (default)
+        - "many_to_one": Multiple inputs can map to one output (outputs used once)
+        - "one_to_many": One input can map to multiple outputs (inputs used once)
+
+    Args:
+        input_grid: The input grid array (H_in, W_in)
+        output_grid: The output grid array (H_out, W_out)
+        input_objects: List of input Object instances (may have parent/child hierarchy)
+        output_objects: List of output Object instances (may have parent/child hierarchy)
+        threshold: Minimum similarity threshold for a valid match (default 0.3)
+        use_matchable: If True (default), applies get_matchable_objects() to handle
+                      asymmetric hierarchies where input patterns are roots but
+                      output patterns are children inside divider-created containers.
+        weights: Optional dict with feature weights for shape similarity:
+                 {'structural': 1.0, 'moments': 1.0, 'color': 1.0, 'fourier': 1.0, 'location': 1.0}
+        shape_match_threshold: Similarity threshold to consider shapes "identical" for
+                              direct matching without location tiebreaker (default 0.85)
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
+
+    Returns:
+        Tuple of:
+        - correspondences: List of (input_idx, output_idx, score) tuples.
+          Indices refer to positions in the matchable lists (if use_matchable=True)
+          or the original lists (if use_matchable=False).
+        - input_matchable: The list of input objects used for matching
+        - output_matchable: The list of output objects used for matching
+
+    Example:
+        >>> correspondences, in_objs, out_objs = find_correspondences(
+        ...     input_grid, output_grid, input_objects, output_objects
+        ... )
+        >>> # Find unmatched output objects (novel objects)
+        >>> matched_out_idxs = {out_idx for _, out_idx, _ in correspondences}
+        >>> novel = [obj for i, obj in enumerate(out_objs) if i not in matched_out_idxs]
+    """
+    if not input_objects or not output_objects:
+        return [], [], []
+
+    # Apply hierarchy handling if requested
+    if use_matchable:
+        input_matchable = get_matchable_objects(input_objects, grid_shape=input_grid.shape)
+        output_matchable = get_matchable_objects(output_objects, grid_shape=output_grid.shape)
+    else:
+        input_matchable = list(input_objects)
+        output_matchable = list(output_objects)
+
+    if not input_matchable or not output_matchable:
+        return [], input_matchable, output_matchable
+
+    # Use shape-based matching
+    correspondences = find_object_correspondences_shape(
+        input_grid, output_grid,
+        input_matchable, output_matchable,
+        threshold=threshold,
+        weights=weights,
+        shape_match_threshold=shape_match_threshold,
+        mode=mode,
+        margin=margin
+    )
+
+    return correspondences, input_matchable, output_matchable
+
+
+def find_unmatched_objects(
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    input_objects: List,
+    output_objects: List,
+    threshold: float = 0.3,
+    use_matchable: bool = True,
+    weights: Optional[Dict[str, float]] = None,
+    shape_match_threshold: float = 0.85,
+    mode: CorrespondenceMode = "one_to_one",
+    margin: float = DEFAULT_MARGIN
+) -> Tuple[List, List, List[Tuple[int, int, float]]]:
+    """
+    Find objects that have no correspondence (novel objects).
+
+    This is a convenience function built on find_correspondences() that returns
+    the unmatched objects directly.
+
+    Args:
+        input_grid: The input grid array
+        output_grid: The output grid array
+        input_objects: List of input Object instances
+        output_objects: List of output Object instances
+        threshold: Minimum similarity threshold for a valid match
+        use_matchable: If True, handle hierarchies via get_matchable_objects()
+        weights: Optional dict with feature weights for shape similarity
+        shape_match_threshold: Similarity for "identical" shapes
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
+
+    Returns:
+        Tuple of:
+        - unmatched_input: List of input objects with no output correspondence
+        - unmatched_output: List of output objects with no input correspondence (novel)
+        - correspondences: The correspondence list for reference
+
+    Example:
+        >>> _, novel_objects, _ = find_unmatched_objects(
+        ...     input_grid, output_grid, input_objects, output_objects
+        ... )
+        >>> print(f"Found {len(novel_objects)} novel objects")
+    """
+    correspondences, input_matchable, output_matchable = find_correspondences(
+        input_grid, output_grid,
+        input_objects, output_objects,
+        threshold=threshold,
+        use_matchable=use_matchable,
+        weights=weights,
+        shape_match_threshold=shape_match_threshold,
+        mode=mode,
+        margin=margin
+    )
+
+    # Find matched indices
+    matched_input_idxs = {in_idx for in_idx, _, _ in correspondences}
+    matched_output_idxs = {out_idx for _, out_idx, _ in correspondences}
+
+    # Collect unmatched objects
+    unmatched_input = [
+        obj for i, obj in enumerate(input_matchable)
+        if i not in matched_input_idxs
+    ]
+    unmatched_output = [
+        obj for i, obj in enumerate(output_matchable)
+        if i not in matched_output_idxs
+    ]
+
+    return unmatched_input, unmatched_output, correspondences
 
 
 # =============================================================================
@@ -879,7 +1253,9 @@ def find_object_correspondences(
     output_colors: List[int],
     iou_threshold: float = 0.1,
     input_grid: Optional[np.ndarray] = None,
-    output_grid: Optional[np.ndarray] = None
+    output_grid: Optional[np.ndarray] = None,
+    mode: CorrespondenceMode = "one_to_one",
+    margin: float = DEFAULT_MARGIN
 ) -> List[Tuple[int, int, float]]:
     """
     Find correspondences between input and output objects.
@@ -892,6 +1268,11 @@ def find_object_correspondences(
 
     When objects move (IoU=0), pattern matching becomes the primary discriminator.
 
+    Modes:
+        - "one_to_one": Each input matches at most one output and vice versa (default)
+        - "many_to_one": Multiple inputs can map to one output (outputs used once)
+        - "one_to_many": One input can map to multiple outputs (inputs used once)
+
     Args:
         input_labels: Label mask for input (each object has unique label 1, 2, ...)
         input_colors: Dominant color for each input object (indexed by label - 1)
@@ -900,6 +1281,8 @@ def find_object_correspondences(
         iou_threshold: Minimum score threshold for a match
         input_grid: Original input grid (optional, enables pattern matching)
         output_grid: Original output grid (optional, enables pattern matching)
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
 
     Returns:
         List of (input_idx, output_idx, score) tuples, where indices are 0-based.
@@ -964,40 +1347,94 @@ def find_object_correspondences(
                 # No grids provided - fall back to original behavior
                 similarity[i, j] = 0.5 * iou + 0.5 * area_ratio
 
-    # Greedy matching
+    # Mode-aware matching
     matches = []
     used_input = set()
     used_output = set()
 
-    while True:
-        # Find best remaining match
-        best_score = -1
-        best_i, best_j = -1, -1
+    if mode == "one_to_one":
+        # Greedy one-to-one matching (original behavior)
+        while True:
+            # Find best remaining match
+            best_score = -1
+            best_i, best_j = -1, -1
 
-        for i in range(num_input):
-            if i in used_input:
-                continue
-            for j in range(num_output):
-                if j in used_output:
+            for i in range(num_input):
+                if i in used_input:
                     continue
-                if similarity[i, j] > best_score:
-                    best_score = similarity[i, j]
-                    best_i, best_j = i, j
+                for j in range(num_output):
+                    if j in used_output:
+                        continue
+                    if similarity[i, j] > best_score:
+                        best_score = similarity[i, j]
+                        best_i, best_j = i, j
 
-        if best_score < iou_threshold:
-            break
+            if best_score < iou_threshold:
+                break
 
-        matches.append((best_i, best_j, best_score))
-        used_input.add(best_i)
-        used_output.add(best_j)
+            matches.append((best_i, best_j, best_score))
+            used_input.add(best_i)
+            used_output.add(best_j)
 
+    elif mode == "many_to_one":
+        # Many-to-one: multiple inputs can map to one output
+        # For each output, find all inputs within margin of the best
+        for j in range(num_output):
+            # Find all inputs above threshold for this output
+            candidates = []
+            for i in range(num_input):
+                if similarity[i, j] >= iou_threshold:
+                    candidates.append((i, similarity[i, j]))
+
+            if not candidates:
+                continue
+
+            # Sort by score descending
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_score = candidates[0][1]
+
+            # Include all inputs within margin of best
+            for i, score in candidates:
+                if score >= best_score - margin:
+                    matches.append((i, j, score))
+
+    elif mode == "one_to_many":
+        # One-to-many: one input can map to multiple outputs
+        # For each input, find all outputs within margin of the best
+        for i in range(num_input):
+            # Find all outputs above threshold for this input
+            candidates = []
+            for j in range(num_output):
+                if similarity[i, j] >= iou_threshold:
+                    candidates.append((j, similarity[i, j]))
+
+            if not candidates:
+                continue
+
+            # Sort by score descending
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_score = candidates[0][1]
+
+            # Include all outputs within margin of best
+            for j, score in candidates:
+                if score >= best_score - margin:
+                    matches.append((i, j, score))
+
+    else:
+        raise ValueError(f"Unknown correspondence mode: {mode}. "
+                        f"Valid modes: 'one_to_one', 'many_to_one', 'one_to_many'")
+
+    # Sort by score (highest first) and deduplicate
+    matches = list(set(matches))
+    matches.sort(key=lambda x: x[2], reverse=True)
     return matches
 
 
 def find_object_correspondences_from_objects(
     input_objects: List,
     output_objects: List,
-    iou_threshold: float = 0.1
+    iou_threshold: float = 0.1,
+    use_matchable: bool = True
 ) -> List[Tuple[int, int, float]]:
     """
     Find correspondences between input and output Object instances.
@@ -1009,10 +1446,23 @@ def find_object_correspondences_from_objects(
         input_objects: List of input Object instances with color and pixels attributes
         output_objects: List of output Object instances
         iou_threshold: Minimum score threshold for a valid match
+        use_matchable: If True (default), applies get_matchable_objects() to handle
+                      asymmetric hierarchies where input patterns are roots but
+                      output patterns are children inside divider-created containers.
 
     Returns:
-        List of (input_idx, output_idx, score) tuples
+        List of (input_idx, output_idx, score) tuples.
+        Note: When use_matchable=True, indices refer to positions in the
+        matchable object lists, not the original input/output object lists.
     """
+    if not input_objects or not output_objects:
+        return []
+
+    # Apply get_matchable_objects to handle asymmetric hierarchies
+    if use_matchable:
+        input_objects = get_matchable_objects(input_objects)
+        output_objects = get_matchable_objects(output_objects)
+
     if not input_objects or not output_objects:
         return []
 
@@ -1138,7 +1588,8 @@ def find_correspondences_by_pattern(
     output_grid: np.ndarray,
     input_objects: List,
     output_objects: List,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    use_matchable: bool = True
 ) -> List[Tuple[int, int, float]]:
     """
     Find correspondences by comparing actual pixel patterns.
@@ -1152,10 +1603,23 @@ def find_correspondences_by_pattern(
         input_objects: List of input objects with row, col, height, width attributes
         output_objects: List of output objects with row, col, height, width attributes
         threshold: Minimum pattern similarity threshold for a match
+        use_matchable: If True (default), applies get_matchable_objects() to handle
+                      asymmetric hierarchies where input patterns are roots but
+                      output patterns are children inside divider-created containers.
 
     Returns:
-        List of (input_idx, output_idx, score) tuples
+        List of (input_idx, output_idx, score) tuples.
+        Note: When use_matchable=True, indices refer to positions in the
+        matchable object lists, not the original input/output object lists.
     """
+    if not input_objects or not output_objects:
+        return []
+
+    # Apply get_matchable_objects to handle asymmetric hierarchies
+    if use_matchable:
+        input_objects = get_matchable_objects(input_objects, grid_shape=input_grid.shape)
+        output_objects = get_matchable_objects(output_objects, grid_shape=output_grid.shape)
+
     if not input_objects or not output_objects:
         return []
 
@@ -1206,6 +1670,127 @@ def find_correspondences_by_pattern(
         used_output.add(best_j)
 
     return matches
+
+
+# =============================================================================
+# Hierarchical Correspondence Matching
+# =============================================================================
+
+def find_hierarchical_correspondences(
+    input_roots: List,
+    output_roots: List,
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    threshold: float = 0.5
+) -> List[Tuple]:
+    """Find correspondences respecting object hierarchy.
+
+    Strategy: Match at root level first, then recursively match children
+    within matched parents. This enables scoped matching where objects
+    are matched within their container context.
+
+    Args:
+        input_roots: Root objects from input grid hierarchy
+                     (from build_containment_hierarchy)
+        output_roots: Root objects from output grid hierarchy
+        input_grid: Full input grid for pattern extraction
+        output_grid: Full output grid for pattern extraction
+        threshold: Minimum pattern similarity for a match
+
+    Returns:
+        List of (input_obj, output_obj) correspondence pairs,
+        including both root and descendant matches.
+
+    Example:
+        >>> input_roots = extract_objects_from_grid(input_grid, build_hierarchy=True)
+        >>> output_roots = extract_objects_from_grid(output_grid, build_hierarchy=True)
+        >>> correspondences = find_hierarchical_correspondences(
+        ...     input_roots, output_roots, input_grid, output_grid
+        ... )
+    """
+    all_correspondences = []
+
+    # Step 1: Match root-level objects
+    root_matches = find_correspondences_by_pattern(
+        input_grid, output_grid,
+        input_roots, output_roots,
+        threshold=threshold
+    )
+
+    # Step 2: For each matched root pair, add to correspondences and match children
+    for in_idx, out_idx, score in root_matches:
+        input_root = input_roots[in_idx]
+        output_root = output_roots[out_idx]
+        all_correspondences.append((input_root, output_root))
+
+        # Recursively match children if both have children
+        if (hasattr(input_root, 'children') and hasattr(output_root, 'children')
+            and input_root.children and output_root.children):
+            child_correspondences = match_children_within_parents(
+                input_root, output_root,
+                input_grid, output_grid,
+                threshold=threshold
+            )
+            all_correspondences.extend(child_correspondences)
+
+    return all_correspondences
+
+
+def match_children_within_parents(
+    input_parent,
+    output_parent,
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    threshold: float = 0.5
+) -> List[Tuple]:
+    """Match children of two corresponding parent objects.
+
+    Recursively matches children within the context of their parents,
+    enabling scoped correspondence discovery.
+
+    Args:
+        input_parent: Parent object from input (with .children attribute)
+        output_parent: Parent object from output (with .children attribute)
+        input_grid: Full input grid for pattern extraction
+        output_grid: Full output grid for pattern extraction
+        threshold: Minimum pattern similarity for a match
+
+    Returns:
+        List of (input_child, output_child) correspondence pairs,
+        including nested children.
+    """
+    correspondences = []
+
+    input_children = getattr(input_parent, 'children', [])
+    output_children = getattr(output_parent, 'children', [])
+
+    if not input_children or not output_children:
+        return correspondences
+
+    # Match children using pattern similarity
+    child_matches = find_correspondences_by_pattern(
+        input_grid, output_grid,
+        input_children, output_children,
+        threshold=threshold
+    )
+
+    # Add matched children and recursively match their children
+    for in_idx, out_idx, score in child_matches:
+        input_child = input_children[in_idx]
+        output_child = output_children[out_idx]
+        correspondences.append((input_child, output_child))
+
+        # Recurse for nested hierarchy
+        if (hasattr(input_child, 'children') and hasattr(output_child, 'children')
+            and input_child.children and output_child.children):
+            nested_correspondences = match_children_within_parents(
+                input_child, output_child,
+                input_grid, output_grid,
+                threshold=threshold
+            )
+            correspondences.extend(nested_correspondences)
+
+    return correspondences
 
 
 # =============================================================================
@@ -1421,21 +2006,32 @@ class CorrespondenceNavigator:
 
 
 def visualize_puzzle_correspondences(puzzle_id: str, data_root: str = "kaggle/combined",
-                                      threshold: float = 0.3):
+                                      threshold: float = 0.3,
+                                      strategy: SegmentationStrategy = None,
+                                      mode: CorrespondenceMode = "one_to_one",
+                                      margin: float = DEFAULT_MARGIN):
     """
     Visualize object correspondences for a specific puzzle.
 
     Uses shape features (structural, moments, color, Fourier, location) with
-    greedy one-to-one matching.
+    configurable matching mode.
 
     Args:
         puzzle_id: The ARC puzzle ID (e.g., "1990f7a8")
         data_root: Path to puzzle data
         threshold: Minimum similarity score for correspondence matching
+        strategy: Segmentation strategy (can specify different modes for input/output)
+        mode: Correspondence mode - "one_to_one", "many_to_one", or "one_to_many"
+        margin: For non-one_to_one modes, how close to best score to allow secondary matches
     """
     from object_module import extract_objects_from_grid
 
+    # Default strategy if none provided
+    if strategy is None:
+        strategy = SegmentationStrategy()
+
     print(f"Loading puzzle: {puzzle_id}")
+    print(f"Segmentation strategy: {strategy}")
     puzzle = _load_puzzle(puzzle_id, data_root)
     print(f"Found {len(puzzle['train'])} training examples")
 
@@ -1451,16 +2047,20 @@ def visualize_puzzle_correspondences(puzzle_id: str, data_root: str = "kaggle/co
         print(f"\nProcessing example {i + 1}...")
         print(f"  Input shape: {input_grid.shape}, Output shape: {output_grid.shape}")
 
-        # Extract objects
-        input_objects = extract_objects_from_grid(input_grid)
-        output_objects = extract_objects_from_grid(output_grid)
+        # Extract objects using strategy-determined modes
+        input_mode = strategy.get_mode("input")
+        output_mode = strategy.get_mode("output")
+        input_objects = extract_objects_from_grid(input_grid, segmentation_mode=input_mode)
+        output_objects = extract_objects_from_grid(output_grid, segmentation_mode=output_mode)
 
         print(f"  Input objects: {len(input_objects)}, Output objects: {len(output_objects)}")
 
-        # Find correspondences using shape features (greedy one-to-one)
+        # Find correspondences using shape features
         correspondences = find_object_correspondences_shape(
             input_grid, output_grid, input_objects, output_objects,
-            threshold=threshold
+            threshold=threshold,
+            mode=mode,
+            margin=margin
         )
 
         print(f"  Found {len(correspondences)} correspondences:")
@@ -1499,6 +2099,11 @@ if __name__ == "__main__":
 Examples:
     python correspondence_module.py --puzzle-id 1990f7a8
     python correspondence_module.py --puzzle-id 009d5c81 --threshold 0.3
+    python correspondence_module.py --puzzle-id 1990f7a8 --segmentation-mode pixel
+    python correspondence_module.py --puzzle-id 1990f7a8 --correspondence-mode many_to_one --correspondence-margin 0.1
+
+    # Different segmentation for input vs output:
+    python correspondence_module.py --puzzle-id 1990f7a8 --input-segmentation-mode connectivity --output-segmentation-mode pixel
         """
     )
 
@@ -1508,11 +2113,47 @@ Examples:
                         help="Path to puzzle data")
     parser.add_argument("--threshold", type=float, default=0.3,
                         help="Minimum shape similarity threshold for correspondences (default: 0.3)")
+    parser.add_argument("--segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Object segmentation mode for BOTH input and output (shorthand). "
+                             "Use --input-segmentation-mode and --output-segmentation-mode for different modes.")
+    parser.add_argument("--input-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for INPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--output-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for OUTPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--correspondence-mode", type=str,
+                        choices=['one_to_one', 'many_to_one', 'one_to_many'],
+                        default='one_to_one',
+                        help="Correspondence matching mode: one_to_one (default), "
+                             "many_to_one (multiple inputs to one output), "
+                             "one_to_many (one input to multiple outputs)")
+    parser.add_argument("--correspondence-margin", type=float, default=DEFAULT_MARGIN,
+                        help=f"For non-one_to_one modes, how close to best score to allow secondary matches (default: {DEFAULT_MARGIN})")
 
     args = parser.parse_args()
+
+    # Build segmentation strategy from arguments
+    # Priority: specific mode > general mode > default (connectivity)
+    base_mode = SegmentationMode(args.segmentation_mode) if args.segmentation_mode else SegmentationMode.CONNECTIVITY
+    input_mode = SegmentationMode(args.input_segmentation_mode) if args.input_segmentation_mode else base_mode
+    output_mode = SegmentationMode(args.output_segmentation_mode) if args.output_segmentation_mode else base_mode
+
+    strategy = SegmentationStrategy(input_mode=input_mode, output_mode=output_mode)
+
+    # Print mode info if non-default
+    if args.correspondence_mode != "one_to_one":
+        print(f"Correspondence mode: {args.correspondence_mode} (margin={args.correspondence_margin})")
 
     visualize_puzzle_correspondences(
         args.puzzle_id,
         data_root=args.data_root,
-        threshold=args.threshold
+        threshold=args.threshold,
+        strategy=strategy,
+        mode=args.correspondence_mode,
+        margin=args.correspondence_margin
     )
