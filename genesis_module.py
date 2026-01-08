@@ -45,7 +45,9 @@ if TYPE_CHECKING:
 
 # Import anchor system from existing module
 from anchoring_module import AnchorPoint, get_anchor_offset, get_anchor_position, ALL_ANCHORS
-from correspondence_module import find_unmatched_objects
+from correspondence_module import find_unmatched_objects, CorrespondenceMode, DEFAULT_MARGIN
+from object_module import SegmentationMode, SegmentationStrategy
+from puzzle_loader import load_puzzle as _load_puzzle
 
 
 # =============================================================================
@@ -378,6 +380,20 @@ class PositionSpec:
             offset=offset
         )
 
+    def describe(self) -> str:
+        """Return human-readable description of the position spec."""
+        if self.position_type == PositionType.GRID_ANCHOR:
+            return f"grid_relative({self.grid_anchor.name}→{self.object_anchor.name}, offset={self.offset})"
+        elif self.position_type == PositionType.OBJECT_RELATIVE:
+            return f"object_relative(ref={self.reference_object_idx}, {self.target_anchor.name}→{self.source_anchor.name}, offset={self.anchor_offset})"
+        elif self.position_type == PositionType.AT_INTERSECTION:
+            return f"at_intersection(row_from={self.row_from_object_idx}, col_from={self.col_from_object_idx})"
+        elif self.position_type == PositionType.ABSOLUTE:
+            return f"absolute({self.absolute_location})"
+        elif self.position_type == PositionType.PARENT_RELATIVE:
+            return f"parent_relative(parent={self.parent_region_idx}, {self.parent_anchor.name})"
+        return f"unknown({self.position_type})"
+
 
 # =============================================================================
 # Complete Object Specification
@@ -509,17 +525,17 @@ def find_novel_children(
     """
     Find novel children - output objects that don't correspond to any input object.
 
-    Uses the canonical shape-based matching from correspondence_module to identify
-    objects that appear in output but have no matching input object. This handles:
-    - Flat object lists (no hierarchy)
-    - Hierarchical objects with parent/child relationships
-    - Asymmetric hierarchies (input flat, output hierarchical or vice versa)
+    Uses a TWO-LEVEL matching strategy:
+    1. Match top-level regions/parents between input and output
+    2. For each matched region pair, detect novel children:
+       - If input region is atomic (no children) but output region has children
+         → those children are NOVEL
+       - If both have children → match children, report unmatched output children
 
-    The matching uses rich shape features including:
-    - Structural properties (area, density, compactness)
-    - Hu moments (rotation/scale invariant)
-    - Color distribution
-    - Fourier descriptors of contours
+    This correctly handles the asymmetric case where:
+    - Input has an empty region (atomic, no children)
+    - Output has content in that region (children)
+    - The content is NOVEL because the input region was empty
 
     Args:
         input_objects: Objects extracted from input grid (may have hierarchy)
@@ -553,31 +569,151 @@ def find_novel_children(
             ))
         return novel
 
-    # Use the canonical correspondence function with hierarchy support
+    # Check if we have hierarchical objects (parents with children)
+    has_hierarchy = any(
+        hasattr(obj, 'children') and obj.children
+        for obj in input_objects + output_objects
+    )
+
+    if has_hierarchy:
+        # TWO-LEVEL MATCHING for hierarchical objects
+        return _find_novel_children_hierarchical(
+            input_objects, output_objects,
+            input_grid, output_grid,
+            threshold
+        )
+    else:
+        # FLAT MATCHING for non-hierarchical objects
+        return _find_novel_children_flat(
+            input_objects, output_objects,
+            input_grid, output_grid,
+            threshold
+        )
+
+
+def _find_novel_children_flat(
+    input_objects: List['Object'],
+    output_objects: List['Object'],
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    threshold: float = 0.3,
+) -> List[NovelObject]:
+    """Find novel objects in flat (non-hierarchical) object lists."""
     _, unmatched_output, _ = find_unmatched_objects(
         input_grid, output_grid,
         input_objects, output_objects,
         threshold=threshold,
-        use_matchable=True  # Handle hierarchies automatically
+        use_matchable=False  # No hierarchy to handle
     )
 
-    # Convert to NovelObject instances
     novel = []
     for obj in unmatched_output:
-        # Skip background objects
         if hasattr(obj, 'is_background') and obj.is_background:
             continue
-
-        # Determine parent info
-        parent = getattr(obj, 'parent', None)
-        parent_idx = parent.id if parent is not None else None
 
         novel_obj = NovelObject(
             object=obj,
             output_idx=obj.id if hasattr(obj, 'id') else 0,
-            parent_idx=parent_idx
+            parent_idx=None
         )
         novel.append(novel_obj)
+
+    return novel
+
+
+def _find_novel_children_hierarchical(
+    input_objects: List['Object'],
+    output_objects: List['Object'],
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    threshold: float = 0.3,
+) -> List[NovelObject]:
+    """
+    Find novel children using two-level hierarchical matching.
+
+    Level 1: Match top-level regions (parents/atomic objects)
+    Level 2: For each matched region pair, detect novel children
+    """
+    from correspondence_module import find_correspondences
+
+    novel = []
+
+    # Filter out background objects for top-level matching
+    input_toplevel = [o for o in input_objects if not getattr(o, 'is_background', False)]
+    output_toplevel = [o for o in output_objects if not getattr(o, 'is_background', False)]
+
+    if not output_toplevel:
+        return []
+
+    # LEVEL 1: Match top-level regions
+    # Use shape matching at the region level (NOT using get_matchable_objects)
+    correspondences, _, _ = find_correspondences(
+        input_grid, output_grid,
+        input_toplevel, output_toplevel,
+        threshold=threshold,
+        use_matchable=False  # Match regions directly, not their children
+    )
+
+    # Build mapping: output region index -> matched input region index
+    output_to_input = {}
+    matched_input_idxs = set()
+    for in_idx, out_idx, _score in correspondences:
+        output_to_input[out_idx] = in_idx
+        matched_input_idxs.add(in_idx)
+
+    # LEVEL 2: For each output region, detect novel children
+    for out_idx, out_region in enumerate(output_toplevel):
+        out_children = getattr(out_region, 'children', None) or []
+
+        if out_idx in output_to_input:
+            # This output region matches an input region
+            in_idx = output_to_input[out_idx]
+            in_region = input_toplevel[in_idx]
+            in_children = getattr(in_region, 'children', None) or []
+
+            if not in_children and out_children:
+                # Input region was atomic (empty), output region has children
+                # ALL output children are novel
+                for child in out_children:
+                    novel.append(NovelObject(
+                        object=child,
+                        output_idx=child.id if hasattr(child, 'id') else 0,
+                        parent_idx=out_region.id if hasattr(out_region, 'id') else out_idx
+                    ))
+            elif in_children and out_children:
+                # Both have children - match children and find unmatched
+                child_correspondences, _, _ = find_correspondences(
+                    input_grid, output_grid,
+                    in_children, out_children,
+                    threshold=threshold,
+                    use_matchable=False
+                )
+                matched_out_child_idxs = {out_c_idx for _, out_c_idx, _ in child_correspondences}
+
+                for c_idx, child in enumerate(out_children):
+                    if c_idx not in matched_out_child_idxs:
+                        novel.append(NovelObject(
+                            object=child,
+                            output_idx=child.id if hasattr(child, 'id') else 0,
+                            parent_idx=out_region.id if hasattr(out_region, 'id') else out_idx
+                        ))
+        else:
+            # Output region has no matching input region - region itself is novel
+            # (or we treat all its children as novel if it has any)
+            if out_children:
+                for child in out_children:
+                    novel.append(NovelObject(
+                        object=child,
+                        output_idx=child.id if hasattr(child, 'id') else 0,
+                        parent_idx=out_region.id if hasattr(out_region, 'id') else out_idx
+                    ))
+            else:
+                # Atomic output region with no input match
+                novel.append(NovelObject(
+                    object=out_region,
+                    output_idx=out_region.id if hasattr(out_region, 'id') else out_idx,
+                    parent_idx=None
+                ))
 
     return novel
 
@@ -595,7 +731,7 @@ def find_novel_pixels(
     Returns:
         Boolean mask where True = novel pixel
     """
-    from correspondence_module import find_object_correspondences_shape
+    from correspondence_module import find_correspondences
 
     # Start with all output pixels as potentially novel
     novel_mask = np.ones(output_grid.shape, dtype=bool)
@@ -603,11 +739,12 @@ def find_novel_pixels(
     if not input_objects or not output_objects:
         return novel_mask
 
-    # Find correspondences
-    correspondences = find_object_correspondences_shape(
+    # Find correspondences using canonical shape-based matching
+    correspondences, _, _ = find_correspondences(
         input_grid, output_grid,
         input_objects, output_objects,
-        threshold=correspondence_threshold
+        threshold=correspondence_threshold,
+        use_matchable=False
     )
 
     # Mark matched output object pixels as not novel
@@ -1483,42 +1620,6 @@ ARC_COLORS = [
 ]
 
 
-def _load_puzzle(puzzle_id: str, data_root: str = "kaggle/combined"):
-    """Load a single puzzle from the ARC dataset."""
-    import json
-    import os
-
-    subsets = ["training", "evaluation", "training2", "evaluation2"]
-
-    for subset in subsets:
-        challenges_path = f"{data_root}/arc-agi_{subset}_challenges.json"
-        solutions_path = f"{data_root}/arc-agi_{subset}_solutions.json"
-
-        if not os.path.exists(challenges_path):
-            continue
-
-        with open(challenges_path) as f:
-            puzzles = json.load(f)
-
-        if puzzle_id not in puzzles:
-            continue
-
-        puzzle = puzzles[puzzle_id]
-
-        # Load solutions if available
-        if os.path.exists(solutions_path):
-            with open(solutions_path) as f:
-                solutions = json.load(f)
-            if puzzle_id in solutions:
-                for i, sol in enumerate(solutions[puzzle_id]):
-                    if i < len(puzzle["test"]):
-                        puzzle["test"][i]["output"] = sol
-
-        return puzzle
-
-    raise ValueError(f"Puzzle '{puzzle_id}' not found in dataset")
-
-
 def _draw_grid(ax, grid: np.ndarray, title: str = ""):
     """Draw an ARC grid on a matplotlib axis."""
     H, W = grid.shape
@@ -1571,7 +1672,10 @@ def _highlight_novel_objects(ax, novel_objects: List[NovelObject], color='lime')
 
 
 def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
-                             threshold: float = 0.3, verbose: bool = True):
+                             threshold: float = 0.3, verbose: bool = True,
+                             strategy: Optional[SegmentationStrategy] = None,
+                             correspondence_mode: CorrespondenceMode = "one_to_one",
+                             correspondence_margin: float = DEFAULT_MARGIN):
     """
     Detailed tracing of genesis (novel object) detection for a puzzle.
 
@@ -1586,6 +1690,9 @@ def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
         data_root: Path to puzzle data
         threshold: Similarity threshold for correspondence matching
         verbose: If True, print detailed shape features
+        strategy: Optional segmentation strategy for input/output grids
+        correspondence_mode: Matching mode ('one_to_one', 'many_to_one', 'one_to_many')
+        correspondence_margin: Margin for non-one_to_one modes
 
     Returns:
         Dict with tracing results for programmatic analysis
@@ -1600,6 +1707,8 @@ def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
     print(f"GENESIS TRACE: Puzzle {puzzle_id}")
     print(f"{'='*80}")
     print(f"Correspondence threshold: {threshold}")
+    if correspondence_mode != "one_to_one":
+        print(f"Correspondence mode: {correspondence_mode} (margin={correspondence_margin})")
 
     puzzle = _load_puzzle(puzzle_id, data_root)
     print(f"Training examples: {len(puzzle['train'])}")
@@ -1632,8 +1741,15 @@ def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
         print("STEP 1: Object Extraction")
         print(f"{'-'*40}")
 
-        input_objects_raw = extract_objects_from_grid(input_grid)
-        output_objects_raw = extract_objects_from_grid(output_grid)
+        # Determine segmentation modes
+        input_mode = strategy.input_mode if strategy else SegmentationMode.CONNECTIVITY
+        output_mode = strategy.output_mode if strategy else SegmentationMode.CONNECTIVITY
+        if strategy and (input_mode != SegmentationMode.CONNECTIVITY or output_mode != SegmentationMode.CONNECTIVITY):
+            print(f"Input segmentation mode: {input_mode.value}")
+            print(f"Output segmentation mode: {output_mode.value}")
+
+        input_objects_raw = extract_objects_from_grid(input_grid, segmentation_mode=input_mode)
+        output_objects_raw = extract_objects_from_grid(output_grid, segmentation_mode=output_mode)
 
         # Filter background
         input_objects = [o for o in input_objects_raw if not o.is_background]
@@ -1796,7 +1912,9 @@ def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
             input_grid, output_grid,
             input_objects, output_objects,
             threshold=threshold,
-            use_matchable=True
+            use_matchable=True,
+            mode=correspondence_mode,
+            margin=correspondence_margin
         )
 
         print(f"\nMatched pairs: {len(correspondences)}")
@@ -1898,7 +2016,8 @@ def trace_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
     return trace_results
 
 
-def visualize_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined"):
+def visualize_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combined",
+                                  strategy: Optional[SegmentationStrategy] = None):
     """
     Visualize novel object detection for a puzzle.
 
@@ -1907,6 +2026,7 @@ def visualize_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combin
     Args:
         puzzle_id: The ARC puzzle ID (e.g., "27a77e38")
         data_root: Path to puzzle data
+        strategy: Optional segmentation strategy for input/output grids
     """
     import matplotlib.pyplot as plt
     from object_module import extract_objects_from_grid
@@ -1914,6 +2034,13 @@ def visualize_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combin
     print(f"Loading puzzle: {puzzle_id}")
     puzzle = _load_puzzle(puzzle_id, data_root)
     print(f"Found {len(puzzle['train'])} training examples")
+
+    # Determine segmentation modes
+    input_mode = strategy.input_mode if strategy else SegmentationMode.CONNECTIVITY
+    output_mode = strategy.output_mode if strategy else SegmentationMode.CONNECTIVITY
+    if strategy and (input_mode != SegmentationMode.CONNECTIVITY or output_mode != SegmentationMode.CONNECTIVITY):
+        print(f"Input segmentation mode: {input_mode.value}")
+        print(f"Output segmentation mode: {output_mode.value}")
 
     # Process each example
     for ex_idx, example in enumerate(puzzle['train']):
@@ -1929,8 +2056,8 @@ def visualize_genesis_for_puzzle(puzzle_id: str, data_root: str = "kaggle/combin
         print(f"Input shape: {input_grid.shape}, Output shape: {output_grid.shape}")
 
         # Extract objects
-        input_objects = extract_objects_from_grid(input_grid)
-        output_objects = extract_objects_from_grid(output_grid)
+        input_objects = extract_objects_from_grid(input_grid, segmentation_mode=input_mode)
+        output_objects = extract_objects_from_grid(output_grid, segmentation_mode=output_mode)
 
         # Filter background
         input_nobg = [o for o in input_objects if not o.is_background]
@@ -1997,6 +2124,12 @@ Examples:
     python genesis_module.py --puzzle-id 03560426 --trace
     python genesis_module.py --puzzle-id 03560426 --trace --threshold 0.5
 
+    # Different segmentation for input vs output:
+    python genesis_module.py --puzzle-id 27a77e38 --input-segmentation-mode connectivity --output-segmentation-mode pixel
+
+    # Different correspondence modes:
+    python genesis_module.py --puzzle-id 27a77e38 --trace --correspondence-mode many_to_one --correspondence-margin 0.1
+
 This module detects novel objects (objects that appear in output but have no
 corresponding input object) and discovers rules for generating them.
 
@@ -2018,10 +2151,38 @@ Use --trace for detailed debugging output showing:
                         help="Similarity threshold for correspondence matching (default: 0.3)")
     parser.add_argument("--quiet", action="store_true",
                         help="Less verbose output (skip detailed feature printing)")
+    parser.add_argument("--segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Object segmentation mode for BOTH input and output (shorthand). "
+                             "Use --input-segmentation-mode and --output-segmentation-mode for different modes.")
+    parser.add_argument("--input-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for INPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--output-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for OUTPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--correspondence-mode", type=str,
+                        choices=['one_to_one', 'many_to_one', 'one_to_many'],
+                        default='one_to_one',
+                        help="Correspondence matching mode: one_to_one (default), "
+                             "many_to_one (multiple inputs to one output), "
+                             "one_to_many (one input to multiple outputs)")
+    parser.add_argument("--correspondence-margin", type=float, default=DEFAULT_MARGIN,
+                        help=f"For non-one_to_one modes, how close to best score to allow secondary matches (default: {DEFAULT_MARGIN})")
     parser.add_argument("--test", action="store_true",
                         help="Run basic module tests")
 
     args = parser.parse_args()
+
+    # Build segmentation strategy from arguments
+    # Priority: specific mode > general mode > default (connectivity)
+    base_mode = SegmentationMode(args.segmentation_mode) if args.segmentation_mode else SegmentationMode.CONNECTIVITY
+    input_mode = SegmentationMode(args.input_segmentation_mode) if args.input_segmentation_mode else base_mode
+    output_mode = SegmentationMode(args.output_segmentation_mode) if args.output_segmentation_mode else base_mode
+    strategy = SegmentationStrategy(input_mode=input_mode, output_mode=output_mode)
 
     if args.puzzle_id:
         if args.trace:
@@ -2029,10 +2190,13 @@ Use --trace for detailed debugging output showing:
                 args.puzzle_id,
                 args.data_root,
                 threshold=args.threshold,
-                verbose=not args.quiet
+                verbose=not args.quiet,
+                strategy=strategy,
+                correspondence_mode=args.correspondence_mode,
+                correspondence_margin=args.correspondence_margin
             )
         else:
-            visualize_genesis_for_puzzle(args.puzzle_id, args.data_root)
+            visualize_genesis_for_puzzle(args.puzzle_id, args.data_root, strategy=strategy)
     elif args.test:
         # Run basic tests
         print("Genesis Module loaded successfully")

@@ -9,8 +9,6 @@ Usage:
     python ordering_module.py --puzzle-id 1990f7a8   # Visualize ordering for a specific puzzle
 """
 
-import json
-import os
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Callable, Dict, Optional, Any
@@ -29,9 +27,10 @@ from object_module import (
 )
 
 # Object correspondence matching
-from correspondence_module import (
-    find_object_correspondences_from_objects,
-)
+from correspondence_module import find_correspondences
+
+# Puzzle loading
+from puzzle_loader import load_puzzle
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -1332,47 +1331,8 @@ class ConsistencyChecker:
 
 
 # =============================================================================
-# Puzzle Loading and Object Extraction
+# Object Extraction Helpers
 # =============================================================================
-
-def load_puzzles(dataset_name: str = "arc-agi-1", data_root: str = None) -> Dict:
-    """Load ARC puzzles from JSON files."""
-    if data_root is None:
-        # Find the kaggle/combined directory relative to this file
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_root = os.path.join(script_dir, "kaggle", "combined")
-
-    config = {
-        "arc-agi-1": {"subsets": ["training", "evaluation"]},
-        "arc-agi-2": {"subsets": ["training2", "evaluation2"]},
-    }
-
-    all_puzzles = {}
-
-    for subset in config[dataset_name]["subsets"]:
-        challenges_path = os.path.join(data_root, f"arc-agi_{subset}_challenges.json")
-        solutions_path = os.path.join(data_root, f"arc-agi_{subset}_solutions.json")
-
-        if not os.path.exists(challenges_path):
-            print(f"Warning: {challenges_path} not found")
-            continue
-
-        with open(challenges_path) as f:
-            puzzles = json.load(f)
-
-        if os.path.exists(solutions_path):
-            with open(solutions_path) as f:
-                solutions = json.load(f)
-            for puzzle_id in puzzles:
-                if puzzle_id in solutions:
-                    for i, sol in enumerate(solutions[puzzle_id]):
-                        if i < len(puzzles[puzzle_id]["test"]):
-                            puzzles[puzzle_id]["test"][i]["output"] = sol
-
-        all_puzzles.update(puzzles)
-
-    return all_puzzles
-
 
 def compute_iou(pixels1: set, pixels2: set) -> float:
     """Compute Intersection over Union between two pixel sets.
@@ -1386,20 +1346,23 @@ def compute_iou(pixels1: set, pixels2: set) -> float:
 def find_object_correspondences_simple(
     input_objects: List[Object],
     output_objects: List[Object],
-    iou_threshold: float = 0.1
+    input_grid: np.ndarray,
+    output_grid: np.ndarray,
+    threshold: float = 0.1
 ) -> List[Correspondence]:
     """
-    Find correspondences between input and output objects based on color and IoU overlap.
+    Find correspondences between input and output objects using canonical shape-based matching.
 
-    Uses the shared correspondence_module implementation:
-    1. Same color (required)
-    2. IoU overlap (for objects that don't move much)
-    3. Area similarity
+    Uses the shared find_correspondences() function with:
+    - Rich shape features (structural, Hu moments, color distribution, Fourier descriptors)
+    - Hierarchy awareness via get_matchable_objects()
 
     Args:
         input_objects: List of input Object instances
         output_objects: List of output Object instances
-        iou_threshold: Minimum score threshold for a valid match
+        input_grid: The input grid array
+        output_grid: The output grid array
+        threshold: Minimum similarity threshold for a valid match
 
     Returns:
         List of Correspondence instances
@@ -1407,14 +1370,21 @@ def find_object_correspondences_simple(
     if not input_objects or not output_objects:
         return []
 
-    # Use the shared correspondence function
-    matches = find_object_correspondences_from_objects(
-        input_objects, output_objects, iou_threshold
+    # Use canonical correspondence function with hierarchy handling
+    matches, matchable_in, matchable_out = find_correspondences(
+        input_grid, output_grid,
+        input_objects, output_objects,
+        threshold=threshold,
+        use_matchable=True
     )
 
+    if not matchable_in or not matchable_out:
+        return []
+
     # Convert (input_idx, output_idx, score) tuples to Correspondence objects
+    # Indices are into the matchable lists
     return [
-        Correspondence(input_objects[in_idx], output_objects[out_idx])
+        Correspondence(matchable_in[in_idx], matchable_out[out_idx])
         for in_idx, out_idx, _ in matches
     ]
 
@@ -1501,7 +1471,14 @@ def screen_orderings_for_puzzle(
         if not input_objects:
             continue
 
-        correspondences = find_object_correspondences_simple(input_objects, output_objects)
+        # Use canonical find_correspondences for shape-based matching
+        matches, matchable_in, matchable_out = find_correspondences(
+            input_grid, output_grid, input_objects, output_objects
+        )
+        correspondences = [
+            Correspondence(matchable_in[in_idx], matchable_out[out_idx])
+            for in_idx, out_idx, _ in matches
+        ]
 
         grid_shape = (max(input_grid.shape[0], output_grid.shape[0]),
                      max(input_grid.shape[1], output_grid.shape[1]))
@@ -1517,9 +1494,13 @@ def screen_orderings_for_puzzle(
             if any(o.children for o in output_objects_hier):
                 has_hierarchy = True
 
-            correspondences_hier = find_object_correspondences_simple(
-                input_objects_hier, output_objects_hier
+            matches_hier, matchable_in_hier, matchable_out_hier = find_correspondences(
+                input_grid, output_grid, input_objects_hier, output_objects_hier
             )
+            correspondences_hier = [
+                Correspondence(matchable_in_hier[in_idx], matchable_out_hier[out_idx])
+                for in_idx, out_idx, _ in matches_hier
+            ]
             hierarchical_examples.append((correspondences_hier, grid_shape))
 
     if not flat_examples:
@@ -1858,20 +1839,16 @@ def visualize_puzzle_ordering(puzzle_id: str, ordering_name: str = "auto"):
     Visualize object ordering for a specific puzzle.
 
     Args:
-        puzzle_id: The ARC puzzle ID (e.g., "1990f7a8")
+        puzzle_id: The ARC puzzle ID (e.g., "1990f7a8") or synthetic puzzle ID (e.g., "syn_dual_fill")
         ordering_name: Name of ordering strategy to use, or "auto" to find best
     """
-    # Load puzzles
+    # Load puzzle (supports synthetic puzzles with syn_ prefix)
     print(f"Loading puzzle {puzzle_id}...")
-    puzzles = load_puzzles("arc-agi-1")
-    if puzzle_id not in puzzles:
-        puzzles.update(load_puzzles("arc-agi-2"))
-
-    if puzzle_id not in puzzles:
-        print(f"Error: Puzzle '{puzzle_id}' not found in ARC datasets")
+    try:
+        puzzle = load_puzzle(puzzle_id)
+    except ValueError as e:
+        print(f"Error: {e}")
         return
-
-    puzzle = puzzles[puzzle_id]
 
     # Get the ordering strategy
     if ordering_name == "auto":
@@ -1975,19 +1952,15 @@ def compare_orderings(puzzle_id: str):
     Compare all ordering strategies for a specific puzzle.
 
     Args:
-        puzzle_id: The ARC puzzle ID (e.g., "1990f7a8")
+        puzzle_id: The ARC puzzle ID (e.g., "1990f7a8") or synthetic puzzle ID (e.g., "syn_dual_fill")
     """
-    # Load puzzles
+    # Load puzzle (supports synthetic puzzles with syn_ prefix)
     print(f"Loading puzzle {puzzle_id}...")
-    puzzles = load_puzzles("arc-agi-1")
-    if puzzle_id not in puzzles:
-        puzzles.update(load_puzzles("arc-agi-2"))
-
-    if puzzle_id not in puzzles:
-        print(f"Error: Puzzle '{puzzle_id}' not found in ARC datasets")
+    try:
+        puzzle = load_puzzle(puzzle_id)
+    except ValueError as e:
+        print(f"Error: {e}")
         return
-
-    puzzle = puzzles[puzzle_id]
 
     # Select key ordering strategies to compare
     key_orderings = [
@@ -2620,33 +2593,26 @@ Available ordering strategies:
     args = parser.parse_args()
 
     if args.puzzle_id:
+        # Load single puzzle (supports synthetic puzzles with syn_ prefix)
+        try:
+            puzzle = load_puzzle(args.puzzle_id)
+        except ValueError as e:
+            print(f"Error: {e}")
+            exit(1)
+
         if args.screen_all:
             # Unified ordering screening (the canonical approach)
-            puzzles = load_puzzles("arc-agi-1")
-            if args.puzzle_id not in puzzles:
-                puzzles.update(load_puzzles("arc-agi-2"))
-            if args.puzzle_id not in puzzles:
-                print(f"Error: Puzzle '{args.puzzle_id}' not found")
-            else:
-                result = find_best_ordering(puzzles[args.puzzle_id], verbose=True)
-                print("\n" + "=" * 60)
-                print("SUMMARY")
-                print("=" * 60)
-                print(f"Best configuration: {result.describe()}")
-                print(f"Has hierarchy: {result.has_hierarchy}")
+            result = find_best_ordering(puzzle, verbose=True)
+            print("\n" + "=" * 60)
+            print("SUMMARY")
+            print("=" * 60)
+            print(f"Best configuration: {result.describe()}")
+            print(f"Has hierarchy: {result.has_hierarchy}")
         elif args.screen_per_parent:
             # Screen per-parent orderings only
-            puzzles = load_puzzles("arc-agi-1")
-            if args.puzzle_id not in puzzles:
-                puzzles.update(load_puzzles("arc-agi-2"))
-            if args.puzzle_id not in puzzles:
-                print(f"Error: Puzzle '{args.puzzle_id}' not found")
-            else:
-                result = screen_per_parent_orderings_for_puzzle(
-                    puzzles[args.puzzle_id], verbose=True
-                )
-                if result is None:
-                    print("\nNo hierarchical structure found for per-parent ordering")
+            result = screen_per_parent_orderings_for_puzzle(puzzle, verbose=True)
+            if result is None:
+                print("\nNo hierarchical structure found for per-parent ordering")
         elif args.compare:
             compare_orderings(args.puzzle_id)
         else:

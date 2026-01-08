@@ -36,12 +36,14 @@ from object_module import (
 
 # Import shared utilities from ordering_module
 from ordering_module import (
-    load_puzzles,
     find_object_correspondences_simple,
     Correspondence,
     ALL_ORDERINGS,
     AdaptiveReadingOrder,
 )
+
+# Puzzle loading
+from puzzle_loader import load_puzzles
 
 # Object correspondence matching
 from correspondence_module import (
@@ -1092,7 +1094,9 @@ def analyze_puzzle_anchors(
             continue
 
         # Find correspondences
-        correspondences = find_object_correspondences_simple(input_objects, output_objects)
+        correspondences = find_object_correspondences_simple(
+            input_objects, output_objects, input_grid, output_grid
+        )
 
         if not correspondences:
             continue

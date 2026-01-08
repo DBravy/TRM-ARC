@@ -29,8 +29,9 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 from scipy import ndimage
 
-from object_module import extract_connected_components
-from correspondence_module import find_object_correspondences
+from object_module import extract_connected_components, labels_to_objects, SegmentationMode, SegmentationStrategy
+from correspondence_module import find_correspondences, CorrespondenceMode, DEFAULT_MARGIN
+from puzzle_loader import load_all_puzzles as _load_puzzles
 
 
 # =============================================================================
@@ -95,7 +96,20 @@ SELECTION_RULES = [
     'bottom_1',   # Keep only highest rank (last place)
     'bottom_2',   # Keep last two
     'all',        # Keep all (baseline)
+    'all_best',   # Keep ALL objects with the best (lowest) rank
 ]
+
+# Rule preference order for tie-breaking: prefer more permissive rules
+# Higher value = more preferred when accuracy and num_selected are tied
+RULE_PREFERENCE = {
+    'all_best': 6,   # Most preferred - semantically clearest "all tied for best"
+    'all': 5,        # All objects
+    'top_3': 4,
+    'top_2': 3,
+    'top_1': 2,
+    'bottom_2': 1,
+    'bottom_1': 0,
+}
 
 
 # =============================================================================
@@ -293,15 +307,23 @@ def compute_ranks(props: ObjectPropertiesForRanking, criterion: str) -> np.ndarr
         else:
             raise ValueError(f"Unknown criterion: {criterion}")
 
-    # Convert keys to ranks
+    # Convert keys to ranks (ties get the same rank)
     ranks = np.full(n, -1, dtype=np.int32)
     valid_indices = np.where(props.valid)[0]
 
     if len(valid_indices) > 0:
         valid_keys = keys[valid_indices]
         sorted_order = np.argsort(valid_keys)
-        for rank, idx in enumerate(sorted_order):
-            ranks[valid_indices[idx]] = rank
+
+        # Assign ranks with tie handling - equal keys get equal ranks
+        current_rank = 0
+        for i, idx in enumerate(sorted_order):
+            if i > 0:
+                prev_idx = sorted_order[i - 1]
+                # If key differs from previous, increment rank
+                if valid_keys[idx] != valid_keys[prev_idx]:
+                    current_rank = i  # Use position as rank (leaves gaps for ties)
+            ranks[valid_indices[idx]] = current_rank
 
     return ranks
 
@@ -330,6 +352,13 @@ def apply_selection_rule(ranks: np.ndarray, valid: np.ndarray,
     elif rule == 'bottom_2':
         max_rank = ranks[valid].max() if valid.any() else -1
         selected = (ranks >= 0) & (ranks >= max_rank - 1)
+    elif rule == 'all_best':
+        # Select ALL objects that share the best (lowest) rank
+        if valid.any():
+            best_rank = ranks[valid].min()
+            selected = (ranks == best_rank)
+        else:
+            selected = np.zeros(len(ranks), dtype=bool)
     else:
         raise ValueError(f"Unknown selection rule: {rule}")
 
@@ -470,10 +499,33 @@ class SelectionScreener:
         self,
         puzzles: Dict,
         puzzle_ids: List[str],
-        use_color_only: bool = False
+        use_color_only: bool = False,
+        strategy: Optional[SegmentationStrategy] = None,
+        correspondence_mode: CorrespondenceMode = "one_to_one",
+        correspondence_margin: float = DEFAULT_MARGIN
     ) -> List[SelectionSample]:
-        """Create selection samples from puzzles for screening."""
+        """Create selection samples from puzzles for screening.
+
+        Args:
+            puzzles: Dictionary of puzzles
+            puzzle_ids: List of puzzle IDs to process
+            use_color_only: DEPRECATED - use strategy instead
+            strategy: Optional segmentation strategy for input/output grids
+            correspondence_mode: Matching mode for correspondences
+            correspondence_margin: Margin for non-one_to_one modes
+        """
         samples = []
+
+        # Determine segmentation modes
+        if strategy:
+            input_mode = strategy.input_mode
+            output_mode = strategy.output_mode
+        elif use_color_only:
+            input_mode = SegmentationMode.COLOR
+            output_mode = SegmentationMode.COLOR
+        else:
+            input_mode = SegmentationMode.CONNECTIVITY
+            output_mode = SegmentationMode.CONNECTIVITY
 
         for puzzle_id in puzzle_ids:
             if puzzle_id not in puzzles:
@@ -491,22 +543,27 @@ class SelectionScreener:
 
                 # Extract objects
                 input_labels, input_colors, input_bboxes, _ = extract_connected_components(
-                    input_grid, use_color_only=use_color_only
+                    input_grid, segmentation_mode=input_mode
                 )
                 output_labels, output_colors, output_bboxes, _ = extract_connected_components(
-                    output_grid, use_color_only=use_color_only
+                    output_grid, segmentation_mode=output_mode
                 )
 
                 if len(input_colors) == 0:
                     continue
 
-                # Find correspondences (with pattern matching)
-                matches = find_object_correspondences(
-                    input_labels, input_colors,
-                    output_labels, output_colors,
-                    iou_threshold=0.0,
-                    input_grid=input_grid,
-                    output_grid=output_grid
+                # Convert to Object instances for correspondence matching
+                input_objects = labels_to_objects(input_labels, input_colors, input_bboxes)
+                output_objects = labels_to_objects(output_labels, output_colors, output_bboxes)
+
+                # Find correspondences using canonical shape-based matching
+                matches, _, _ = find_correspondences(
+                    input_grid, output_grid,
+                    input_objects, output_objects,
+                    threshold=0.0,
+                    use_matchable=False,
+                    mode=correspondence_mode,
+                    margin=correspondence_margin
                 )
 
                 # Build actual_selected from correspondences
@@ -544,11 +601,14 @@ class SelectionScreener:
             - all_results: Dict[(criterion, rule), accuracy]
         """
         results = {}
+        # Track how many objects each combination selects (for tie-breaking)
+        num_selected = {}
 
         for criterion in RANKING_CRITERIA:
             for rule in SELECTION_RULES:
                 correct = 0
                 total = 0
+                total_selected = 0
 
                 for sample in samples:
                     ranks = compute_ranks(sample.props, criterion)
@@ -560,9 +620,11 @@ class SelectionScreener:
                     match = (predicted == sample.actual_selected)
                     correct += match.sum()
                     total += len(match)
+                    total_selected += predicted.sum()
 
                 accuracy = correct / total if total > 0 else 0.0
                 results[(criterion, rule)] = accuracy
+                num_selected[(criterion, rule)] = total_selected
 
                 if self.verbose and accuracy > 0.8:
                     print(f"  {criterion:25s} + {rule:10s}: {accuracy:.1%}")
@@ -576,7 +638,8 @@ class SelectionScreener:
                 'all_results': results
             }
 
-        best_combo = max(results, key=results.get)
+        # Find best combo: highest accuracy, then most objects selected, then rule preference
+        best_combo = max(results, key=lambda k: (results[k], num_selected[k], RULE_PREFERENCE.get(k[1], 0)))
         best_accuracy = results[best_combo]
 
         self.results = results
@@ -619,43 +682,6 @@ class SelectionScreener:
 
 
 # =============================================================================
-# Data Loading
-# =============================================================================
-
-def _load_puzzles(data_root: str = "kaggle/combined") -> Dict:
-    """Load all ARC puzzles from JSON files."""
-    import json
-    import os
-
-    all_puzzles = {}
-
-    subsets = ["training", "evaluation", "training2", "evaluation2"]
-
-    for subset in subsets:
-        challenges_path = f"{data_root}/arc-agi_{subset}_challenges.json"
-        solutions_path = f"{data_root}/arc-agi_{subset}_solutions.json"
-
-        if not os.path.exists(challenges_path):
-            continue
-
-        with open(challenges_path) as f:
-            puzzles = json.load(f)
-
-        if os.path.exists(solutions_path):
-            with open(solutions_path) as f:
-                solutions = json.load(f)
-            for puzzle_id in puzzles:
-                if puzzle_id in solutions:
-                    for i, test in enumerate(puzzles[puzzle_id].get('test', [])):
-                        if i < len(solutions[puzzle_id]):
-                            test['output'] = solutions[puzzle_id][i]
-
-        all_puzzles.update(puzzles)
-
-    return all_puzzles
-
-
-# =============================================================================
 # Visualization
 # =============================================================================
 
@@ -691,16 +717,22 @@ def visualize_selection(samples: List[SelectionSample], criterion: str, rule: st
 def analyze_puzzle_selection(puzzle_id: str, puzzles: Dict,
                              use_color_only: bool = False,
                              verbose: bool = True,
-                             visualize: bool = False):
+                             visualize: bool = False,
+                             strategy: Optional[SegmentationStrategy] = None,
+                             correspondence_mode: CorrespondenceMode = "one_to_one",
+                             correspondence_margin: float = DEFAULT_MARGIN):
     """
     Analyze selection patterns for a single puzzle.
 
     Args:
         puzzle_id: The puzzle ID to analyze
         puzzles: Dictionary of all puzzles
-        use_color_only: Whether to use color-only object extraction
+        use_color_only: DEPRECATED - use strategy instead
         verbose: Whether to print detailed output
         visualize: Whether to show detailed visualization
+        strategy: Optional segmentation strategy for input/output grids
+        correspondence_mode: Matching mode for correspondences
+        correspondence_margin: Margin for non-one_to_one modes
 
     Returns:
         Dictionary with analysis results
@@ -710,7 +742,12 @@ def analyze_puzzle_selection(puzzle_id: str, puzzles: Dict,
         return None
 
     screener = SelectionScreener(verbose=False)
-    samples = screener.create_selection_samples(puzzles, [puzzle_id], use_color_only)
+    samples = screener.create_selection_samples(
+        puzzles, [puzzle_id], use_color_only,
+        strategy=strategy,
+        correspondence_mode=correspondence_mode,
+        correspondence_margin=correspondence_margin
+    )
 
     if not samples:
         print("No valid samples created")
@@ -803,8 +840,14 @@ Examples:
     # Scan all puzzles for selection patterns
     python selection_module.py --scan-all --min-accuracy 0.9
 
-    # Use color-based object extraction
+    # Use color-based object extraction (DEPRECATED - use --segmentation-mode color)
     python selection_module.py --puzzle-id 6fa7a44f --object-by-color
+
+    # Different segmentation for input vs output:
+    python selection_module.py --puzzle-id 6fa7a44f --input-segmentation-mode connectivity --output-segmentation-mode pixel
+
+    # Different correspondence modes:
+    python selection_module.py --puzzle-id 6fa7a44f --correspondence-mode many_to_one --correspondence-margin 0.1
         """
     )
 
@@ -815,15 +858,48 @@ Examples:
     parser.add_argument("--min-accuracy", type=float, default=0.9,
                         help="Minimum accuracy to report (for --scan-all)")
     parser.add_argument("--object-by-color", action="store_true",
-                        help="Extract objects by color only (no connectivity)")
+                        help="DEPRECATED: Extract objects by color only. Use --segmentation-mode color instead.")
     parser.add_argument("--data-root", type=str, default="kaggle/combined",
                         help="Path to puzzle data")
     parser.add_argument("--verbose", action="store_true",
                         help="Show detailed output")
     parser.add_argument("--visualize", action="store_true",
                         help="Show selection visualization for each example")
+    parser.add_argument("--segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Object segmentation mode for BOTH input and output (shorthand). "
+                             "Use --input-segmentation-mode and --output-segmentation-mode for different modes.")
+    parser.add_argument("--input-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for INPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--output-segmentation-mode", type=str,
+                        choices=['connectivity', 'pixel', 'color'],
+                        default=None,
+                        help="Segmentation mode for OUTPUT grid (overrides --segmentation-mode)")
+    parser.add_argument("--correspondence-mode", type=str,
+                        choices=['one_to_one', 'many_to_one', 'one_to_many'],
+                        default='one_to_one',
+                        help="Correspondence matching mode: one_to_one (default), "
+                             "many_to_one (multiple inputs to one output), "
+                             "one_to_many (one input to multiple outputs)")
+    parser.add_argument("--correspondence-margin", type=float, default=DEFAULT_MARGIN,
+                        help=f"For non-one_to_one modes, how close to best score to allow secondary matches (default: {DEFAULT_MARGIN})")
 
     args = parser.parse_args()
+
+    # Build segmentation strategy from arguments
+    # Priority: specific mode > general mode > object-by-color flag > default (connectivity)
+    if args.segmentation_mode:
+        base_mode = SegmentationMode(args.segmentation_mode)
+    elif args.object_by_color:
+        base_mode = SegmentationMode.COLOR
+    else:
+        base_mode = SegmentationMode.CONNECTIVITY
+    input_mode = SegmentationMode(args.input_segmentation_mode) if args.input_segmentation_mode else base_mode
+    output_mode = SegmentationMode(args.output_segmentation_mode) if args.output_segmentation_mode else base_mode
+    strategy = SegmentationStrategy(input_mode=input_mode, output_mode=output_mode)
 
     # Load puzzles
     print("Loading puzzles...")
@@ -837,7 +913,10 @@ Examples:
             puzzles,
             use_color_only=args.object_by_color,
             verbose=args.verbose,
-            visualize=args.visualize
+            visualize=args.visualize,
+            strategy=strategy,
+            correspondence_mode=args.correspondence_mode,
+            correspondence_margin=args.correspondence_margin
         )
 
     elif args.scan_all:
@@ -850,7 +929,10 @@ Examples:
 
         for puzzle_id in puzzles:
             samples = screener.create_selection_samples(
-                puzzles, [puzzle_id], args.object_by_color
+                puzzles, [puzzle_id], args.object_by_color,
+                strategy=strategy,
+                correspondence_mode=args.correspondence_mode,
+                correspondence_margin=args.correspondence_margin
             )
 
             if not samples:
