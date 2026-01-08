@@ -376,6 +376,67 @@ class QuadrantOrder(OrderingStrategy):
         return quadrants
 
 
+class ColumnThenRow(OrderingStrategy):
+    """
+    Order objects by column first, then by row within each column.
+
+    This is useful for procedural puzzles like 136b0064 where the instruction
+    region has patterns arranged in a 2-column layout and should be read:
+    - First the left column from top to bottom
+    - Then the right column from top to bottom
+
+    The column split is determined by the median horizontal position of objects.
+    """
+    name = "column_then_row"
+
+    def __init__(self, column_threshold: Optional[float] = None):
+        """
+        Args:
+            column_threshold: Fixed column dividing point. If None, uses median.
+        """
+        self.column_threshold = column_threshold
+
+    def order(self, objects: List[Object]) -> List[Object]:
+        if len(objects) <= 1:
+            return objects
+
+        # Find the dividing point
+        if self.column_threshold is not None:
+            mid_col = self.column_threshold
+        else:
+            # Use median of object centers
+            cols = [o.center[1] for o in objects]
+            mid_col = np.median(cols)
+
+        # Split into left and right columns
+        left = [o for o in objects if o.center[1] < mid_col]
+        right = [o for o in objects if o.center[1] >= mid_col]
+
+        # Sort each column by row (top to bottom)
+        left_sorted = sorted(left, key=lambda o: o.center[0])
+        right_sorted = sorted(right, key=lambda o: o.center[0])
+
+        # Return left column first, then right column
+        return left_sorted + right_sorted
+
+    def get_column_structure(self, objects: List[Object]) -> Dict[str, List[int]]:
+        """Return objects grouped by column (for debugging)."""
+        if not objects:
+            return {}
+
+        cols = [o.center[1] for o in objects]
+        mid_col = self.column_threshold if self.column_threshold else np.median(cols)
+
+        columns = {'left': [], 'right': []}
+        for obj in objects:
+            if obj.center[1] < mid_col:
+                columns['left'].append(obj.id)
+            else:
+                columns['right'].append(obj.id)
+
+        return columns
+
+
 # =============================================================================
 # Per-Parent Ordering (for hierarchical objects)
 # =============================================================================
@@ -858,6 +919,7 @@ ALL_ORDERINGS: List[OrderingStrategy] = [
     ByColor(),
     AdaptiveReadingOrder(),
     QuadrantOrder(),
+    ColumnThenRow(),
 ]
 
 # Per-parent orderings (for hierarchical objects)

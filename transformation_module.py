@@ -89,6 +89,7 @@ class ColorDerivationType(Enum):
     MODE_OF_CORRESPONDENTS = auto()  # Most common color among correspondents
     LITERAL = auto()            # Fixed color (same across all examples)
     MODE_OF_CHILDREN = auto()   # Mode color of children within hierarchical region
+    MODE_OF_PIXELS = auto()     # Mode color of individual pixels within correspondent objects
 
 
 @dataclass
@@ -137,6 +138,23 @@ class ColorDerivation:
                 counter = Counter(correspondent_colors)
                 return counter.most_common(1)[0][0]
             return 0
+        elif self.derivation_type == ColorDerivationType.MODE_OF_PIXELS:
+            # Get mode color from individual pixels within correspondent objects
+            if correspondent_objects:
+                pixel_colors = []
+                for obj in correspondent_objects:
+                    # Each pixel in the object contributes its color
+                    # For multi-color objects, we'd need to read from the grid
+                    # For now, use the object's color repeated for each pixel
+                    pixel_colors.extend([obj.color] * len(obj.pixels))
+                if pixel_colors:
+                    counter = Counter(pixel_colors)
+                    return counter.most_common(1)[0][0]
+            # Fallback to mode of correspondent colors
+            if correspondent_colors:
+                counter = Counter(correspondent_colors)
+                return counter.most_common(1)[0][0]
+            return 0
         return 0
 
     def describe(self) -> str:
@@ -148,6 +166,8 @@ class ColorDerivation:
             return "mode_of_correspondents"
         elif self.derivation_type == ColorDerivationType.MODE_OF_CHILDREN:
             return "mode_of_children"
+        elif self.derivation_type == ColorDerivationType.MODE_OF_PIXELS:
+            return "mode_of_pixels"
         return str(self.derivation_type)
 
 
@@ -447,6 +467,7 @@ def screen_color_derivation(
         ColorDerivationType.COMMON_COLOR,
         ColorDerivationType.MODE_OF_CORRESPONDENTS,
         ColorDerivationType.MODE_OF_CHILDREN,
+        ColorDerivationType.MODE_OF_PIXELS,
         ColorDerivationType.LITERAL,
     ]
 
@@ -511,6 +532,21 @@ def screen_color_derivation(
                         predicted = counter.most_common(1)[0][0]
                     else:
                         predicted = -1  # No children, not applicable
+
+                elif hyp_type == ColorDerivationType.MODE_OF_PIXELS:
+                    # Get mode color from individual pixels within correspondent objects
+                    # Weight by pixel count - objects with more pixels contribute more
+                    pixel_colors = []
+                    for in_idx in in_indices:
+                        if in_idx < len(ex.input_objects):
+                            obj = ex.input_objects[in_idx]
+                            # Each pixel contributes the object's color
+                            pixel_colors.extend([obj.color] * len(obj.pixels))
+                    if pixel_colors:
+                        counter = Counter(pixel_colors)
+                        predicted = counter.most_common(1)[0][0]
+                    else:
+                        predicted = -1  # No pixels, not applicable
 
                 elif hyp_type == ColorDerivationType.LITERAL:
                     literal_values.append(actual_color)
