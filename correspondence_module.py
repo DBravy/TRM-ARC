@@ -84,7 +84,7 @@ DEFAULT_MARGIN = 0.0
 DEFAULT_CORRESPONDENCE_WEIGHTS = {
     'structural': 1.0,
     'moments': 1.0,
-    'color': 1.0,
+    'color': 5.0,
     'fourier': 1.0,
     'location': 1.0,
 }
